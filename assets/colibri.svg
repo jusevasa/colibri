@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" shape-rendering="crispEdges">
+<defs><linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#161c27"/><stop offset="1" stop-color="#0a0d13"/></linearGradient></defs>
+<rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" shape-rendering="geometricPrecision"/>
+<rect x="278" y="278" width="78" height="39" fill="#1f9e8f"/>
+<rect x="278" y="317" width="117" height="39" fill="#1f9e8f"/>
+<rect x="317" y="356" width="117" height="39" fill="#1f9e8f"/>
+<rect x="590" y="356" width="78" height="39" fill="#34d6a8"/>
+<rect x="317" y="395" width="156" height="39" fill="#1f9e8f"/>
+<rect x="551" y="395" width="156" height="39" fill="#34d6a8"/>
+<rect x="356" y="434" width="156" height="39" fill="#1f9e8f"/>
+<rect x="512" y="434" width="78" height="39" fill="#34d6a8"/>
+<rect x="590" y="434" width="39" height="39" fill="#0b0e14"/>
+<rect x="629" y="434" width="39" height="39" fill="#34d6a8"/>
+<rect x="668" y="434" width="156" height="39" fill="#e8ecf1"/>
+<rect x="356" y="473" width="117" height="39" fill="#1f9e8f"/>
+<rect x="473" y="473" width="156" height="39" fill="#34d6a8"/>
+<rect x="629" y="473" width="39" height="39" fill="#ff5d8f"/>
+<rect x="356" y="512" width="78" height="39" fill="#1f9e8f"/>
+<rect x="434" y="512" width="156" height="39" fill="#34d6a8"/>
+<rect x="590" y="512" width="78" height="39" fill="#ff5d8f"/>
+<rect x="317" y="551" width="234" height="39" fill="#34d6a8"/>
+<rect x="551" y="551" width="78" height="39" fill="#c9f7e6"/>
+<rect x="278" y="590" width="234" height="39" fill="#34d6a8"/>
+<rect x="512" y="590" width="78" height="39" fill="#c9f7e6"/>
+<rect x="239" y="629" width="78" height="39" fill="#167a70"/>
+<rect x="317" y="629" width="195" height="39" fill="#34d6a8"/>
+<rect x="512" y="629" width="39" height="39" fill="#c9f7e6"/>
+<rect x="200" y="668" width="117" height="39" fill="#167a70"/>
+<rect x="356" y="668" width="117" height="39" fill="#34d6a8"/>
+<rect x="200" y="707" width="78" height="39" fill="#167a70"/>
+</svg>

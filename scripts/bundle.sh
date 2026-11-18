@@ -7,6 +7,8 @@ APP=target/Colibri.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp target/release/colibri "$APP/Contents/MacOS/colibri"
+mkdir -p "$APP/Contents/Resources"
+cp assets/Colibri.icns "$APP/Contents/Resources/Colibri.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -15,6 +17,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>Colibrí</string>
   <key>CFBundleIdentifier</key><string>dev.colibri.terminal</string>
   <key>CFBundleExecutable</key><string>colibri</string>
+  <key>CFBundleIconFile</key><string>Colibri</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>NSHighResolutionCapable</key><true/>
