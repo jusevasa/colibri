@@ -27,6 +27,8 @@ pub struct Config {
     pub notify: bool,
     /// Al abrir, recupera las pestañas que tenías (en sus carpetas) al cerrar.
     pub restore_tabs: bool,
+    /// ↑ en el prompt abre la lista de comandos usados antes.
+    pub history_popup: bool,
     /// Qué apartados del panel lateral están visibles al abrir.
     pub show_agents: bool,
     pub show_ports: bool,
@@ -92,6 +94,7 @@ impl Default for Config {
             shell: String::new(),
             notify: true,
             restore_tabs: true,
+            history_popup: true,
             show_agents: false,
             show_ports: false,
             show_processes: false,

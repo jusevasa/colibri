@@ -10,12 +10,24 @@ use eframe::egui::{
 #[derive(Clone, PartialEq)]
 pub enum Overlay {
     None,
-    Palette { query: String, sel: usize },
-    Prefs { sel: usize },
-    Rename { text: String },
+    Palette {
+        query: String,
+        sel: usize,
+    },
+    Prefs {
+        sel: usize,
+    },
+    Rename {
+        text: String,
+    },
+    /// Comandos usados antes; `sel` 0 es el más reciente.
+    History {
+        query: String,
+        sel: usize,
+    },
 }
 
-const PREF_ROWS: [(&str, &str); 15] = [
+const PREF_ROWS: [(&str, &str); 16] = [
     ("theme", "Tema"),
     ("font", "Fuente"),
     ("font_size", "Tamaño de fuente"),
@@ -27,6 +39,7 @@ const PREF_ROWS: [(&str, &str); 15] = [
     ("scrollback", "Historial por pestaña"),
     ("restore_tabs", "Recuperar pestañas al abrir"),
     ("notify", "Notificar cuando algo termina"),
+    ("history_popup", "Historial de comandos con ↑"),
     ("show_agents", "Agentes"),
     ("show_ports", "Puertos"),
     ("show_processes", "Procesos"),
@@ -124,6 +137,170 @@ impl App {
             Overlay::Palette { query, sel } => self.palette_ui(ctx, query, sel),
             Overlay::Prefs { sel } => self.prefs_ui(ctx, sel),
             Overlay::Rename { text } => self.rename_ui(ctx, text),
+            Overlay::History { query, sel } => self.history_ui(ctx, query, sel),
+        }
+    }
+
+    /// Lista de comandos anclada al cursor: el más reciente abajo, ↑ va hacia los antiguos.
+    fn history_ui(&mut self, ctx: &egui::Context, mut query: String, mut sel: usize) {
+        if type_into(ctx, &mut query) {
+            sel = 0;
+        }
+        let words: Vec<String> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let items: Vec<&String> = self
+            .history
+            .iter()
+            .filter(|c| {
+                let l = c.to_lowercase();
+                words.iter().all(|w| l.contains(w))
+            })
+            .collect();
+        if pressed(ctx, Key::ArrowUp) && !items.is_empty() {
+            sel = (sel + 1).min(items.len() - 1);
+        }
+        if pressed(ctx, Key::ArrowDown) {
+            // Bajar desde el más reciente cierra la lista, como volver al prompt vacío.
+            if sel == 0 {
+                self.overlay = Overlay::None;
+                return;
+            }
+            sel -= 1;
+        }
+        sel = sel.min(items.len().saturating_sub(1));
+        let mut pick = pressed(ctx, Key::Enter)
+            .then_some(sel)
+            .filter(|_| !items.is_empty());
+
+        const VISIBLE: usize = 8;
+        const ROW: f32 = 26.0;
+        const FOOT: f32 = 30.0;
+        let pal = self.pal.clone();
+        let mono = FontId::monospace(12.5);
+        let small = FontId::proportional(11.0);
+        let screen = ctx.content_rect();
+        let width = 640.0_f32.min(screen.width() - 16.0);
+        let height = items.len().clamp(1, VISIBLE) as f32 * ROW + FOOT + 8.0;
+        let cursor = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.cursor_px)
+            .unwrap_or_else(|| {
+                Rect::from_min_size(
+                    Pos2::new(screen.left() + 16.0, screen.bottom() - 40.0),
+                    Vec2::new(8.0, 18.0),
+                )
+            });
+        // Encima del cursor; si no cabe (cursor en lo alto de la pantalla), debajo.
+        let above = cursor.top() - height - 6.0;
+        let y = if above >= screen.top() + crate::TAB_BAR_H {
+            above
+        } else {
+            cursor.bottom() + 6.0
+        };
+        let max_x = (screen.right() - width - 8.0).max(screen.left() + 8.0);
+        let x = cursor.left().clamp(screen.left() + 8.0, max_x);
+        let first = sel.saturating_sub(VISIBLE - 1);
+        let last = (first + VISIBLE).min(items.len());
+
+        let out = egui::Area::new(Id::unique("history"))
+            .order(Order::Foreground)
+            .fixed_pos(Pos2::new(x, y))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        ui.add_space(4.0);
+                        if items.is_empty() {
+                            let (r, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ROW),
+                                Sense::hover(),
+                            );
+                            ui.painter().text(
+                                Pos2::new(r.left() + 14.0, r.center().y),
+                                Align2::LEFT_CENTER,
+                                "Ningún comando coincide",
+                                mono.clone(),
+                                pal.muted,
+                            );
+                        }
+                        for i in (first..last).rev() {
+                            let (r, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ROW),
+                                Sense::click(),
+                            );
+                            if resp.hovered() && ui.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
+                                sel = i;
+                            }
+                            if resp.clicked() {
+                                pick = Some(i);
+                            }
+                            let p = ui.painter();
+                            if i == sel {
+                                p.rect_filled(
+                                    r.shrink2(Vec2::new(4.0, 1.0)),
+                                    CornerRadius::same(5),
+                                    pal.accent.gamma_multiply(0.16),
+                                );
+                            }
+                            let label = items[i].replace('\n', " ↵ ");
+                            let color = if i == sel { pal.fg } else { pal.muted };
+                            let g = elided(ui.ctx(), &label, &mono, color, r.width() - 28.0);
+                            p.galley(
+                                Pos2::new(r.left() + 14.0, r.center().y - g.size().y / 2.0),
+                                g,
+                                color,
+                            );
+                        }
+                        ui.add_space(4.0);
+                        let (foot, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), FOOT),
+                            Sense::hover(),
+                        );
+                        let p = ui.painter();
+                        p.line_segment(
+                            [foot.left_top(), foot.right_top()],
+                            Stroke::new(1.0, pal.border),
+                        );
+                        let (shown, color) = if query.is_empty() {
+                            ("Escribe para filtrar".to_string(), pal.muted)
+                        } else {
+                            (query.clone(), pal.fg)
+                        };
+                        p.text(
+                            Pos2::new(foot.left() + 14.0, foot.center().y),
+                            Align2::LEFT_CENTER,
+                            format!("›  {shown}"),
+                            mono.clone(),
+                            color,
+                        );
+                        p.text(
+                            Pos2::new(foot.right() - 14.0, foot.center().y),
+                            Align2::RIGHT_CENTER,
+                            "↑↓ elegir  ·  ↩ insertar  ·  esc cerrar",
+                            small.clone(),
+                            pal.muted,
+                        );
+                    });
+            });
+
+        if let Some(i) = pick {
+            let cmd = items[i].clone();
+            self.overlay = Overlay::None;
+            if let Some(s) = self.sessions.get_mut(self.active) {
+                s.insert_command(&cmd);
+            }
+        } else if clicked_outside(ctx, out.response.rect) {
+            self.overlay = Overlay::None;
+        } else {
+            self.overlay = Overlay::History { query, sel };
         }
     }
 
@@ -145,6 +322,8 @@ impl App {
             ("Tamaño de texto original", Cmd::FontReset),
             ("Limpiar pantalla e historial", Cmd::Clear),
             ("Abrir config.toml en el editor", Cmd::OpenConfig),
+            ("Reiniciar Colibrí con la última compilación", Cmd::Restart),
+            ("Historial de comandos", Cmd::History),
         ];
         let mut items: Vec<(String, String, Cmd)> = commands
             .iter()
@@ -326,6 +505,7 @@ impl App {
             "blur" => (String::new(), Some(c.blur)),
             "restore_tabs" => (String::new(), Some(c.restore_tabs)),
             "notify" => (String::new(), Some(c.notify)),
+            "history_popup" => (String::new(), Some(c.history_popup)),
             "show_agents" => (String::new(), Some(c.show_agents)),
             "show_ports" => (String::new(), Some(c.show_ports)),
             "show_processes" => (String::new(), Some(c.show_processes)),
@@ -386,6 +566,7 @@ impl App {
             "blur" => c.blur = !c.blur,
             "restore_tabs" => c.restore_tabs = !c.restore_tabs,
             "notify" => c.notify = !c.notify,
+            "history_popup" => c.history_popup = !c.history_popup,
             "show_agents" => c.show_agents = !c.show_agents,
             "show_ports" => c.show_ports = !c.show_ports,
             "show_processes" => c.show_processes = !c.show_processes,

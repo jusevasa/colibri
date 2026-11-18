@@ -1,6 +1,7 @@
 //! Guion de depuración: COLIBRI_SCRIPT=archivo ejecuta pasos y guarda capturas del propio render.
 //! Pasos (uno por línea): `type <texto>` (\n = Enter), `wait <ms>`, `tab`, `select <n>`,
-//! `shot <ruta.bmp>`, `procs`, `killport <puerto>`, `quit`.
+//! `move <de> <a>`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`,
+//! `open palette|prefs|history`, `key up|down|enter|esc`, `pref <id> <+1|-1>`, `update`, `quit`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -19,12 +20,19 @@ pub enum Step {
     Hover,
     /// Detiene el proceso que escucha en ese puerto (mismo camino que el botón).
     KillPort(u16),
-    /// Abre la paleta (`open palette`) o las preferencias (`open prefs`).
+    /// Abre la paleta (`open palette`), las preferencias (`open prefs`) o el historial
+    /// de comandos (`open history`).
     Open(String),
     /// Cambia una preferencia: `pref <id> <+1|-1>`.
     Pref(String, i32),
     /// Pone nombre a la pestaña activa.
     Name(String),
+    /// Pulsa una tecla como si viniera del teclado: `key up|down|enter|esc`.
+    Key(String),
+    /// Mueve una pestaña de una posición a otra (lo mismo que arrastrarla).
+    Move(usize, usize),
+    /// Muestra u oculta el botón «Actualizar» sin que haya una compilación nueva.
+    Update,
     Quit,
 }
 
@@ -57,6 +65,12 @@ impl Script {
                         Step::Pref(id.to_string(), dir.parse().ok()?)
                     }
                     "name" => Step::Name(arg.to_string()),
+                    "move" => {
+                        let (from, to) = arg.split_once(' ')?;
+                        Step::Move(from.parse().ok()?, to.parse().ok()?)
+                    }
+                    "key" => Step::Key(arg.to_string()),
+                    "update" => Step::Update,
                     "quit" => Step::Quit,
                     _ => return None,
                 })

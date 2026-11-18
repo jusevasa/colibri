@@ -111,6 +111,7 @@ pub fn show(
     let mut bgs: Vec<BgRun> = Vec::new();
     let mut texts: Vec<TextRun> = Vec::new();
     let mut lines_deco: Vec<(i32, usize, usize, Color32, bool)> = Vec::new();
+    let mut dots: Vec<(i32, usize, Color32)> = Vec::new();
     let cursor;
     let cursor_cell_fg;
     {
@@ -174,6 +175,12 @@ pub fn show(
             if c == ' ' || c == '\0' || flags.contains(Flags::HIDDEN) {
                 continue;
             }
+            // ⏺ (la viñeta de Claude Code) solo existe como emoji de color en macOS:
+            // se dibuja a mano para que salga como un punto del color del texto.
+            if c == '\u{23FA}' {
+                dots.push((row, col, fg));
+                continue;
+            }
             let bold = flags.contains(Flags::BOLD);
             let zero = cell.zerowidth();
             let ascii = c.is_ascii() && zero.is_none();
@@ -229,6 +236,10 @@ pub fn show(
         };
         painter.text(pos, Align2::LEFT_TOP, t.text, font, t.fg);
     }
+    for (row, col, color) in dots {
+        let center = cell_pos(row, col) + Vec2::new(m.cell_w, m.cell_h) / 2.0;
+        painter.circle_filled(center, (m.cell_w * 0.45).min(m.cell_h * 0.3), color);
+    }
     for (row, col, width, color, strike) in lines_deco {
         let p = cell_pos(row, col);
         let y = if strike {
@@ -255,6 +266,7 @@ pub fn show(
     if shape != CursorShape::Hidden && crow >= 0 && (crow as usize) < lines {
         let min = cell_pos(crow, ccol);
         let cell = Rect::from_min_size(min, Vec2::new(m.cell_w, m.cell_h));
+        s.cursor_px = Some(cell);
         if !focused {
             painter.rect_stroke(cell, 0.0, Stroke::new(1.0, pal.cursor), StrokeKind::Inside);
         } else {

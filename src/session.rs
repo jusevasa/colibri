@@ -147,6 +147,13 @@ pub struct Session {
     dirty: bool,
     last_poll: Instant,
     pub scroll_acc: f32,
+    /// Celda del cursor en pantalla en el último cuadro (para anclar el historial).
+    pub cursor_px: Option<egui::Rect>,
+    /// Lo tecleado en el prompt desde el último Enter. None = se perdió la pista
+    /// (hubo teclas de edición: flechas, tabulador…).
+    line: Option<String>,
+    /// Comandos tecleados en esta pestaña, del más antiguo al más reciente.
+    pub typed: Vec<String>,
     /// Última celda informada al programa y botón que se mantiene pulsado.
     pub mouse_cell: Option<(usize, usize)>,
     pub mouse_down: Option<u8>,
@@ -239,6 +246,9 @@ impl Session {
             dirty: true,
             last_poll: old,
             scroll_acc: 0.0,
+            cursor_px: None,
+            line: Some(String::new()),
+            typed: Vec::new(),
             mouse_cell: None,
             mouse_down: None,
         })
@@ -252,9 +262,71 @@ impl Session {
 
     /// Entrada del usuario (teclado o pegar).
     pub fn input(&mut self, bytes: Vec<u8>) {
+        self.track(&bytes);
         self.last_input = Instant::now();
         self.term.lock().scroll_display(Scroll::Bottom);
         self.send(bytes);
+    }
+
+    /// Reconstruye el comando que se teclea en el prompt, para ofrecerlo en el historial
+    /// aunque el shell aún no lo haya guardado. Lo que se le escribe a otro programa
+    /// (contraseñas de sudo, mensajes a un agente) no se registra.
+    fn track(&mut self, bytes: &[u8]) {
+        if self.fg_pid != self.shell_pid {
+            self.line = Some(String::new());
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            self.line = None;
+            return;
+        };
+        for c in text.chars() {
+            match c {
+                '\r' | '\n' => {
+                    // Como en zsh: lo que empieza por espacio no se guarda.
+                    if let Some(line) = self.line.take().filter(|l| !l.starts_with(' ')) {
+                        let line = line.trim();
+                        if !line.is_empty() {
+                            self.typed.push(line.to_string());
+                            if self.typed.len() > 500 {
+                                self.typed.remove(0);
+                            }
+                        }
+                    }
+                    self.line = Some(String::new());
+                }
+                '\u{3}' | '\u{15}' => self.line = Some(String::new()),
+                '\u{7f}' | '\u{8}' => {
+                    if let Some(line) = &mut self.line {
+                        line.pop();
+                    }
+                }
+                c if c.is_control() => self.line = None,
+                c => {
+                    if let Some(line) = &mut self.line {
+                        line.push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// El shell espera un comando: no corre nada encima ni hay un programa a pantalla completa.
+    pub fn at_prompt(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.fg_pid == self.shell_pid
+            && !self
+                .term
+                .lock()
+                .mode()
+                .intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+    }
+
+    /// Deja `cmd` escrito en el prompt, en lugar de lo que hubiera, sin ejecutarlo.
+    pub fn insert_command(&mut self, cmd: &str) {
+        self.input(vec![0x15]);
+        self.paste(cmd);
+        self.line = Some(cmd.to_string());
     }
 
     /// Informes de ratón: van al programa sin mover el scroll.
@@ -448,7 +520,20 @@ impl Session {
             return self.name.clone();
         }
         match self.agent {
-            Some(_) => self.project(),
+            // Claude Code pone el nombre de la sesión en el título: «carpeta · sesión».
+            Some(agent) => {
+                let project = self.project();
+                let title = self.clean_title();
+                if agent == Agent::Claude
+                    && !title.is_empty()
+                    && title != agent.label()
+                    && title != project
+                {
+                    format!("{project} · {title}")
+                } else {
+                    project
+                }
+            }
             None if self.fg_pid != self.shell_pid && !self.fg_name.is_empty() => {
                 format!("{} · {}", self.fg_name, self.project())
             }

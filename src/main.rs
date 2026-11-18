@@ -4,6 +4,7 @@
 mod blur;
 mod config;
 mod debug;
+mod history;
 mod notify;
 mod overlay;
 mod ports;
@@ -65,6 +66,8 @@ pub enum Cmd {
     OpenConfig,
     Clear,
     RenameTab,
+    Restart,
+    History,
     GoTab(usize),
 }
 
@@ -148,6 +151,18 @@ struct App {
     state_checked: Instant,
     overlay: overlay::Overlay,
     font_choices: Vec<(String, String, String)>,
+    /// Fecha del ejecutable al arrancar: si cambia, hay una compilación nueva.
+    exe_started: Option<SystemTime>,
+    exe_checked: Instant,
+    update_ready: bool,
+    /// Solo para pruebas: muestra el botón «Actualizar» aunque no haya nada nuevo.
+    force_update: bool,
+    /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
+    drag_tab: Option<(u64, f32)>,
+    /// Comandos que muestra el historial, del más reciente al más antiguo.
+    history: Vec<String>,
+    /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
+    script_keys: Vec<egui::Key>,
 }
 
 impl App {
@@ -187,6 +202,13 @@ impl App {
             state_checked: Instant::now(),
             overlay: overlay::Overlay::None,
             font_choices: Vec::new(),
+            exe_started: exe_mtime(),
+            exe_checked: Instant::now(),
+            update_ready: false,
+            force_update: false,
+            drag_tab: None,
+            history: Vec::new(),
+            script_keys: Vec::new(),
             cfg,
         };
         app.state_path = state::path(app.script.is_some());
@@ -261,6 +283,110 @@ impl App {
         }
     }
 
+    /// Lee el historial del shell y le suma lo tecleado aquí (primero la pestaña activa).
+    fn load_history(&mut self) {
+        let shell = if self.cfg.shell.is_empty() {
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+        } else {
+            self.cfg.shell.clone()
+        };
+        let mut typed: Vec<String> = Vec::new();
+        for (i, s) in self.sessions.iter().enumerate() {
+            if i != self.active {
+                typed.extend(s.typed.iter().cloned());
+            }
+        }
+        if let Some(s) = self.sessions.get(self.active) {
+            typed.extend(s.typed.iter().cloned());
+        }
+        self.history = history::load(&shell, &typed);
+    }
+
+    /// ↑ en el prompt abre el historial; en cualquier otro caso la tecla sigue su camino.
+    fn history_key(&mut self, ctx: &egui::Context) {
+        if !self.cfg.history_popup
+            || !self
+                .sessions
+                .get(self.active)
+                .is_some_and(|s| s.at_prompt())
+        {
+            return;
+        }
+        let up = Shortcut {
+            cmd: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            key: egui::Key::ArrowUp,
+        };
+        if !take_shortcut(ctx, &up) {
+            return;
+        }
+        self.load_history();
+        if self.history.is_empty() {
+            // Sin historial que mostrar, el shell recibe su flecha de siempre.
+            if let Some(s) = self.sessions.get_mut(self.active) {
+                let app = s
+                    .term
+                    .lock()
+                    .mode()
+                    .contains(alacritty_terminal::term::TermMode::APP_CURSOR);
+                s.input(if app {
+                    b"\x1bOA".to_vec()
+                } else {
+                    b"\x1b[A".to_vec()
+                });
+            }
+            return;
+        }
+        self.overlay = overlay::Overlay::History {
+            query: String::new(),
+            sel: 0,
+        };
+        ctx.request_repaint();
+    }
+
+    /// Arranca la versión que hay ahora en disco y cierra esta. Las pestañas se guardan
+    /// antes y la nueva las reabre; lo que estuviera corriendo en ellas se detiene.
+    fn restart(&mut self) {
+        self.state_checked = Instant::now() - Duration::from_secs(3);
+        self.save_tabs();
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        // Dentro de Colibri.app se relanza el bundle, para conservar permisos y notificaciones.
+        let bundle = exe
+            .ancestors()
+            .find(|p| p.extension().is_some_and(|e| e == "app"));
+        let launched = match bundle {
+            Some(app) => std::process::Command::new("/usr/bin/open")
+                .arg("-n")
+                .arg(app)
+                .spawn(),
+            None => std::process::Command::new(&exe).spawn(),
+        };
+        match launched {
+            Ok(_) => std::process::exit(0),
+            Err(e) => eprintln!("colibri: no se pudo reiniciar: {e}"),
+        }
+    }
+
+    /// Hay una compilación nueva cuando el ejecutable cambió y lleva 2 s sin tocarse
+    /// (bundle.sh lo copia y luego lo firma: no hay que arrancarlo a medias).
+    fn check_update(&mut self, ctx: &egui::Context) {
+        if self.exe_checked.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.exe_checked = Instant::now();
+        let changed = exe_mtime().filter(|m| self.exe_started.is_some_and(|s| s != *m));
+        let settled =
+            changed.is_some_and(|m| m.elapsed().is_ok_and(|d| d > Duration::from_secs(2)));
+        if changed.is_some() && !settled {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+        self.update_ready = settled;
+    }
+
     fn new_tab(&mut self, ctx: &egui::Context, cwd: Option<std::path::PathBuf>) {
         match Session::new(self.next_id, &self.cfg, cwd, ctx) {
             Ok(s) => {
@@ -279,6 +405,20 @@ impl App {
         self.sessions.remove(i);
         if self.active > i || self.active >= self.sessions.len() {
             self.active = self.active.saturating_sub(1);
+        }
+    }
+
+    /// Cambia una pestaña de posición; la activa sigue siendo la misma.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        let n = self.sessions.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let active_id = self.sessions.get(self.active).map(|s| s.id);
+        let tab = self.sessions.remove(from);
+        self.sessions.insert(to, tab);
+        if let Some(i) = active_id.and_then(|id| self.sessions.iter().position(|s| s.id == id)) {
+            self.active = i;
         }
     }
 
@@ -435,6 +575,19 @@ impl App {
                     &["-t".into(), config::path().display().to_string()],
                 );
             }
+            Cmd::Restart => self.restart(),
+            Cmd::History => {
+                self.overlay = match self.overlay {
+                    overlay::Overlay::History { .. } => overlay::Overlay::None,
+                    _ => {
+                        self.load_history();
+                        overlay::Overlay::History {
+                            query: String::new(),
+                            sel: 0,
+                        }
+                    }
+                };
+            }
             Cmd::Clear => {
                 if let Some(s) = self.sessions.get_mut(self.active) {
                     s.term.lock().grid_mut().clear_history();
@@ -500,10 +653,10 @@ impl App {
             Some(debug::Step::Open(what)) => {
                 self.run(
                     ctx,
-                    if what == "prefs" {
-                        Cmd::Prefs
-                    } else {
-                        Cmd::Palette
+                    match what.as_str() {
+                        "prefs" => Cmd::Prefs,
+                        "history" => Cmd::History,
+                        _ => Cmd::Palette,
                     },
                 );
             }
@@ -513,6 +666,18 @@ impl App {
                     s.name = name;
                 }
             }
+            Some(debug::Step::Move(from, to)) => self.move_tab(from, to),
+            Some(debug::Step::Key(name)) => {
+                let name = match name.as_str() {
+                    "up" => "ArrowUp",
+                    "down" => "ArrowDown",
+                    "enter" => "Enter",
+                    "esc" => "Escape",
+                    other => other,
+                };
+                self.script_keys.extend(egui::Key::from_name(name));
+            }
+            Some(debug::Step::Update) => self.force_update = !self.force_update,
             Some(debug::Step::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
             Some(debug::Step::Wait(_)) | None => {}
         }
@@ -545,7 +710,8 @@ impl App {
         let full = ui.max_rect();
         let time = ui.input(|i| i.time);
         let n = self.sessions.len().max(1);
-        let right_reserved = 158.0;
+        let show_update = self.update_ready || self.force_update;
+        let right_reserved = if show_update { 252.0 } else { 158.0 };
         let avail = full.width() - TRAFFIC_LIGHTS_W - right_reserved - 34.0;
         let tab_w = (avail / n as f32).clamp(64.0, 230.0);
         let ui_font = FontId::proportional(12.5);
@@ -553,17 +719,55 @@ impl App {
         let mut select = None;
         let mut close = None;
         let mut rename = None;
-        let mut x = full.left() + TRAFFIC_LIGHTS_W;
+        let mut moved = None;
+        let mut grabbed = None;
+        let tabs_left = full.left() + TRAFFIC_LIGHTS_W;
+        let pointer_x = ui.input(|i| i.pointer.latest_pos().map(|p| p.x));
+        if !ui.input(|i| i.pointer.primary_down()) {
+            self.drag_tab = None;
+        }
+        let mut x = tabs_left;
         for (i, s) in self.sessions.iter().enumerate() {
-            let rect = Rect::from_min_size(
+            let mut rect = Rect::from_min_size(
                 Pos2::new(x, full.top() + 5.0),
                 Vec2::new(tab_w - 4.0, TAB_BAR_H - 9.0),
             );
             x += tab_w;
-            let resp = ui.interact(rect, ui.scope_id().with(("tab", s.id)), Sense::click());
+            // La pestaña arrastrada sigue al puntero; al cruzar a otro hueco cambia de sitio.
+            let dragging = match (self.drag_tab, pointer_x) {
+                (Some((id, grab)), Some(px)) if id == s.id => {
+                    let last = tabs_left + (self.sessions.len() - 1) as f32 * tab_w;
+                    let left = (px - grab).clamp(tabs_left, last);
+                    rect = rect.translate(Vec2::new(left - rect.left(), 0.0));
+                    let slot = ((left + tab_w / 2.0 - tabs_left) / tab_w).floor() as usize;
+                    if slot != i {
+                        moved = Some((i, slot));
+                    }
+                    true
+                }
+                _ => false,
+            };
+            let resp = ui.interact(
+                rect,
+                ui.scope_id().with(("tab", s.id)),
+                Sense::click_and_drag(),
+            );
+            if resp.drag_started() {
+                if let Some(px) = pointer_x {
+                    grabbed = Some((i, s.id, px - rect.left()));
+                }
+            }
             let active = i == self.active;
-            let hovered = resp.hovered();
-            let p = ui.painter();
+            let hovered = resp.hovered() && (self.drag_tab.is_none() || dragging);
+            // Encima de las demás mientras se mueve.
+            let p = &if dragging {
+                ui.painter().clone().with_layer_id(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::unique("tab-drag"),
+                ))
+            } else {
+                ui.painter().clone()
+            };
             if active {
                 p.rect_filled(rect, CornerRadius::same(7), pal.tab_active);
                 p.rect_stroke(
@@ -604,7 +808,7 @@ impl App {
                 Pos2::new(rect.right() - 14.0, rect.center().y),
                 Vec2::splat(18.0),
             );
-            let over_close = hovered && ui.rect_contains_pointer(close_rect);
+            let over_close = hovered && !dragging && ui.rect_contains_pointer(close_rect);
             if hovered {
                 if over_close {
                     p.rect_filled(
@@ -643,7 +847,9 @@ impl App {
             if resp.double_clicked() && !over_close {
                 rename = Some(i);
             }
-            resp.on_hover_ui(|ui| tab_tooltip(ui, s, &pal));
+            if self.drag_tab.is_none() {
+                resp.on_hover_ui(|ui| tab_tooltip(ui, s, &pal));
+            }
         }
 
         // Botón de nueva pestaña.
@@ -718,10 +924,40 @@ impl App {
             );
         }
 
+        // Compilación nueva en disco: un clic reinicia y la toma.
+        let mut right_edge = toggle.left() - 24.0;
+        let mut restart = false;
+        if show_update {
+            let pill = Rect::from_min_max(
+                Pos2::new(right_edge - 86.0, cy - 11.0),
+                Pos2::new(right_edge, cy + 11.0),
+            );
+            let resp = ui.interact(pill, ui.scope_id().with("update"), Sense::click());
+            let fill = if resp.hovered() {
+                pal.accent
+            } else {
+                pal.accent.gamma_multiply(0.85)
+            };
+            let p = ui.painter();
+            p.rect_filled(pill, CornerRadius::same(6), fill);
+            p.text(
+                pill.center(),
+                Align2::CENTER_CENTER,
+                "Actualizar",
+                FontId::proportional(11.5),
+                pal.bg,
+            );
+            restart = resp.clicked();
+            resp.on_hover_text(
+                "Hay una compilación nueva. Reinicia Colibrí y reabre tus pestañas;\nlo que esté corriendo en ellas se detiene.",
+            );
+            right_edge = pill.left() - 8.0;
+        }
+
         // El resto de la barra arrastra la ventana.
         let drag_rect = Rect::from_min_max(
             Pos2::new(x + 30.0, full.top()),
-            Pos2::new(toggle.left() - 24.0, full.bottom()),
+            Pos2::new(right_edge, full.bottom()),
         );
         if drag_rect.width() > 4.0 {
             let drag = ui.interact(
@@ -741,6 +977,13 @@ impl App {
         if let Some(i) = select {
             self.select(i);
         }
+        if let Some((i, id, grab)) = grabbed {
+            self.select(i);
+            self.drag_tab = Some((id, grab));
+        }
+        if let Some((from, to)) = moved {
+            self.move_tab(from, to);
+        }
         if let Some(i) = close {
             self.close_tab(i);
         }
@@ -751,6 +994,9 @@ impl App {
         if plus_clicked {
             let cwd = self.sessions.get(self.active).map(|s| s.cwd.clone());
             self.new_tab(&ctx, cwd);
+        }
+        if restart {
+            self.restart();
         }
     }
 
@@ -1269,6 +1515,20 @@ impl eframe::App for App {
         [0.0, 0.0, 0.0, 0.0]
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        for key in self.script_keys.drain(..) {
+            for pressed in [true, false] {
+                raw.events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
@@ -1282,6 +1542,7 @@ impl eframe::App for App {
         }
 
         self.run_script(ctx);
+        self.check_update(ctx);
 
         let mut notes = Vec::new();
         for (i, s) in self.sessions.iter_mut().enumerate() {
@@ -1397,6 +1658,9 @@ impl eframe::App for App {
 
         let metrics = self.metrics(&ctx);
         let focused = self.focused;
+        if !self.search_focus && self.overlay == overlay::Overlay::None {
+            self.history_key(&ctx);
+        }
         let keyboard = !self.search_focus && self.overlay == overlay::Overlay::None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
@@ -1493,6 +1757,10 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
             (menlo, 1, None),
         ],
     );
+    // Menlo va siempre detrás de la fuente elegida: trae los símbolos (✳ ✢ ✶ ✻ ✽ …) que
+    // usan los agentes y que casi ninguna fuente de programar incluye. Sin él, esos
+    // caracteres caían en el emoji de color del sistema o en un recuadro vacío.
+    let has_menlo = !cfg.font_path.is_empty() && load("term-menlo", &[(menlo, 0, None)]);
     let has_symbols = load(
         "term-symbols",
         &[("/System/Library/Fonts/Apple Symbols.ttf", 0, None)],
@@ -1503,6 +1771,9 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
         v.extend(first.map(str::to_string));
         if has_regular && first != Some("term-regular") {
             v.push("term-regular".into());
+        }
+        if has_menlo {
+            v.push("term-menlo".into());
         }
         v.extend(fallback.iter().cloned());
         if has_symbols {
@@ -1897,6 +2168,12 @@ fn ago(d: Duration) -> String {
         60..=3599 => format!("{} min", s / 60),
         _ => format!("{} h", s / 3600),
     }
+}
+
+fn exe_mtime() -> Option<SystemTime> {
+    std::fs::metadata(std::env::current_exe().ok()?)
+        .and_then(|m| m.modified())
+        .ok()
 }
 
 fn spawn_detached(program: &str, args: &[String]) {
