@@ -482,25 +482,6 @@ impl App {
         for cmd in hits {
             self.run(ctx, cmd);
         }
-        let ctrl_tab = Shortcut {
-            cmd: false,
-            ctrl: true,
-            shift: false,
-            alt: false,
-            key: egui::Key::Tab,
-        };
-        if take_shortcut(ctx, &ctrl_tab) {
-            self.run(ctx, Cmd::NextTab);
-        }
-        if take_shortcut(
-            ctx,
-            &Shortcut {
-                shift: true,
-                ..ctrl_tab
-            },
-        ) {
-            self.run(ctx, Cmd::PrevTab);
-        }
         const DIGITS: [egui::Key; 9] = [
             egui::Key::Num1,
             egui::Key::Num2,

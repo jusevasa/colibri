@@ -135,8 +135,8 @@ impl Default for Keys {
         Self {
             new_tab: "cmd+t".into(),
             close_tab: "cmd+w".into(),
-            next_tab: "cmd+shift+]".into(),
-            prev_tab: "cmd+shift+[".into(),
+            next_tab: "cmd+alt+right".into(),
+            prev_tab: "cmd+alt+left".into(),
             move_tab_left: "cmd+shift+left".into(),
             move_tab_right: "cmd+shift+right".into(),
             jump_finished: "cmd+j".into(),
@@ -158,8 +158,8 @@ impl Default for Keys {
 
 const HEADER: &str = "\
 # Colibrí — configuración. Los cambios se aplican al guardar.
-# Atajos: combina cmd, ctrl, shift, alt con una tecla: \"cmd+shift+j\", \"ctrl+tab\", \"cmd+shift+left\".
-# Fijos: cmd+1..9 va a la pestaña N, ctrl+tab / ctrl+shift+tab cambia de pestaña.
+# Atajos: combina cmd, ctrl, shift, alt con una tecla: \"cmd+shift+j\", \"cmd+alt+right\", \"ctrl+tab\".
+# Fijo: cmd+1..9 va a la pestaña N.
 # Colores en formato #rrggbb.
 
 ";
