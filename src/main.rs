@@ -31,6 +31,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Colibrí")
+            // Sin esto eframe pone su propio icono en el Dock al arrancar y tapa el del
+            // bundle (assets/Colibri.icns). Con el icono vacío macOS usa el de Colibri.app.
+            .with_icon(egui::IconData::default())
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([480.0, 300.0])
             .with_fullsize_content_view(true)
