@@ -1,7 +1,8 @@
 //! Guion de depuración: COLIBRI_SCRIPT=archivo ejecuta pasos y guarda capturas del propio render.
 //! Pasos (uno por línea): `type <texto>` (\n = Enter), `wait <ms>`, `tab`, `select <n>`,
 //! `move <de> <a>`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`,
-//! `open palette|prefs|history`, `key up|down|enter|esc`, `pref <id> <+1|-1>`, `update`, `quit`.
+//! `open palette|prefs|history`, `key up|down|enter|esc`,
+//! `press <x> <y>`, `moveto <x> <y>`, `release <x> <y>`, `pref <id> <+1|-1>`, `update`, `quit`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -29,6 +30,8 @@ pub enum Step {
     Name(String),
     /// Pulsa una tecla como si viniera del teclado: `key up|down|enter|esc`.
     Key(String),
+    /// Puntero simulado, en puntos de la ventana: `press`, `moveto` o `release` + `<x> <y>`.
+    Pointer(String, f32, f32),
     /// Mueve una pestaña de una posición a otra (lo mismo que arrastrarla).
     Move(usize, usize),
     /// Muestra u oculta el botón «Actualizar» sin que haya una compilación nueva.
@@ -70,6 +73,10 @@ impl Script {
                         Step::Move(from.parse().ok()?, to.parse().ok()?)
                     }
                     "key" => Step::Key(arg.to_string()),
+                    "press" | "moveto" | "release" => {
+                        let (x, y) = arg.split_once(' ')?;
+                        Step::Pointer(cmd.to_string(), x.parse().ok()?, y.parse().ok()?)
+                    }
                     "update" => Step::Update,
                     "quit" => Step::Quit,
                     _ => return None,

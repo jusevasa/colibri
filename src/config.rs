@@ -62,6 +62,9 @@ pub struct Keys {
     pub close_tab: String,
     pub next_tab: String,
     pub prev_tab: String,
+    /// Cambia la pestaña activa de posición.
+    pub move_tab_left: String,
+    pub move_tab_right: String,
     /// Salta a la pestaña del agente que terminó más recientemente.
     pub jump_finished: String,
     /// Muestra u oculta los dos apartados a la vez.
@@ -134,6 +137,8 @@ impl Default for Keys {
             close_tab: "cmd+w".into(),
             next_tab: "cmd+shift+]".into(),
             prev_tab: "cmd+shift+[".into(),
+            move_tab_left: "cmd+shift+left".into(),
+            move_tab_right: "cmd+shift+right".into(),
             jump_finished: "cmd+j".into(),
             toggle_panel: "cmd+b".into(),
             toggle_agents: "cmd+shift+a".into(),
@@ -153,7 +158,7 @@ impl Default for Keys {
 
 const HEADER: &str = "\
 # Colibrí — configuración. Los cambios se aplican al guardar.
-# Atajos: combina cmd, ctrl, shift, alt con una tecla: \"cmd+shift+j\", \"ctrl+tab\".
+# Atajos: combina cmd, ctrl, shift, alt con una tecla: \"cmd+shift+j\", \"ctrl+tab\", \"cmd+shift+left\".
 # Fijos: cmd+1..9 va a la pestaña N, ctrl+tab / ctrl+shift+tab cambia de pestaña.
 # Colores en formato #rrggbb.
 
@@ -348,6 +353,10 @@ pub fn pretty_shortcut(s: &str) -> String {
             "shift" => mods.push('⇧'),
             "cmd" | "command" | "super" => mods.push('⌘'),
             "tab" => key = "⇥".into(),
+            "left" | "arrowleft" => key = "←".into(),
+            "right" | "arrowright" => key = "→".into(),
+            "up" | "arrowup" => key = "↑".into(),
+            "down" | "arrowdown" => key = "↓".into(),
             "enter" => key = "↩".into(),
             other => key = other.to_uppercase(),
         }
@@ -455,10 +464,13 @@ impl Shortcut {
                 "shift" => sc.shift = true,
                 "alt" | "opt" | "option" => sc.alt = true,
                 other => {
-                    let name = if other.chars().count() == 1 {
-                        other.to_uppercase()
-                    } else {
-                        part.to_string()
+                    let name = match other {
+                        "left" => "ArrowLeft".to_string(),
+                        "right" => "ArrowRight".to_string(),
+                        "up" => "ArrowUp".to_string(),
+                        "down" => "ArrowDown".to_string(),
+                        _ if other.chars().count() == 1 => other.to_uppercase(),
+                        _ => part.to_string(),
                     };
                     let key = Key::from_name(&name).or_else(|| {
                         let mut c = part.chars();

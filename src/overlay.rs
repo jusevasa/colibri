@@ -310,6 +310,8 @@ impl App {
             ("Cerrar pestaña", Cmd::CloseTab),
             ("Pestaña siguiente", Cmd::NextTab),
             ("Pestaña anterior", Cmd::PrevTab),
+            ("Mover pestaña a la izquierda", Cmd::MoveTabLeft),
+            ("Mover pestaña a la derecha", Cmd::MoveTabRight),
             ("Renombrar pestaña…", Cmd::RenameTab),
             ("Ir al agente que terminó", Cmd::JumpFinished),
             ("Preferencias: tema, fuente, tamaño…", Cmd::Prefs),

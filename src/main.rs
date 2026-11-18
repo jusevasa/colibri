@@ -56,6 +56,8 @@ pub enum Cmd {
     CloseTab,
     NextTab,
     PrevTab,
+    MoveTabLeft,
+    MoveTabRight,
     JumpFinished,
     TogglePanel,
     ToggleAgents,
@@ -88,6 +90,8 @@ impl Keys {
             (Cmd::CloseTab, &k.close_tab),
             (Cmd::NextTab, &k.next_tab),
             (Cmd::PrevTab, &k.prev_tab),
+            (Cmd::MoveTabLeft, &k.move_tab_left),
+            (Cmd::MoveTabRight, &k.move_tab_right),
             (Cmd::JumpFinished, &k.jump_finished),
             (Cmd::TogglePanel, &k.toggle_panel),
             (Cmd::ToggleProcs, &k.toggle_processes),
@@ -166,6 +170,10 @@ struct App {
     history: Vec<String>,
     /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
     script_keys: Vec<egui::Key>,
+    /// Solo para pruebas: eventos de puntero del guion (`press`, `moveto`, `release`).
+    script_pointer: Vec<egui::Event>,
+    /// Si macOS puede mover la ventana ahora mismo (se apaga con el puntero sobre las pestañas).
+    window_movable: Option<bool>,
 }
 
 impl App {
@@ -212,6 +220,8 @@ impl App {
             drag_tab: None,
             history: Vec::new(),
             script_keys: Vec::new(),
+            script_pointer: Vec::new(),
+            window_movable: None,
             cfg,
         };
         app.state_path = state::path(app.script.is_some());
@@ -532,6 +542,9 @@ impl App {
             Cmd::NextTab if n > 0 => self.select((self.active + 1) % n),
             Cmd::PrevTab if n > 0 => self.select((self.active + n - 1) % n),
             Cmd::NextTab | Cmd::PrevTab => {}
+            Cmd::MoveTabLeft if self.active > 0 => self.move_tab(self.active, self.active - 1),
+            Cmd::MoveTabRight => self.move_tab(self.active, self.active + 1),
+            Cmd::MoveTabLeft => {}
             Cmd::GoTab(i) => self.select(i),
             Cmd::JumpFinished => self.jump_finished(),
             Cmd::TogglePanel => {
@@ -679,6 +692,18 @@ impl App {
                     other => other,
                 };
                 self.script_keys.extend(egui::Key::from_name(name));
+            }
+            Some(debug::Step::Pointer(kind, x, y)) => {
+                let pos = Pos2::new(x, y);
+                self.script_pointer.push(egui::Event::PointerMoved(pos));
+                if kind != "moveto" {
+                    self.script_pointer.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: kind == "press",
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
             }
             Some(debug::Step::Update) => self.force_update = !self.force_update,
             Some(debug::Step::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -853,6 +878,21 @@ impl App {
             if self.drag_tab.is_none() {
                 resp.on_hover_ui(|ui| tab_tooltip(ui, s, &pal));
             }
+        }
+
+        // Sobre las pestañas el arrastre es nuestro (reordenar), no de macOS (mover la ventana).
+        let tabs_zone = Rect::from_min_max(
+            Pos2::new(tabs_left, full.top()),
+            Pos2::new(x + 30.0, full.bottom()),
+        );
+        let over_tabs = ui.input(|i| {
+            i.pointer
+                .latest_pos()
+                .is_some_and(|p| tabs_zone.contains(p))
+        });
+        let movable = !(over_tabs || self.drag_tab.is_some() || grabbed.is_some());
+        if self.window_movable != Some(movable) && blur::set_movable(movable) {
+            self.window_movable = Some(movable);
         }
 
         // Botón de nueva pestaña.
@@ -1519,6 +1559,7 @@ impl eframe::App for App {
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        raw.events.append(&mut self.script_pointer);
         for key in self.script_keys.drain(..) {
             for pressed in [true, false] {
                 raw.events.push(egui::Event::Key {
