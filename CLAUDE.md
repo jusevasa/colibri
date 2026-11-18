@@ -17,9 +17,11 @@ cargo test                     # las únicas pruebas están en src/view.rs
 cargo test sgr_press_release   # una sola prueba, por nombre
 cargo fmt && cargo clippy
 scripts/bundle.sh              # release + target/Colibri.app firmada
+scripts/rebundle.sh            # lo mismo, pero solo si el código cambió desde el último bundle
 python3 scripts/icon.py assets # regenera assets/colibri.svg y colibri-1024.png
 ```
 
+- **Rebundle automático**: `.claude/settings.json` (a nivel de proyecto, versionado) tiene un hook `Stop` que corre `scripts/rebundle.sh` cuando Claude Code termina un turno. El script solo llama a `bundle.sh` si algo de `src/`, `assets/`, `Cargo.toml`, `Cargo.lock` o `scripts/bundle.sh` es más nuevo que el ejecutable del bundle; si no, no hace nada. Así el Colibrí abierto muestra «Actualizar» tras cada cambio sin correr nada a mano. Si la compilación falla solo avisa, no bloquea. Se desactiva desde `/hooks` o borrando la entrada.
 - `scripts/bundle.sh` firma con una identidad fija para que macOS recuerde los permisos entre compilaciones; se cambia con `COLIBRI_SIGN_ID`. Si falla, cae a firma ad-hoc.
 - Las notificaciones nativas (con clic que lleva a la pestaña) solo funcionan desde `Colibri.app`; con `cargo run` se usa `osascript` como respaldo sin clic. Para probar notificaciones hay que pasar por `bundle.sh`.
 
