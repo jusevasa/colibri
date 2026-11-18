@@ -127,6 +127,8 @@ pub struct Session {
 
     /// Nombre que le pusiste a la pestaña; vacío = automático.
     pub name: String,
+    /// Color que le pusiste a la pestaña: índice en `TAB_COLORS`.
+    pub color: Option<u8>,
     /// Título que puso el programa (OSC 0/2).
     pub title: String,
     pub cwd: PathBuf,
@@ -154,6 +156,8 @@ pub struct Session {
     line: Option<String>,
     /// Comandos tecleados en esta pestaña, del más antiguo al más reciente.
     pub typed: Vec<String>,
+    /// Sube cada vez que el programa escribe algo: sirve para saber si hubo novedades.
+    pub activity: u64,
     /// Última celda informada al programa y botón que se mantiene pulsado.
     pub mouse_cell: Option<(usize, usize)>,
     pub mouse_down: Option<u8>,
@@ -231,6 +235,7 @@ impl Session {
             cell_px: (8, 16),
             exited: false,
             name: String::new(),
+            color: None,
             title: String::new(),
             cwd: cwd.unwrap_or_default(),
             fg_pid: shell_pid,
@@ -249,6 +254,7 @@ impl Session {
             cursor_px: None,
             line: Some(String::new()),
             typed: Vec::new(),
+            activity: 0,
             mouse_cell: None,
             mouse_down: None,
         })
@@ -309,6 +315,19 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Lo tecleado en el prompt hasta ahora, si se le sigue la pista.
+    pub fn prompt_line(&self) -> Option<&str> {
+        self.line.as_deref()
+    }
+
+    /// Cambia la última palabra del prompt (`chars` caracteres) por `text`, como si se
+    /// borrara y se tecleara: así `track` sigue cuadrando con lo que ve el shell.
+    pub fn replace_word(&mut self, chars: usize, text: &str) {
+        let mut bytes = vec![0x7f; chars];
+        bytes.extend_from_slice(text.as_bytes());
+        self.input(bytes);
     }
 
     /// El shell espera un comando: no corre nada encima ni hay un programa a pantalla completa.
@@ -379,6 +398,7 @@ impl Session {
             self.dirty = true;
             match event {
                 Event::Wakeup => {
+                    self.activity += 1;
                     // Salida que no es eco de lo que tecleas = actividad real.
                     if now.duration_since(self.last_input) > Duration::from_millis(350) {
                         if now.duration_since(self.last_active_output) > Duration::from_millis(1500)
@@ -468,7 +488,12 @@ impl Session {
         let mut notify = false;
         if busy && !self.busy {
             self.busy_since = now;
-            self.finished_at = None;
+            // Un «terminó» que aún no viste sobrevive a un parpadeo de actividad: si se
+            // borrara aquí y la ráfaga nueva fuera corta, la pestaña quedaría marcada como
+            // terminada pero sin fecha, y ⌘J no la encontraría.
+            if !self.unseen {
+                self.finished_at = None;
+            }
         } else if !busy && self.busy {
             let ran = now.duration_since(self.busy_since);
             let min = if self.agent.is_some() { 2 } else { 8 };

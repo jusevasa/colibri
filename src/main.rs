@@ -2,9 +2,13 @@
 //! Sin telemetría: la app no abre ninguna conexión de red propia.
 
 mod blur;
+mod complete;
 mod config;
 mod debug;
+mod git;
 mod history;
+mod hotkey;
+mod menu;
 mod notify;
 mod overlay;
 mod ports;
@@ -25,6 +29,20 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 const TAB_BAR_H: f32 = 38.0;
+const STATUS_H: f32 = 32.0;
+/// Colores que se le pueden poner a una pestaña desde su menú (clic derecho).
+/// El nombre es el que se guarda en `session.toml`.
+const TAB_COLORS: [(&str, Color32); 7] = [
+    ("rojo", Color32::from_rgb(0xf4, 0x70, 0x67)),
+    ("naranja", Color32::from_rgb(0xf0, 0x88, 0x3e)),
+    ("amarillo", Color32::from_rgb(0xe0, 0xb2, 0x5b)),
+    ("verde", Color32::from_rgb(0x57, 0xc9, 0x6b)),
+    ("azul", Color32::from_rgb(0x6c, 0xb6, 0xff)),
+    ("morado", Color32::from_rgb(0xb0, 0x83, 0xf0)),
+    ("rosa", Color32::from_rgb(0xf7, 0x78, 0xba)),
+];
+/// Segundos que tarda una pestaña en deslizarse a su hueco nuevo.
+const TAB_SLIDE: f32 = 0.16;
 const TRAFFIC_LIGHTS_W: f32 = 78.0;
 
 fn main() -> eframe::Result {
@@ -58,6 +76,8 @@ pub enum Cmd {
     PrevTab,
     MoveTabLeft,
     MoveTabRight,
+    NextAgent,
+    PrevAgent,
     JumpFinished,
     TogglePanel,
     ToggleAgents,
@@ -92,6 +112,8 @@ impl Keys {
             (Cmd::PrevTab, &k.prev_tab),
             (Cmd::MoveTabLeft, &k.move_tab_left),
             (Cmd::MoveTabRight, &k.move_tab_right),
+            (Cmd::NextAgent, &k.next_agent),
+            (Cmd::PrevAgent, &k.prev_agent),
             (Cmd::JumpFinished, &k.jump_finished),
             (Cmd::TogglePanel, &k.toggle_panel),
             (Cmd::ToggleProcs, &k.toggle_processes),
@@ -166,8 +188,13 @@ struct App {
     force_update: bool,
     /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
     drag_tab: Option<(u64, f32)>,
+    /// Ancho y origen de las pestañas en el cuadro anterior: si cambian (se redimensiona la
+    /// ventana, se abre una pestaña) las pestañas se recolocan sin animación.
+    tab_layout: (f32, f32),
     /// Comandos que muestra el historial, del más reciente al más antiguo.
     history: Vec<String>,
+    /// Rama y cambios de la carpeta de la pestaña activa (barra de estado).
+    git: git::Watch,
     /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
     script_keys: Vec<egui::Key>,
     /// Solo para pruebas: eventos de puntero del guion (`press`, `moveto`, `release`).
@@ -183,6 +210,7 @@ impl App {
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         install_fonts(ctx, &cfg);
         notify::init(ctx);
+        hotkey::set(ctx, &cfg.keys.global_jump);
         let mut app = Self {
             pal: Palette::new(&cfg.theme),
             keys: Keys::new(&cfg.keys),
@@ -218,7 +246,9 @@ impl App {
             update_ready: false,
             force_update: false,
             drag_tab: None,
+            tab_layout: (0.0, 0.0),
             history: Vec::new(),
+            git: git::Watch::new(),
             script_keys: Vec::new(),
             script_pointer: Vec::new(),
             window_movable: None,
@@ -252,6 +282,10 @@ impl App {
             if self.sessions.len() > before {
                 if let Some(s) = self.sessions.last_mut() {
                     s.name = tab.name.clone();
+                    s.color = TAB_COLORS
+                        .iter()
+                        .position(|(name, _)| *name == tab.color)
+                        .map(|k| k as u8);
                 }
             }
             if tab.agent == "claude" && self.sessions.len() > before {
@@ -283,6 +317,11 @@ impl App {
                 .map(|s| state::Tab {
                     cwd: s.cwd.display().to_string(),
                     name: s.name.clone(),
+                    color: s
+                        .color
+                        .and_then(|k| TAB_COLORS.get(k as usize))
+                        .map(|(name, _)| name.to_string())
+                        .unwrap_or_default(),
                     agent: match s.agent {
                         Some(session::Agent::Claude) => "claude".into(),
                         _ => String::new(),
@@ -357,6 +396,49 @@ impl App {
             sel: 0,
         };
         ctx.request_repaint();
+    }
+
+    /// Tab en el prompt: sugiere carpetas y archivos para la palabra que se teclea. Si no se
+    /// sabe qué hay escrito, o nada coincide, el Tab le llega al shell como siempre.
+    fn complete_key(&mut self, ctx: &egui::Context) {
+        if !self.cfg.complete_popup {
+            return;
+        }
+        let Some(s) = self.sessions.get(self.active).filter(|s| s.at_prompt()) else {
+            return;
+        };
+        let Some(target) = s.prompt_line().and_then(complete::target) else {
+            return;
+        };
+        let tab = Shortcut {
+            cmd: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            key: egui::Key::Tab,
+        };
+        if !take_shortcut(ctx, &tab) {
+            return;
+        }
+        let items = complete::candidates(&s.cwd, &target);
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        match items.as_slice() {
+            [] => s.input(b"\t".to_vec()),
+            [only] => s.replace_word(
+                target.token.chars().count(),
+                &complete::replacement(&target, only),
+            ),
+            _ => {
+                self.overlay = overlay::Overlay::Complete {
+                    target,
+                    items,
+                    sel: 0,
+                };
+                ctx.request_repaint();
+            }
+        }
     }
 
     /// Arranca la versión que hay ahora en disco y cierra esta. Las pestañas se guardan
@@ -442,6 +524,23 @@ impl App {
         }
     }
 
+    /// Recorre solo las pestañas con agente, en el orden del panel «Agentes», dando la vuelta.
+    fn step_agent(&mut self, forward: bool) {
+        let n = self.sessions.len();
+        let target = (1..=n)
+            .map(|d| {
+                if forward {
+                    (self.active + d) % n
+                } else {
+                    (self.active + n - d) % n
+                }
+            })
+            .find(|&i| self.sessions[i].agent.is_some());
+        if let Some(i) = target {
+            self.select(i);
+        }
+    }
+
     /// Va al agente (o comando largo) que terminó más recientemente; primero los no vistos.
     fn jump_finished(&mut self) {
         let best = |unseen_only: bool, sessions: &[Session], active: usize| {
@@ -468,6 +567,9 @@ impl App {
         }
         self.pal = Palette::new(&new.theme);
         self.keys = Keys::new(&new.keys);
+        if new.keys.global_jump != self.cfg.keys.global_jump {
+            hotkey::set(ctx, &new.keys.global_jump);
+        }
         self.cfg = new;
     }
 
@@ -527,6 +629,8 @@ impl App {
             Cmd::MoveTabRight => self.move_tab(self.active, self.active + 1),
             Cmd::MoveTabLeft => {}
             Cmd::GoTab(i) => self.select(i),
+            Cmd::NextAgent => self.step_agent(true),
+            Cmd::PrevAgent => self.step_agent(false),
             Cmd::JumpFinished => self.jump_finished(),
             Cmd::TogglePanel => {
                 let open = !(self.show_agents || self.show_ports || self.show_procs);
@@ -664,12 +768,14 @@ impl App {
                 }
             }
             Some(debug::Step::Move(from, to)) => self.move_tab(from, to),
+            Some(debug::Step::Agent(forward)) => self.step_agent(forward),
             Some(debug::Step::Key(name)) => {
                 let name = match name.as_str() {
                     "up" => "ArrowUp",
                     "down" => "ArrowDown",
                     "enter" => "Enter",
                     "esc" => "Escape",
+                    "tab" => "Tab",
                     other => other,
                 };
                 self.script_keys.extend(egui::Key::from_name(name));
@@ -677,7 +783,16 @@ impl App {
             Some(debug::Step::Pointer(kind, x, y)) => {
                 let pos = Pos2::new(x, y);
                 self.script_pointer.push(egui::Event::PointerMoved(pos));
-                if kind != "moveto" {
+                if kind == "rclick" {
+                    for pressed in [true, false] {
+                        self.script_pointer.push(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                    }
+                } else if kind != "moveto" {
                     self.script_pointer.push(egui::Event::PointerButton {
                         pos,
                         button: egui::PointerButton::Primary,
@@ -730,15 +845,30 @@ impl App {
         let mut rename = None;
         let mut moved = None;
         let mut grabbed = None;
+        let mut recolor = None;
         let tabs_left = full.left() + TRAFFIC_LIGHTS_W;
         let pointer_x = ui.input(|i| i.pointer.latest_pos().map(|p| p.x));
         if !ui.input(|i| i.pointer.primary_down()) {
             self.drag_tab = None;
         }
+        // Al cambiar de hueco la pestaña se desliza en vez de saltar.
+        let slide = if self.tab_layout == (tab_w, tabs_left) {
+            TAB_SLIDE
+        } else {
+            0.0
+        };
+        self.tab_layout = (tab_w, tabs_left);
         let mut x = tabs_left;
         for (i, s) in self.sessions.iter().enumerate() {
+            let slide_id = egui::Id::unique(("tab-x", s.id));
+            let held = self.drag_tab.is_some_and(|(id, _)| id == s.id) && pointer_x.is_some();
+            let shown_x = if held {
+                x
+            } else {
+                ctx.animate_value_with_time(slide_id, x, slide)
+            };
             let mut rect = Rect::from_min_size(
-                Pos2::new(x, full.top() + 5.0),
+                Pos2::new(shown_x, full.top() + 5.0),
                 Vec2::new(tab_w - 4.0, TAB_BAR_H - 9.0),
             );
             x += tab_w;
@@ -748,6 +878,8 @@ impl App {
                     let last = tabs_left + (self.sessions.len() - 1) as f32 * tab_w;
                     let left = (px - grab).clamp(tabs_left, last);
                     rect = rect.translate(Vec2::new(left - rect.left(), 0.0));
+                    // Al soltarla se desliza desde donde quedó hasta su hueco.
+                    ctx.animate_value_with_time(slide_id, left, 0.0);
                     let slot = ((left + tab_w / 2.0 - tabs_left) / tab_w).floor() as usize;
                     if slot != i {
                         moved = Some((i, slot));
@@ -768,8 +900,8 @@ impl App {
             }
             let active = i == self.active;
             let hovered = resp.hovered() && (self.drag_tab.is_none() || dragging);
-            // Encima de las demás mientras se mueve.
-            let p = &if dragging {
+            // Encima de las demás mientras se mueve (arrastrada, o la activa deslizándose).
+            let p = &if dragging || (active && shown_x != x) {
                 ui.painter().clone().with_layer_id(egui::LayerId::new(
                     egui::Order::Foreground,
                     egui::Id::unique("tab-drag"),
@@ -777,16 +909,43 @@ impl App {
             } else {
                 ui.painter().clone()
             };
+            let tint = s
+                .color
+                .and_then(|k| TAB_COLORS.get(k as usize))
+                .map(|c| c.1);
             if active {
                 p.rect_filled(rect, CornerRadius::same(7), pal.tab_active);
+                if let Some(c) = tint {
+                    p.rect_filled(rect, CornerRadius::same(7), c.gamma_multiply(0.34));
+                }
                 p.rect_stroke(
                     rect,
                     CornerRadius::same(7),
-                    Stroke::new(1.0, pal.border),
+                    Stroke::new(1.0, tint.map_or(pal.border, |c| c.gamma_multiply(0.7))),
+                    StrokeKind::Inside,
+                );
+            } else if let Some(c) = tint {
+                let strength = if hovered { 0.36 } else { 0.26 };
+                p.rect_filled(rect, CornerRadius::same(7), c.gamma_multiply(strength));
+                p.rect_stroke(
+                    rect,
+                    CornerRadius::same(7),
+                    Stroke::new(1.0, c.gamma_multiply(0.45)),
                     StrokeKind::Inside,
                 );
             } else if hovered {
                 p.rect_filled(rect, CornerRadius::same(7), pal.border);
+            }
+            // La raya de abajo es lo que deja ver el color de un vistazo.
+            if let Some(c) = tint {
+                let y = rect.bottom() - 2.0;
+                p.line_segment(
+                    [
+                        Pos2::new(rect.left() + 8.0, y),
+                        Pos2::new(rect.right() - 8.0, y),
+                    ],
+                    Stroke::new(2.0, c),
+                );
             }
 
             // Indicador a la izquierda: trabajando / terminó / agente en reposo.
@@ -856,7 +1015,53 @@ impl App {
             if resp.double_clicked() && !over_close {
                 rename = Some(i);
             }
-            if self.drag_tab.is_none() {
+            // Clic derecho: color de la pestaña, renombrar y cerrar.
+            resp.context_menu(|ui| {
+                ui.set_min_width(196.0);
+                ui.label(egui::RichText::new("Color").color(pal.muted).size(11.0));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let choices =
+                        std::iter::once(None).chain((0..TAB_COLORS.len() as u8).map(Some));
+                    for choice in choices {
+                        let (dot, sw) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+                        let p = ui.painter();
+                        let c = dot.center();
+                        let label = match choice.and_then(|k| TAB_COLORS.get(k as usize)) {
+                            Some((name, color)) => {
+                                p.circle_filled(c, 7.0, *color);
+                                *name
+                            }
+                            None => {
+                                p.circle_stroke(c, 6.5, Stroke::new(1.2, pal.muted));
+                                p.line_segment(
+                                    [c + Vec2::new(-4.5, 4.5), c + Vec2::new(4.5, -4.5)],
+                                    Stroke::new(1.2, pal.muted),
+                                );
+                                "sin color"
+                            }
+                        };
+                        if s.color == choice || sw.hovered() {
+                            p.circle_stroke(c, 9.5, Stroke::new(1.5, pal.fg));
+                        }
+                        if sw.clicked() {
+                            recolor = Some((i, choice));
+                            ui.close();
+                        }
+                        sw.on_hover_text(label);
+                    }
+                });
+                ui.separator();
+                if ui.button("Renombrar…").clicked() {
+                    rename = Some(i);
+                    ui.close();
+                }
+                if ui.button("Cerrar pestaña").clicked() {
+                    close = Some(i);
+                    ui.close();
+                }
+            });
+            if self.drag_tab.is_none() && !resp.context_menu_opened() {
                 resp.on_hover_ui(|ui| tab_tooltip(ui, s, &pal));
             }
         }
@@ -1008,6 +1213,11 @@ impl App {
         if let Some((from, to)) = moved {
             self.move_tab(from, to);
         }
+        if let Some((i, color)) = recolor
+            && let Some(s) = self.sessions.get_mut(i)
+        {
+            s.color = color;
+        }
         if let Some(i) = close {
             self.close_tab(i);
         }
@@ -1037,7 +1247,7 @@ impl App {
                 &pal,
                 Section::Agents,
                 "Agentes",
-                "⌘J salta al que terminó",
+                "⌥⌘↑↓ recorre · ⌘J terminó",
                 0.0,
             ) {
                 self.show_agents = false;
@@ -1062,6 +1272,13 @@ impl App {
                     p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.7));
                 } else if resp.hovered() {
                     p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.4));
+                }
+                if let Some((_, c)) = s.color.and_then(|k| TAB_COLORS.get(k as usize)) {
+                    let bar = Rect::from_min_max(
+                        rect.left_top(),
+                        Pos2::new(rect.left() + 3.0, rect.bottom()),
+                    );
+                    p.rect_filled(bar, 0.0, *c);
                 }
                 let left = rect.left() + 14.0;
                 agent_icon(p, Pos2::new(left + 6.0, rect.top() + 18.0), 6.5, agent);
@@ -1598,6 +1815,18 @@ impl eframe::App for App {
             }
         }
 
+        // «Reiniciar Colibrí» en el menú de la aplicación.
+        menu::install(ctx);
+        if menu::take_restart() {
+            self.restart();
+        }
+
+        // Atajo global: la app ya viene al frente; ir al agente que terminó.
+        if hotkey::take_pressed() {
+            self.jump_finished();
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+
         // Clic en una notificación: traer la ventana al frente e ir a esa pestaña.
         for id in notify::take_clicked() {
             if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
@@ -1685,8 +1914,20 @@ impl eframe::App for App {
         let focused = self.focused;
         if !self.search_focus && self.overlay == overlay::Overlay::None {
             self.history_key(&ctx);
+            self.complete_key(&ctx);
         }
         let keyboard = !self.search_focus && self.overlay == overlay::Overlay::None;
+        if self.cfg.status_bar
+            && let Some(s) = self.sessions.get(self.active)
+        {
+            let (cwd, activity) = (s.cwd.clone(), s.activity);
+            let info = self.git.info(&ctx, &cwd, activity);
+            egui::Panel::bottom("status")
+                .exact_size(STATUS_H)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
+                .show(ui, |ui| status_bar(ui, &pal, &cwd, info.as_ref()));
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
             .show(ui, |ui| {
@@ -1700,6 +1941,110 @@ impl eframe::App for App {
         if self.sessions.iter().any(|s| s.busy) {
             let ms = if self.focused { 33 } else { 250 };
             ctx.request_repaint_after(Duration::from_millis(ms));
+        }
+    }
+}
+
+/// Barra bajo la terminal: una caja por dato (carpeta, rama de git, archivos con cambios).
+fn status_bar(ui: &mut egui::Ui, pal: &Palette, cwd: &std::path::Path, git: Option<&git::Info>) {
+    #[derive(Clone, Copy)]
+    enum Icon {
+        Folder,
+        Branch,
+        None,
+    }
+    let full = ui.max_rect();
+    let font = FontId::new(11.5, FontFamily::Name("term-bold".into()));
+    let mut chips = vec![(Icon::Folder, proc::pretty_path(cwd), pal.fg)];
+    if let Some(info) = git {
+        chips.push((Icon::Branch, info.branch.clone(), pal.done));
+        if let Some(n) = info.changes {
+            let color = if n > 0 { pal.ansi[3] } else { pal.muted };
+            chips.push((Icon::None, format!("± {n}"), color));
+        }
+    }
+    let p = ui.painter();
+    let mut x = full.left() + 10.0;
+    // La carpeta se recorta por el inicio si no cabe; las demás cajas tienen prioridad.
+    let others: f32 = chips.len().saturating_sub(1) as f32 * 120.0;
+    for (icon, text, color) in chips {
+        let icon_w = if matches!(icon, Icon::None) {
+            0.0
+        } else {
+            18.0
+        };
+        let max_w = match icon {
+            Icon::Folder => (full.right() - x - others - icon_w - 30.0).max(60.0),
+            _ => 220.0,
+        };
+        let galley = elided(ui.ctx(), &text, &font, color, max_w);
+        let w = 9.0 + icon_w + galley.size().x + 9.0;
+        let rect = Rect::from_min_size(Pos2::new(x, full.center().y - 11.0), Vec2::new(w, 22.0));
+        if rect.right() > full.right() - 6.0 {
+            break;
+        }
+        p.rect_filled(rect, CornerRadius::same(5), pal.panel);
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(5),
+            Stroke::new(1.0, pal.border),
+            StrokeKind::Inside,
+        );
+        let c = Pos2::new(rect.left() + 9.0 + 6.0, rect.center().y);
+        match icon {
+            Icon::Folder => file_icon(p, c, true, color),
+            Icon::Branch => {
+                // Dos commits en una línea y un tercero que se ramifica.
+                let stroke = Stroke::new(1.2, color);
+                let (a, b, d) = (
+                    c + Vec2::new(-3.0, -4.5),
+                    c + Vec2::new(-3.0, 4.5),
+                    c + Vec2::new(3.5, -2.0),
+                );
+                p.line_segment([a, b], stroke);
+                p.line_segment([d, c + Vec2::new(-3.0, 2.0)], stroke);
+                for dot in [a, b, d] {
+                    p.circle_filled(dot, 1.9, color);
+                }
+            }
+            Icon::None => {}
+        }
+        p.galley(
+            Pos2::new(
+                rect.left() + 9.0 + icon_w,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            color,
+        );
+        x = rect.right() + 6.0;
+    }
+}
+
+/// Carpeta (con su pestaña) u hoja de archivo, dibujadas a mano.
+pub fn file_icon(p: &egui::Painter, c: Pos2, is_dir: bool, color: Color32) {
+    let stroke = Stroke::new(1.2, color);
+    if is_dir {
+        let body = Rect::from_center_size(c + Vec2::new(0.0, 1.0), Vec2::new(12.0, 8.0));
+        p.rect_stroke(body, CornerRadius::same(2), stroke, StrokeKind::Inside);
+        p.line_segment(
+            [
+                Pos2::new(body.left() + 1.0, body.top() - 1.5),
+                Pos2::new(body.left() + 5.0, body.top() - 1.5),
+            ],
+            stroke,
+        );
+    } else {
+        let page = Rect::from_center_size(c, Vec2::new(9.0, 11.0));
+        p.rect_stroke(page, CornerRadius::same(2), stroke, StrokeKind::Inside);
+        for dy in [-2.0, 1.0] {
+            p.line_segment(
+                [
+                    Pos2::new(page.left() + 2.5, c.y + dy),
+                    Pos2::new(page.right() - 2.5, c.y + dy),
+                ],
+                Stroke::new(1.0, color),
+            );
         }
     }
 }
@@ -1745,8 +2090,11 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
             if path.is_empty() {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(path) {
-                let mut data = FontData::from_owned(bytes);
+            if let Some(bytes) = config::font_bytes(path) {
+                let mut data = match bytes {
+                    std::borrow::Cow::Borrowed(b) => FontData::from_static(b),
+                    std::borrow::Cow::Owned(b) => FontData::from_owned(b),
+                };
                 data.index = *index;
                 if let Some(w) = weight {
                     if data

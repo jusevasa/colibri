@@ -17,6 +17,8 @@ pub struct Tab {
     pub cwd: String,
     /// Nombre personalizado de la pestaña, o vacío.
     pub name: String,
+    /// Color de la pestaña ("azul"), o vacío.
+    pub color: String,
     /// Agente que corría en la pestaña ("claude"), o vacío.
     pub agent: String,
 }

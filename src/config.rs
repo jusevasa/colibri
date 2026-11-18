@@ -29,6 +29,10 @@ pub struct Config {
     pub restore_tabs: bool,
     /// ↑ en el prompt abre la lista de comandos usados antes.
     pub history_popup: bool,
+    /// Tab en el prompt abre la lista de carpetas y archivos que coinciden.
+    pub complete_popup: bool,
+    /// Barra inferior con la carpeta, la rama de git y los archivos con cambios.
+    pub status_bar: bool,
     /// Qué apartados del panel lateral están visibles al abrir.
     pub show_agents: bool,
     pub show_ports: bool,
@@ -65,8 +69,14 @@ pub struct Keys {
     /// Cambia la pestaña activa de posición.
     pub move_tab_left: String,
     pub move_tab_right: String,
+    /// Recorre solo las pestañas donde corre un agente.
+    pub next_agent: String,
+    pub prev_agent: String,
     /// Salta a la pestaña del agente que terminó más recientemente.
     pub jump_finished: String,
+    /// Lo mismo, pero global: funciona aunque Colibrí no tenga el foco y lo trae al frente.
+    /// Vacío = desactivado.
+    pub global_jump: String,
     /// Muestra u oculta los dos apartados a la vez.
     pub toggle_panel: String,
     pub toggle_agents: String,
@@ -98,6 +108,8 @@ impl Default for Config {
             notify: true,
             restore_tabs: true,
             history_popup: true,
+            complete_popup: true,
+            status_bar: true,
             show_agents: false,
             show_ports: false,
             show_processes: false,
@@ -139,7 +151,10 @@ impl Default for Keys {
             prev_tab: "cmd+alt+left".into(),
             move_tab_left: "cmd+shift+left".into(),
             move_tab_right: "cmd+shift+right".into(),
+            next_agent: "cmd+alt+down".into(),
+            prev_agent: "cmd+alt+up".into(),
             jump_finished: "cmd+j".into(),
+            global_jump: "ctrl+alt+cmd+j".into(),
             toggle_panel: "cmd+b".into(),
             toggle_agents: "cmd+shift+a".into(),
             toggle_ports: "cmd+shift+p".into(),
@@ -160,6 +175,7 @@ const HEADER: &str = "\
 # Colibrí — configuración. Los cambios se aplican al guardar.
 # Atajos: combina cmd, ctrl, shift, alt con una tecla: \"cmd+shift+j\", \"cmd+alt+right\", \"ctrl+tab\".
 # Fijo: cmd+1..9 va a la pestaña N.
+# global_jump funciona desde cualquier aplicación (trae Colibrí al frente); \"\" lo desactiva.
 # Colores en formato #rrggbb.
 
 ";
@@ -262,9 +278,26 @@ pub fn presets() -> Vec<(&'static str, Theme)> {
     ]
 }
 
-/// Fuentes monoespaciadas disponibles: (nombre, ruta normal, ruta negrita). La primera es Menlo.
+/// Rutas especiales de la fuente Hack, que viaja dentro del ejecutable (assets/fonts).
+pub const HACK: &str = "builtin:hack";
+pub const HACK_BOLD: &str = "builtin:hack-bold";
+
+/// Bytes de una fuente: las incluidas en el ejecutable o un archivo del disco.
+pub fn font_bytes(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    match path {
+        HACK => Some(include_bytes!("../assets/fonts/Hack-Regular.ttf")[..].into()),
+        HACK_BOLD => Some(include_bytes!("../assets/fonts/Hack-Bold.ttf")[..].into()),
+        _ => std::fs::read(path).ok().map(Into::into),
+    }
+}
+
+/// Fuentes monoespaciadas disponibles: (nombre, ruta normal, ruta negrita). La primera es
+/// Menlo y la segunda Hack, que viene incluida; el resto son las instaladas en el Mac.
 pub fn fonts() -> Vec<(String, String, String)> {
-    let mut found = vec![("Menlo".to_string(), String::new(), String::new())];
+    let mut found = vec![
+        ("Menlo".to_string(), String::new(), String::new()),
+        ("Hack".to_string(), HACK.to_string(), HACK_BOLD.to_string()),
+    ];
     let mut dirs_to_scan = vec![std::path::PathBuf::from("/Library/Fonts")];
     if let Some(home) = dirs::home_dir() {
         dirs_to_scan.insert(0, home.join("Library/Fonts"));

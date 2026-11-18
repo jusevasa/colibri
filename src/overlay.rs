@@ -25,9 +25,15 @@ pub enum Overlay {
         query: String,
         sel: usize,
     },
+    /// Carpetas y archivos que encajan con la palabra que se teclea en el prompt.
+    Complete {
+        target: crate::complete::Target,
+        items: Vec<crate::complete::Item>,
+        sel: usize,
+    },
 }
 
-const PREF_ROWS: [(&str, &str); 16] = [
+const PREF_ROWS: [(&str, &str); 18] = [
     ("theme", "Tema"),
     ("font", "Fuente"),
     ("font_size", "Tamaño de fuente"),
@@ -40,6 +46,8 @@ const PREF_ROWS: [(&str, &str); 16] = [
     ("restore_tabs", "Recuperar pestañas al abrir"),
     ("notify", "Notificar cuando algo termina"),
     ("history_popup", "Historial de comandos con ↑"),
+    ("complete_popup", "Sugerir carpetas y archivos con ⇥"),
+    ("status_bar", "Barra de carpeta y rama"),
     ("show_agents", "Agentes"),
     ("show_ports", "Puertos"),
     ("show_processes", "Procesos"),
@@ -138,6 +146,7 @@ impl App {
             Overlay::Prefs { sel } => self.prefs_ui(ctx, sel),
             Overlay::Rename { text } => self.rename_ui(ctx, text),
             Overlay::History { query, sel } => self.history_ui(ctx, query, sel),
+            Overlay::Complete { target, items, sel } => self.complete_ui(ctx, target, items, sel),
         }
     }
 
@@ -304,6 +313,208 @@ impl App {
         }
     }
 
+    fn complete_ui(
+        &mut self,
+        ctx: &egui::Context,
+        target: crate::complete::Target,
+        items: Vec<crate::complete::Item>,
+        mut sel: usize,
+    ) {
+        // Seguir escribiendo o borrar cierra la lista y la tecla llega al shell: se vuelve
+        // a pulsar Tab para ver las sugerencias de lo nuevo.
+        let keeps_open = |key: &Key| {
+            matches!(
+                key,
+                Key::ArrowUp | Key::ArrowDown | Key::Tab | Key::Enter | Key::Escape
+            )
+        };
+        let other_input = ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                egui::Event::Text(_) | egui::Event::Paste(_) => true,
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => !keeps_open(key),
+                _ => false,
+            })
+        });
+        if other_input || items.is_empty() {
+            self.overlay = Overlay::None;
+            return;
+        }
+        let n = items.len();
+        if pressed(ctx, Key::ArrowDown) || pressed(ctx, Key::Tab) {
+            sel = (sel + 1) % n;
+        }
+        if pressed(ctx, Key::ArrowUp)
+            || ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab))
+        {
+            sel = (sel + n - 1) % n;
+        }
+        sel = sel.min(n - 1);
+        let mut pick = pressed(ctx, Key::Enter).then_some(sel);
+
+        const VISIBLE: usize = 8;
+        const ROW: f32 = 28.0;
+        const FOOT: f32 = 26.0;
+        let pal = self.pal.clone();
+        let mono = FontId::monospace(12.5);
+        let small = FontId::proportional(11.0);
+        let screen = ctx.content_rect();
+        let width = 440.0_f32.min(screen.width() - 16.0);
+        let height = n.min(VISIBLE) as f32 * ROW + FOOT + 8.0;
+        let cursor = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.cursor_px)
+            .unwrap_or_else(|| {
+                Rect::from_min_size(
+                    Pos2::new(screen.left() + 16.0, screen.bottom() - 40.0),
+                    Vec2::new(8.0, 18.0),
+                )
+            });
+        // Encima del cursor; si no cabe, debajo.
+        let above = cursor.top() - height - 6.0;
+        let y = if above >= screen.top() + crate::TAB_BAR_H {
+            above
+        } else {
+            cursor.bottom() + 6.0
+        };
+        let max_x = (screen.right() - width - 8.0).max(screen.left() + 8.0);
+        let x = cursor.left().clamp(screen.left() + 8.0, max_x);
+        let first = (sel + 1).saturating_sub(VISIBLE);
+        let last = (first + VISIBLE).min(n);
+        let needle = target.prefix.to_lowercase();
+
+        let out = egui::Area::new(Id::unique("complete"))
+            .order(Order::Foreground)
+            .fixed_pos(Pos2::new(x, y))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        ui.add_space(4.0);
+                        for (i, item) in items.iter().enumerate().take(last).skip(first) {
+                            let (r, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ROW),
+                                Sense::click(),
+                            );
+                            if resp.hovered() && ui.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
+                                sel = i;
+                            }
+                            if resp.clicked() {
+                                pick = Some(i);
+                            }
+                            let p = ui.painter();
+                            if i == sel {
+                                p.rect_filled(
+                                    r.shrink2(Vec2::new(4.0, 1.0)),
+                                    CornerRadius::same(5),
+                                    pal.accent.gamma_multiply(0.16),
+                                );
+                            }
+                            let icon = Pos2::new(r.left() + 20.0, r.center().y);
+                            crate::file_icon(p, icon, item.is_dir, pal.muted);
+                            // El trozo que coincide con lo tecleado va resaltado.
+                            let shown = if item.is_dir {
+                                format!("{}/", item.name)
+                            } else {
+                                item.name.clone()
+                            };
+                            let hit = shown
+                                .to_lowercase()
+                                .find(&needle)
+                                .filter(|at| !needle.is_empty() && shown.is_char_boundary(*at))
+                                .filter(|at| shown.is_char_boundary(at + needle.len()));
+                            let mut job = egui::text::LayoutJob::default();
+                            let mut add = |text: &str, color: Color32| {
+                                job.append(
+                                    text,
+                                    0.0,
+                                    egui::TextFormat {
+                                        font_id: mono.clone(),
+                                        color,
+                                        ..Default::default()
+                                    },
+                                );
+                            };
+                            let dim = if i == sel {
+                                pal.fg.gamma_multiply(0.75)
+                            } else {
+                                pal.muted
+                            };
+                            match hit {
+                                Some(at) => {
+                                    add(&shown[..at], dim);
+                                    add(&shown[at..at + needle.len()], pal.fg);
+                                    add(&shown[at + needle.len()..], dim);
+                                }
+                                None => add(&shown, dim),
+                            }
+                            let kind = if item.is_dir { "Carpeta" } else { "Archivo" };
+                            let kind_w = 64.0;
+                            job.wrap = egui::text::TextWrapping::truncate_at_width(
+                                r.width() - 40.0 - kind_w - 12.0,
+                            );
+                            let g = ui.ctx().fonts_mut(|f| f.layout_job(job));
+                            p.galley(
+                                Pos2::new(r.left() + 36.0, r.center().y - g.size().y / 2.0),
+                                g,
+                                pal.fg,
+                            );
+                            p.text(
+                                Pos2::new(r.right() - 14.0, r.center().y),
+                                Align2::RIGHT_CENTER,
+                                kind,
+                                small.clone(),
+                                pal.muted,
+                            );
+                        }
+                        ui.add_space(4.0);
+                        let (foot, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), FOOT),
+                            Sense::hover(),
+                        );
+                        let p = ui.painter();
+                        p.line_segment(
+                            [foot.left_top(), foot.right_top()],
+                            Stroke::new(1.0, pal.border),
+                        );
+                        p.text(
+                            Pos2::new(foot.left() + 14.0, foot.center().y),
+                            Align2::LEFT_CENTER,
+                            format!("{} de {n}", sel + 1),
+                            small.clone(),
+                            pal.muted,
+                        );
+                        p.text(
+                            Pos2::new(foot.right() - 14.0, foot.center().y),
+                            Align2::RIGHT_CENTER,
+                            "⇥ ↑↓ elegir  ·  ↩ insertar  ·  esc cerrar",
+                            small.clone(),
+                            pal.muted,
+                        );
+                    });
+            });
+
+        if let Some(i) = pick {
+            self.overlay = Overlay::None;
+            if let Some(s) = self.sessions.get_mut(self.active) {
+                s.replace_word(
+                    target.token.chars().count(),
+                    &crate::complete::replacement(&target, &items[i]),
+                );
+            }
+        } else if clicked_outside(ctx, out.response.rect) {
+            self.overlay = Overlay::None;
+        } else {
+            self.overlay = Overlay::Complete { target, items, sel };
+        }
+    }
+
     fn palette_items(&self) -> Vec<(String, String, Cmd)> {
         let commands = [
             ("Nueva pestaña", Cmd::NewTab),
@@ -313,6 +524,8 @@ impl App {
             ("Mover pestaña a la izquierda", Cmd::MoveTabLeft),
             ("Mover pestaña a la derecha", Cmd::MoveTabRight),
             ("Renombrar pestaña…", Cmd::RenameTab),
+            ("Agente siguiente", Cmd::NextAgent),
+            ("Agente anterior", Cmd::PrevAgent),
             ("Ir al agente que terminó", Cmd::JumpFinished),
             ("Preferencias: tema, fuente, tamaño…", Cmd::Prefs),
             ("Panel de agentes", Cmd::ToggleAgents),
@@ -508,6 +721,8 @@ impl App {
             "restore_tabs" => (String::new(), Some(c.restore_tabs)),
             "notify" => (String::new(), Some(c.notify)),
             "history_popup" => (String::new(), Some(c.history_popup)),
+            "complete_popup" => (String::new(), Some(c.complete_popup)),
+            "status_bar" => (String::new(), Some(c.status_bar)),
             "show_agents" => (String::new(), Some(c.show_agents)),
             "show_ports" => (String::new(), Some(c.show_ports)),
             "show_processes" => (String::new(), Some(c.show_processes)),
@@ -569,6 +784,8 @@ impl App {
             "restore_tabs" => c.restore_tabs = !c.restore_tabs,
             "notify" => c.notify = !c.notify,
             "history_popup" => c.history_popup = !c.history_popup,
+            "complete_popup" => c.complete_popup = !c.complete_popup,
+            "status_bar" => c.status_bar = !c.status_bar,
             "show_agents" => c.show_agents = !c.show_agents,
             "show_ports" => c.show_ports = !c.show_ports,
             "show_processes" => c.show_processes = !c.show_processes,
@@ -744,7 +961,7 @@ impl App {
             );
             let hint = match PREF_ROWS[sel].0 {
                 "font" => {
-                    "Fuentes monoespaciadas instaladas en tu Mac. Otras: font_path en el archivo."
+                    "Menlo, Hack (incluida) y las monoespaciadas de tu Mac. Otras: font_path en el archivo."
                 }
                 "opacity" => "Menos de 100 % deja ver lo que hay detrás de la ventana.",
                 "blur" => "Solo se nota con la opacidad por debajo de 100 %.",
