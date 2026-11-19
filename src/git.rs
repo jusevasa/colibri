@@ -7,8 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui;
-
 #[derive(Clone, Default, PartialEq)]
 pub struct Info {
     pub branch: String,

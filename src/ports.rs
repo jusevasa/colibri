@@ -27,7 +27,7 @@ pub struct Ports {
 }
 
 impl Ports {
-    pub fn start(ctx: eframe::egui::Context) -> Self {
+    pub fn start(ctx: egui::Context) -> Self {
         let list = Arc::new(Mutex::new(Vec::new()));
         let enabled = Arc::new(AtomicBool::new(true));
         let refresh = Arc::new(AtomicBool::new(false));

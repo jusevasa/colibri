@@ -22,6 +22,21 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <!-- Carpetas: «Abrir con → Colibrí», soltarlas en el icono del Dock y
+       open -a Colibri <carpeta>. Alternate: no se queda con las carpetas por defecto. -->
+  <key>CFBundleDocumentTypes</key><array><dict>
+    <key>CFBundleTypeName</key><string>Carpeta</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+  </dict></array>
+  <!-- Clic derecho sobre una carpeta en Finder → Servicios. -->
+  <key>NSServices</key><array><dict>
+    <key>NSMenuItem</key><dict><key>default</key><string>Nueva pestaña de Colibrí aquí</string></dict>
+    <key>NSMessage</key><string>newTab</string>
+    <key>NSPortName</key><string>Colibrí</string>
+    <key>NSSendFileTypes</key><array><string>public.folder</string></array>
+  </dict></array>
 </dict></plist>
 PLIST
 # Firma con una identidad estable para que macOS recuerde los permisos (carpetas,

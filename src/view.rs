@@ -2,14 +2,16 @@
 
 use crate::config::Palette;
 use crate::session::Session;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
-use alacritty_terminal::term::TermMode;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
-use eframe::egui::{
+use std::path::{Path, PathBuf};
+
+use egui::{
     self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
 
@@ -24,6 +26,13 @@ pub struct Metrics {
     pub cursor: CursorShape,
     /// El cursor parpadea mientras no se escribe.
     pub blink: bool,
+    /// Con qué se abre un archivo al hacer ⌘+clic en su ruta (vacío = lo que diga macOS).
+    pub editor: String,
+}
+
+thread_local! {
+    /// Glifos ya maquetados para la rejilla con instancias (solo el hilo de la interfaz).
+    static GLYPHS: std::cell::RefCell<crate::grid::GlyphCache> = Default::default();
 }
 
 struct TextRun {
@@ -83,6 +92,20 @@ pub fn show(
     keyboard: bool,
     chips: bool,
 ) {
+    let t = std::time::Instant::now();
+    show_grid(ui, s, pal, m, focused, keyboard, chips);
+    crate::debug::timing::add(&crate::debug::timing::GRID, t.elapsed());
+}
+
+fn show_grid(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    pal: &Palette,
+    m: &Metrics,
+    focused: bool,
+    keyboard: bool,
+    chips: bool,
+) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     // Arriba va el margen entero: la primera fila (a menudo las cajas del prompt) no debe
     // quedar pegada a la barra de pestañas. Abajo basta con la mitad.
@@ -110,16 +133,35 @@ pub fn show(
         );
     });
 
-    handle_input(ui, s, &resp, rect, origin, m, keyboard);
+    let link = handle_input(ui, s, &resp, rect, origin, m, keyboard);
 
     // Las líneas de cajas no se pintan como texto: en su sitio van las cajas, que dibuja
     // quien llama a partir de `s.chips_px`.
     let chip_rows = if chips { s.chip_rows() } else { Vec::new() };
+    // Un prompt remoto lleva sus cajas en la misma fila que el comando. Las cajas ocupan
+    // más que el texto que sustituyen, así que el comando se pinta corrido a la derecha
+    // lo que haga falta (en celdas enteras, para que siga en la rejilla).
+    let lead = |c: &crate::session::ChipRow| {
+        // Mismas medidas que `prompt_chips`: 36 px de relleno e icono por caja, 6 entre
+        // cajas, y la letra algo más pequeña que la de la rejilla si la fila es baja.
+        let scale = (m.font.size.min((m.cell_h - 4.0) * 0.8) / m.font.size).min(1.0);
+        let px: f32 = c
+            .parts
+            .iter()
+            .map(|(_, text)| 42.0 + text.chars().count() as f32 * m.cell_w * scale)
+            .sum();
+        (px / m.cell_w).ceil() as usize + 1
+    };
     s.chips_px = chip_rows
         .iter()
         .map(|c| {
             let top = origin.y + c.row as f32 * m.cell_h;
-            let right = if c.next >= cols { cols } else { c.next - 2 };
+            // (Las cajas de un prompt remoto se miden solas; el comando empieza en `lead`.)
+            let right = if c.inline || c.next >= cols {
+                cols
+            } else {
+                c.next - 2
+            };
             let area = Rect::from_min_max(
                 Pos2::new(origin.x, top),
                 Pos2::new(origin.x + right as f32 * m.cell_w, top + m.cell_h),
@@ -128,11 +170,17 @@ pub fn show(
         })
         .collect();
     // Bajo una línea de cajas no se pinta el símbolo del prompt («❯ »): la fila se corre a
-    // la izquierda para que se escriba desde el borde, y el cursor ahí es una barra.
+    // la izquierda para que se escriba desde el borde, y el cursor ahí es una barra. El
+    // desplazamiento es en celdas; negativo = a la derecha (prompt remoto).
     s.row_shifts = chip_rows
         .iter()
-        .filter(|c| c.symbol > 0)
-        .map(|c| (c.row + 1, c.symbol))
+        .filter_map(|c| {
+            if c.inline {
+                Some((c.row, c.end as i32 - lead(c) as i32))
+            } else {
+                (c.symbol > 0).then_some((c.row + 1, c.symbol as i32))
+            }
+        })
         .collect();
     let shifts = s.row_shifts.clone();
     let shift_of = |row: i32| {
@@ -141,8 +189,55 @@ pub fn show(
             .find(|(r, _)| *r == row)
             .map_or(0, |(_, n)| *n)
     };
+    // Colores del comando que se escribe en una máquina remota (allí no hay resaltado).
+    let token_at = |row: i32, col: usize| {
+        chip_rows
+            .iter()
+            .flat_map(|c| c.tokens.iter())
+            .find(|(r, from, to, _)| *r == row && (*from..*to).contains(&col))
+            .map(|(.., tok)| *tok)
+    };
     let prompt_bar = !shifts.is_empty() && s.at_prompt();
     let painter = ui.painter().with_clip_rect(rect);
+    // Cada prompt marcado sabe cómo acabó el comando anterior: si falló, una barra roja
+    // en el margen recorre ese comando y su salida, y junto a sus cajas van el código de
+    // salida y lo que tardó (la duración sola, si acabó bien pero tardó).
+    for (i, c) in chip_rows.iter().enumerate() {
+        let Some((status, ms)) = c.result else {
+            continue;
+        };
+        let prev = i.checked_sub(1).map(|j| chip_rows[j].row);
+        let failed = status != 0;
+        let y = |row: i32| origin.y + row as f32 * m.cell_h;
+        if failed {
+            let bar = Rect::from_min_max(
+                Pos2::new(rect.left(), y(prev.unwrap_or(0)) - 3.0),
+                Pos2::new(rect.left() + 3.0, y(c.row) - m.cell_h * 0.6),
+            );
+            painter.rect_filled(bar, 1.0, pal.ansi[1]);
+        }
+        let time = if ms < 1000 {
+            format!("{ms} ms")
+        } else if ms < 60_000 {
+            format!("{:.1} s", ms as f32 / 1000.0)
+        } else {
+            format!("{} min {} s", ms / 60_000, ms % 60_000 / 1000)
+        };
+        let label = match (failed, ms >= 1000) {
+            (true, _) => format!("falló ({status})  ·  {time}"),
+            (false, true) => time,
+            (false, false) => continue,
+        };
+        if let Some(prev) = prev {
+            painter.text(
+                Pos2::new(rect.right() - m.pad - 4.0, y(prev) + m.cell_h / 2.0 - 4.0),
+                Align2::RIGHT_CENTER,
+                label,
+                egui::FontId::proportional(m.font.size * 0.85),
+                if failed { pal.ansi[1] } else { pal.muted },
+            );
+        }
+    }
     let mut bgs: Vec<BgRun> = Vec::new();
     let mut texts: Vec<TextRun> = Vec::new();
     let mut lines_deco: Vec<(i32, usize, usize, Color32, bool)> = Vec::new();
@@ -159,12 +254,7 @@ pub fn show(
         cursor = (
             content.cursor.shape,
             cursor_row,
-            content
-                .cursor
-                .point
-                .column
-                .0
-                .saturating_sub(shift_of(cursor_row)),
+            (content.cursor.point.column.0 as i32 - shift_of(cursor_row)).max(0) as usize,
         );
         let mut under_cursor = None;
 
@@ -179,18 +269,24 @@ pub fn show(
             if chip_rows.iter().any(|c| c.row == row && col < c.end) {
                 continue;
             }
-            let shift = shift_of(row);
-            if col < shift {
+            let token = token_at(row, col);
+            let shifted = col as i32 - shift_of(row);
+            if shifted < 0 {
                 continue;
             }
-            let col = col - shift;
+            let col = shifted as usize;
             let width = if flags.contains(Flags::WIDE_CHAR) {
                 2
             } else {
                 1
             };
 
-            let mut fg = resolve(cell.fg, colors, pal);
+            let mut fg = match token {
+                Some(crate::session::Tok::Command) => pal.ansi[2],
+                Some(crate::session::Tok::Flag) => pal.ansi[4],
+                Some(crate::session::Tok::Str) => pal.ansi[3],
+                None => resolve(cell.fg, colors, pal),
+            };
             let mut bg = resolve(cell.bg, colors, pal);
             if flags.contains(Flags::DIM) {
                 fg = dim(fg);
@@ -200,6 +296,11 @@ pub fn show(
             }
             if selection.is_some_and(|sel| sel.contains(ind.point)) {
                 bg = pal.selection;
+            }
+            // El enlace bajo el puntero (con ⌘): del color de acento y subrayado.
+            let linked = link.as_ref().is_some_and(|l| l.contains(ind.point, cell));
+            if linked {
+                fg = pal.accent;
             }
             if bg != pal.bg {
                 match bgs.last_mut() {
@@ -217,7 +318,9 @@ pub fn show(
             if row == cursor.1 && col == cursor.2 {
                 under_cursor = Some((cell.c, flags.contains(Flags::BOLD)));
             }
-            if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
+            if linked {
+                lines_deco.push((row, col, width, fg, false));
+            } else if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
                 lines_deco.push((row, col, width, fg, flags.contains(Flags::STRIKEOUT)));
             }
             let c = cell.c;
@@ -249,7 +352,7 @@ pub fn show(
                     let mut text = String::from(c);
                     if let Some(z) = zero {
                         // Las marcas de las cajas no son texto (se ven si las cajas están apagadas).
-                        text.extend(z.iter().filter(|c| !('\u{E0D0}'..='\u{E0D2}').contains(*c)));
+                        text.extend(z.iter().filter(|c| !('\u{E0D0}'..='\u{E0D5}').contains(*c)));
                     }
                     texts.push(TextRun {
                         row,
@@ -272,19 +375,50 @@ pub fn show(
             origin.y + row as f32 * m.cell_h,
         )
     };
-    for b in &bgs {
-        let min = cell_pos(b.row, b.col);
-        let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
-        painter.rect_filled(Rect::from_min_max(min, max), 0.0, b.color);
-    }
-    for t in texts {
-        let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
-        let font = if t.bold {
-            m.bold.clone()
-        } else {
-            m.font.clone()
-        };
-        painter.text(pos, Align2::LEFT_TOP, t.text, font, t.fg);
+    if crate::grid::instanced() {
+        // Fondos y letras como instancias de Metal (`grid.rs`), en un solo `Callback` en
+        // el mismo sitio del orden de pintado: lo que va después (puntos, subrayados,
+        // cursor, cajas) queda encima, como antes.
+        let ctx = ui.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let mut instances = Vec::with_capacity(bgs.len() + texts.len() * 8);
+        for b in &bgs {
+            // Como `rect_filled`: el teselador lleva el rectángulo a píxeles enteros.
+            let min = cell_pos(b.row, b.col);
+            let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
+            let r = egui::emath::GuiRounding::round_to_pixels(Rect::from_min_max(min, max), ppp);
+            instances.push(crate::grid::Instance::solid(r.min, r.max, b.color));
+        }
+        GLYPHS.with_borrow_mut(|cache| {
+            cache.begin(&ctx, &m.font, &m.bold);
+            for t in &texts {
+                let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
+                cache.push_text(&ctx, &mut instances, pos, &t.text, t.ascii, t.bold, t.fg);
+            }
+        });
+        crate::debug::timing::INSTANCES
+            .fetch_add(instances.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if !instances.is_empty() {
+            painter.add(egui::Shape::Callback(egui::PaintCallback {
+                rect,
+                callback: std::sync::Arc::new(crate::grid::GridBatch { instances }),
+            }));
+        }
+    } else {
+        for b in &bgs {
+            let min = cell_pos(b.row, b.col);
+            let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
+            painter.rect_filled(Rect::from_min_max(min, max), 0.0, b.color);
+        }
+        for t in texts {
+            let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
+            let font = if t.bold {
+                m.bold.clone()
+            } else {
+                m.font.clone()
+            };
+            painter.text(pos, Align2::LEFT_TOP, t.text, font, t.fg);
+        }
     }
     for (row, col, color) in dots {
         let center = cell_pos(row, col) + Vec2::new(m.cell_w, m.cell_h) / 2.0;
@@ -323,9 +457,25 @@ pub fn show(
         (ms / 500) % 2 == 0
     };
     if shape != CursorShape::Hidden && crow >= 0 && (crow as usize) < lines {
-        let min = cell_pos(crow, ccol);
+        let base = cell_pos(crow, ccol);
+        s.cursor_px = Some(Rect::from_min_size(base, Vec2::new(m.cell_w, m.cell_h)));
+        // Lo que se está componiendo va en el sitio del cursor, subrayado, y el cursor detrás.
+        let composing = s.preedit.chars().count() as f32 * m.cell_w;
+        if composing > 0.0 {
+            let area = Rect::from_min_size(base, Vec2::new(composing, m.cell_h));
+            painter.rect_filled(area, 0.0, pal.bg);
+            painter.text(
+                base + Vec2::new(0.0, m.text_dy),
+                Align2::LEFT_TOP,
+                &s.preedit,
+                m.font.clone(),
+                pal.fg,
+            );
+            let line = Rect::from_min_max(Pos2::new(area.left(), area.bottom() - 2.0), area.max);
+            painter.rect_filled(line, 0.0, pal.accent);
+        }
+        let min = base + Vec2::new(composing, 0.0);
         let cell = Rect::from_min_size(min, Vec2::new(m.cell_w, m.cell_h));
-        s.cursor_px = Some(cell);
         if !focused {
             painter.rect_stroke(cell, 0.0, Stroke::new(1.0, pal.cursor), StrokeKind::Inside);
         } else if blink_on {
@@ -388,7 +538,7 @@ fn grid_point(pos: Pos2, origin: Pos2, m: &Metrics, s: &Session, offset: usize) 
         .iter()
         .find(|(r, _)| *r == row as i32)
         .map_or(0, |(_, n)| *n);
-    let col = (x.floor() as usize + shift).min(s.size.cols - 1);
+    let col = ((x.floor() as i32 + shift).max(0) as usize).min(s.size.cols - 1);
     let side = if x.fract() > 0.5 {
         Side::Right
     } else {
@@ -408,11 +558,33 @@ fn handle_input(
     origin: Pos2,
     m: &Metrics,
     keyboard: bool,
-) {
+) -> Option<Link> {
     let ctx = ui.ctx().clone();
     let mode = *s.term.lock().mode();
     let (events, scroll_y, mods) =
         ui.input(|i| (i.events.clone(), i.smooth_scroll_delta.y, i.modifiers));
+
+    // Lo que se está componiendo deja de enseñarse en cuanto llega texto de verdad. macOS
+    // no siempre avisa de que la composición terminó (la «ñ» de ⌥N + N llega como texto
+    // normal, sin un `Preedit` vacío antes), y el «˜» se quedaba pegado al cursor.
+    let frame = ctx.cumulative_frame_nr();
+    let committed = events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::Text(_)
+                | egui::Event::Paste(_)
+                | egui::Event::Ime(egui::ImeEvent::Commit(_))
+        )
+    });
+    // También si se pulsa otra tecla en un cuadro posterior (Esc, flechas…) o se va el foco.
+    let later_key = frame > s.preedit_frame
+        && events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }));
+    let focused = ui.input(|i| i.viewport().focused.unwrap_or(true));
+    if later_key || !focused {
+        s.preedit.clear();
+    }
 
     for ev in events {
         if !keyboard {
@@ -420,16 +592,34 @@ fn handle_input(
         }
         match ev {
             egui::Event::Text(t) => s.input(t.into_bytes()),
-            egui::Event::Ime(egui::ImeEvent::Commit(t)) => s.input(t.into_bytes()),
+            egui::Event::Ime(egui::ImeEvent::Commit(t)) => {
+                s.preedit.clear();
+                s.input(t.into_bytes());
+            }
+            // Composición en curso: todavía no es texto, solo se enseña.
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                s.preedit = text;
+                s.preedit_frame = frame;
+            }
             egui::Event::Paste(t) => s.paste(&t),
             // ⌘V con una imagen en el portapapeles (sin texto): se envía Ctrl+V para que
             // el programa (Claude Code, etc.) lea la imagen él mismo, como hace Warp.
             egui::Event::PasteImage(_) => s.input(vec![0x16]),
             egui::Event::Copy | egui::Event::Cut => {
-                if let Some(text) = s.term.lock().selection_to_string() {
-                    if !text.is_empty() {
-                        ctx.copy_text(text);
+                let text = s
+                    .term
+                    .lock()
+                    .selection_to_string()
+                    .filter(|t| !t.is_empty());
+                match text {
+                    Some(text) => ctx.copy_text(text),
+                    // Sin selección de pantalla, ⌘C/⌘X son para lo seleccionado dentro
+                    // del comando, que lo lleva zle (ver `assets/shell/zshenv.zsh`).
+                    None if s.input_cells().is_some() => {
+                        let cut = matches!(ev, egui::Event::Cut);
+                        s.input(if cut { SEL_CUT } else { SEL_COPY }.to_vec());
                     }
+                    None => {}
                 }
             }
             egui::Event::Key {
@@ -451,12 +641,27 @@ fn handle_input(
                         continue;
                     }
                 }
+                // ⌘A en el prompt selecciona el comando entero; y al seleccionar con el
+                // teclado se suelta lo que hubiera seleccionado con el ratón.
+                let arrow = matches!(key, Key::ArrowLeft | Key::ArrowRight);
+                let select_all = key == Key::A && modifiers.mac_cmd && !modifiers.shift;
+                if (select_all || arrow && modifiers.shift) && s.in_command() {
+                    s.term.lock().selection = None;
+                    if select_all {
+                        s.input(SEL_ALL.to_vec());
+                        continue;
+                    }
+                }
                 if let Some(bytes) = key_bytes(key, modifiers, mode) {
                     s.input(bytes);
                 }
             }
             _ => {}
         }
+    }
+
+    if committed {
+        s.preedit.clear();
     }
 
     // Rueda / trackpad.
@@ -489,19 +694,45 @@ fn handle_input(
 
     // Ratón: si el programa pidió informes (y no mantienes Shift), se le envían clics,
     // arrastres y movimiento; si no, el ratón selecciona texto.
+    // Con ⌘ pulsado, el enlace bajo el puntero se resalta y un clic lo abre. Va antes que
+    // los informes de ratón: ese clic no es para el programa ni empieza una selección.
+    let link = (mods.command && hovered)
+        .then(|| ctx.pointer_hover_pos())
+        .flatten()
+        .and_then(|pos| {
+            let term = s.term.lock();
+            let offset = term.grid().display_offset();
+            let (point, _) = grid_point(pos, origin, m, s, offset);
+            // Las rutas son de esta máquina: dentro de una sesión ssh no se buscan.
+            let cwd = (!s.remote()).then_some(s.cwd.as_path());
+            link_at(&term, point, cwd)
+        });
+    if let Some(link) = link {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        if resp.clicked() {
+            open_link(&link.target, &m.editor);
+        }
+        return Some(link);
+    }
+
     let reporting = mode.intersects(TermMode::MOUSE_MODE) && !mods.shift;
     if reporting {
         report_mouse(ui, s, rect, origin, m, mode, mods);
-        return;
+        return None;
     }
     s.mouse_cell = None;
     s.mouse_down = None;
+    let app_cursor = mode.contains(TermMode::APP_CURSOR);
+    if resp.drag_stopped() {
+        adopt_selection(s, app_cursor);
+    }
     let Some(pos) = resp.interact_pointer_pos() else {
-        return;
+        return None;
     };
     let mut term = s.term.lock();
     let offset = term.grid().display_offset();
     let (point, side) = grid_point(pos, origin, m, s, offset);
+    let mut place = None;
     if resp.triple_clicked() {
         term.selection = Some(Selection::new(SelectionType::Lines, point, side));
     } else if resp.double_clicked() {
@@ -514,6 +745,436 @@ fn handle_input(
         }
     } else if resp.clicked() {
         term.selection = None;
+        place = Some((point, side));
+    }
+    drop(term);
+    if resp.double_clicked() {
+        adopt_selection(s, app_cursor);
+    } else if let Some((point, side)) = place {
+        place_cursor(s, point, side, app_cursor);
+    }
+    None
+}
+
+/// Un enlace que se puede abrir: el de un hiperenlace OSC 8 (lo que emite Claude Code),
+/// una dirección escrita tal cual en la pantalla o la ruta de un archivo que existe.
+struct Link {
+    target: Target,
+    span: Span,
+}
+
+#[derive(Debug, PartialEq)]
+enum Target {
+    Url(String),
+    /// Archivo o carpeta de esta máquina, con la línea y la columna si el texto las decía
+    /// (`src/view.rs:120:8`).
+    File(PathBuf, Option<u32>, Option<u32>),
+}
+
+/// Qué celdas ocupa el enlace.
+enum Span {
+    /// Las del hiperenlace OSC 8 con esta dirección. Se compara la dirección y no el id:
+    /// un enlace partido en varias líneas llega como varios hiperenlaces.
+    Tag(String),
+    /// De esta celda a esta otra, si salió del texto.
+    Range(Point, Point),
+}
+
+impl Link {
+    fn contains(&self, point: Point, cell: &Cell) -> bool {
+        match &self.span {
+            Span::Range(from, to) => (*from..=*to).contains(&point),
+            Span::Tag(uri) => cell.hyperlink().is_some_and(|h| h.uri() == uri),
+        }
+    }
+}
+
+/// Solo se abren direcciones web y de correo: un hiperenlace lo escribe el programa que
+/// corre en la terminal, y `open` con otro esquema podría lanzar archivos o aplicaciones.
+fn openable(uri: &str) -> bool {
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|scheme| uri.starts_with(scheme))
+}
+
+/// `cwd` es la carpeta contra la que se resuelven las rutas relativas; sin ella (sesión
+/// remota) solo se buscan direcciones.
+fn link_at<T>(term: &Term<T>, point: Point, cwd: Option<&Path>) -> Option<Link> {
+    let grid = term.grid();
+    if let Some(tag) = grid[point].hyperlink() {
+        let target = if openable(tag.uri()) {
+            Some(Target::Url(tag.uri().to_string()))
+        } else {
+            // `file://máquina/ruta`, lo que emiten `ls --hyperlink` y algunos agentes.
+            cwd.and(tag.uri().strip_prefix("file://"))
+                .and_then(|rest| rest.find('/').map(|i| PathBuf::from(unescape(&rest[i..]))))
+                .filter(|path| path.exists())
+                .map(|path| Target::File(path, None, None))
+        };
+        if let Some(target) = target {
+            return Some(Link {
+                target,
+                span: Span::Tag(tag.uri().to_string()),
+            });
+        }
+    }
+    // Sin hiperenlace se busca una dirección en el texto de la línea, entera aunque la
+    // terminal la haya partido en varias filas (hasta 20 hacia cada lado).
+    let last = grid.last_column();
+    let wraps = |line: i32| grid[Line(line)][last].flags.contains(Flags::WRAPLINE);
+    let mut first = point.line.0;
+    while first > grid.topmost_line().0 && point.line.0 - first < 20 && wraps(first - 1) {
+        first -= 1;
+    }
+    let mut end = point.line.0;
+    while end < grid.bottommost_line().0 && end - point.line.0 < 20 && wraps(end) {
+        end += 1;
+    }
+    let mut chars = Vec::new();
+    let mut points = Vec::new();
+    for line in first..=end {
+        for col in 0..grid.columns() {
+            let at = Point::new(Line(line), Column(col));
+            let cell = &grid[at];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            chars.push(if cell.c == '\0' { ' ' } else { cell.c });
+            points.push(at);
+        }
+    }
+    let idx = points.iter().position(|p| *p == point)?;
+    if let Some((from, to)) = url_span(&chars, idx) {
+        return Some(Link {
+            target: Target::Url(chars[from..to].iter().collect()),
+            span: Span::Range(points[from], points[to - 1]),
+        });
+    }
+    let (from, to) = path_span(&chars, idx)?;
+    let token: String = chars[from..to].iter().collect();
+    let (name, line, col) = split_position(&token);
+    let path = find_path(name, cwd?)?;
+    Some(Link {
+        target: Target::File(path, line, col),
+        span: Span::Range(points[from], points[to - 1]),
+    })
+}
+
+/// `%XX` → byte, para las rutas de los hiperenlaces `file://`.
+fn unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = (bytes[i] == b'%')
+            .then(|| text.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// La palabra con forma de ruta que pasa por `idx`, como rango `[desde, hasta)`: llega
+/// hasta los espacios, comillas o paréntesis que la rodean, sin la puntuación final.
+fn path_span(chars: &[char], idx: usize) -> Option<(usize, usize)> {
+    let part = |c: char| {
+        if c.is_ascii() {
+            c.is_ascii_graphic() && !"\"'`<>()[]{}|*?;,=".contains(c)
+        } else {
+            c.is_alphanumeric()
+        }
+    };
+    if !part(*chars.get(idx)?) {
+        return None;
+    }
+    let mut from = idx;
+    while from > 0 && part(chars[from - 1]) {
+        from -= 1;
+    }
+    let mut to = idx + 1;
+    while to < chars.len() && part(chars[to]) {
+        to += 1;
+    }
+    while to > from && matches!(chars[to - 1], '.' | ':') {
+        to -= 1;
+    }
+    (idx < to && chars[from..to].iter().any(|c| c.is_alphanumeric())).then_some((from, to))
+}
+
+/// Separa `ruta:línea:columna` (lo que escriben compiladores y agentes) en sus partes.
+fn split_position(token: &str) -> (&str, Option<u32>, Option<u32>) {
+    fn number(text: &str) -> Option<(&str, u32)> {
+        let (rest, n) = text.rsplit_once(':')?;
+        (!rest.is_empty()).then_some((rest, n.parse().ok()?))
+    }
+    match number(token) {
+        Some((rest, last)) => match number(rest) {
+            Some((name, line)) => (name, Some(line), Some(last)),
+            None => (rest, Some(last), None),
+        },
+        None => (token, None, None),
+    }
+}
+
+/// La ruta a la que se refiere `name` vista desde `cwd`, si existe en el disco. Los
+/// `a/` y `b/` que `git diff` pone delante no son parte de la ruta.
+fn find_path(name: &str, cwd: &Path) -> Option<PathBuf> {
+    let from_home = name
+        .strip_prefix("~/")
+        .and_then(|rest| dirs::home_dir().map(|home| home.join(rest)));
+    let plain = from_home.unwrap_or_else(|| cwd.join(name));
+    let diff = ["a/", "b/"]
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+        .map(|rest| cwd.join(rest));
+    [Some(plain), diff]
+        .into_iter()
+        .flatten()
+        .find(|p| p.exists())
+}
+
+/// Con qué orden se abre un archivo. Lo que al abrirse **se ejecuta** o se instala (una
+/// aplicación, un `.command`, un binario) solo se enseña en Finder: la ruta la escribió el
+/// programa que corre en la terminal, no quien hace clic.
+fn file_command(
+    path: &Path,
+    line: Option<u32>,
+    col: Option<u32>,
+    editor: &str,
+    dir: bool,
+    executable: bool,
+) -> Vec<String> {
+    const RUNS: [&str; 22] = [
+        "app",
+        "command",
+        "tool",
+        "terminal",
+        "workflow",
+        "action",
+        "pkg",
+        "mpkg",
+        "dmg",
+        "jar",
+        "scpt",
+        "scptd",
+        "applescript",
+        "webloc",
+        "inetloc",
+        "fileloc",
+        "prefpane",
+        "zip",
+        "gz",
+        "tgz",
+        "tar",
+        "xip",
+    ];
+    const MEDIA: [&str; 16] = [
+        "png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "bmp", "ico", "icns", "pdf", "mp4",
+        "mov", "mp3", "wav", "m4a",
+    ];
+    let file = path.to_string_lossy().into_owned();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let open = |flags: &[&str]| {
+        let mut cmd = vec!["open".to_string()];
+        cmd.extend(flags.iter().map(|f| f.to_string()));
+        cmd.push(file.clone());
+        cmd
+    };
+    if RUNS.contains(&ext.as_str()) {
+        return open(&["-R"]);
+    }
+    if dir || MEDIA.contains(&ext.as_str()) {
+        return open(&[]);
+    }
+    let mut words = editor.split_whitespace().map(str::to_string);
+    let Some(program) = words.next() else {
+        return if executable { open(&["-R"]) } else { open(&[]) };
+    };
+    let at = |sep: &str| match (line, col) {
+        (Some(l), Some(c)) => format!("{file}{sep}{l}{sep}{c}"),
+        (Some(l), None) => format!("{file}{sep}{l}"),
+        _ => file.clone(),
+    };
+    let name = program.rsplit('/').next().unwrap_or_default().to_string();
+    let args = match name.as_str() {
+        "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => vec!["-g".into(), at(":")],
+        "zed" | "subl" | "nova" => vec![at(":")],
+        "idea" | "webstorm" | "pycharm" | "rustrover" | "goland" | "clion" | "phpstorm"
+        | "rubymine" | "studio" | "xed" => match line {
+            Some(l) => vec!["--line".into(), l.to_string(), file.clone()],
+            None => vec![file.clone()],
+        },
+        _ => vec![file.clone()],
+    };
+    // El editor se busca con el PATH de un shell de inicio de sesión: abierta desde Finder,
+    // la app no hereda el del usuario (Homebrew, `~/.local/bin`…).
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let mut cmd = vec![
+        shell,
+        "-lc".into(),
+        "exec \"$@\"".into(),
+        "colibri".into(),
+        program,
+    ];
+    cmd.extend(words);
+    cmd.extend(args);
+    cmd
+}
+
+/// La dirección web que pasa por `idx`, como rango `[desde, hasta)` de `chars`. No incluye
+/// la puntuación con la que acaba la frase ni el paréntesis que la encierra.
+fn url_span(chars: &[char], idx: usize) -> Option<(usize, usize)> {
+    let starts = |i: usize, scheme: &str| {
+        chars[i..].len() > scheme.len()
+            && chars[i..].iter().zip(scheme.chars()).all(|(a, b)| *a == b)
+    };
+    let part = |c: char| {
+        if c.is_ascii() {
+            c.is_ascii_graphic()
+                && !matches!(c, '"' | '<' | '>' | '`' | '\\' | '^' | '{' | '}' | '|')
+        } else {
+            c.is_alphanumeric()
+        }
+    };
+    let mut i = 0;
+    while i <= idx {
+        let after_word = i > 0 && chars[i - 1].is_alphanumeric();
+        if after_word || !(starts(i, "https://") || starts(i, "http://")) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < chars.len() && part(chars[end]) {
+            end += 1;
+        }
+        loop {
+            let count = |c: char| chars[i..end].iter().filter(|x| **x == c).count();
+            let drop = match chars[end - 1] {
+                '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
+                ')' => count(')') > count('('),
+                ']' => count(']') > count('['),
+                _ => false,
+            };
+            if !drop {
+                break;
+            }
+            end -= 1;
+        }
+        let scheme = if starts(i, "https://") { 8 } else { 7 };
+        if end - i > scheme && (i..end).contains(&idx) {
+            return Some((i, end));
+        }
+        i = end.max(i + 1);
+    }
+    None
+}
+
+/// Abre el enlace: una dirección con la aplicación del sistema, un archivo con el editor
+/// elegido. Con el guion de depuración solo se anuncia en stderr, para poder comprobarlo
+/// sin abrir nada.
+fn open_link(target: &Target, editor: &str) {
+    let cmd = match target {
+        Target::Url(uri) => vec!["open".to_string(), uri.clone()],
+        Target::File(path, line, col) => {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(path).ok();
+            let dir = meta.as_ref().is_some_and(|m| m.is_dir());
+            let executable = meta.is_some_and(|m| m.permissions().mode() & 0o111 != 0);
+            file_command(path, *line, *col, editor, dir, executable)
+        }
+    };
+    if std::env::var_os("COLIBRI_SCRIPT").is_some() {
+        match target {
+            Target::Url(uri) => eprintln!("enlace: {uri}"),
+            Target::File(..) => eprintln!("enlace: {}", cmd.join(" ")),
+        }
+        return;
+    }
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .stdin(std::process::Stdio::null())
+            .status();
+    });
+}
+
+/// Teclas privadas que la integración de zsh enlaza a sus widgets de selección.
+const SEL_ALL: &[u8] = b"\x1b[77;a~";
+const SEL_COPY: &[u8] = b"\x1b[77;c~";
+const SEL_CUT: &[u8] = b"\x1b[77;x~";
+
+/// Flechas (sin modificadores) para llevar el cursor de zle de un carácter a otro.
+fn cursor_moves(from: usize, to: usize, app_cursor: bool) -> Vec<u8> {
+    let key: &[u8] = match (to < from, app_cursor) {
+        (true, true) => b"\x1bOD",
+        (true, false) => b"\x1b[D",
+        (false, true) => b"\x1bOC",
+        (false, false) => b"\x1b[C",
+    };
+    key.repeat(from.abs_diff(to))
+}
+
+/// Una selección hecha con el ratón que cae entera dentro del comando que se está
+/// escribiendo pasa a ser selección de zle (cursor al principio + Shift+→ hasta el final):
+/// así se puede sustituir escribiendo, borrar o cortar, igual que la hecha con el teclado.
+fn adopt_selection(s: &mut Session, app_cursor: bool) {
+    let Some((cells, cursor)) = s.input_cells() else {
+        return;
+    };
+    let range = {
+        let term = s.term.lock();
+        term.selection.as_ref().and_then(|sel| sel.to_range(&term))
+    };
+    let (Some(range), Some(first), Some(last)) = (range, cells.first(), cells.last()) else {
+        return;
+    };
+    if range.is_block || range.start < *first || range.end.line > last.line {
+        return;
+    }
+    let from = cells.partition_point(|c| *c < range.start);
+    let to = cells.partition_point(|c| *c <= range.end);
+    if to <= from {
+        return;
+    }
+    let at = cells.partition_point(|c| *c < cursor);
+    let mut bytes = cursor_moves(at, from, app_cursor);
+    bytes.extend(b"\x1b[1;2C".repeat(to - from));
+    s.term.lock().selection = None;
+    s.input(bytes);
+}
+
+/// Un clic dentro del comando que se está escribiendo lleva ahí el cursor.
+fn place_cursor(s: &mut Session, point: Point, side: Side, app_cursor: bool) {
+    let Some((cells, cursor)) = s.input_cells() else {
+        return;
+    };
+    let (Some(first), Some(last)) = (cells.first(), cells.last()) else {
+        return;
+    };
+    if point < *first || point.line > last.line {
+        return;
+    }
+    let after = side == Side::Right && cells.contains(&point);
+    let to = cells.partition_point(|c| *c < point) + after as usize;
+    let at = cells.partition_point(|c| *c < cursor);
+    if to != at {
+        s.input(cursor_moves(at, to, app_cursor));
     }
 }
 
@@ -606,7 +1267,89 @@ fn report_mouse(
 
 #[cfg(test)]
 mod tests {
-    use super::mouse_seq;
+    use super::{file_command, mouse_seq, path_span, split_position, url_span};
+    use std::path::Path;
+
+    fn url(text: &str, at: &str) -> Option<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let idx = text[..text.find(at)?].chars().count();
+        url_span(&chars, idx).map(|(a, b)| chars[a..b].iter().collect())
+    }
+
+    #[test]
+    fn path_in_text() {
+        let word = |text: &str, at: &str| {
+            let chars: Vec<char> = text.chars().collect();
+            let idx = text[..text.find(at)?].chars().count();
+            path_span(&chars, idx).map(|(a, b)| chars[a..b].iter().collect::<String>())
+        };
+        assert_eq!(
+            word("  --> src/view.rs:120:8", "view").as_deref(),
+            Some("src/view.rs:120:8")
+        );
+        assert_eq!(
+            word("mira (src/main.rs).", "main").as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            word("en `Cargo.toml`: ok", "Cargo").as_deref(),
+            Some("Cargo.toml")
+        );
+        assert_eq!(word("uno  dos", " d"), None);
+        assert_eq!(
+            split_position("src/view.rs:120:8"),
+            ("src/view.rs", Some(120), Some(8))
+        );
+        assert_eq!(split_position("a.rs:7"), ("a.rs", Some(7), None));
+        assert_eq!(split_position("a.rs"), ("a.rs", None, None));
+        assert_eq!(split_position("C:x"), ("C:x", None, None));
+    }
+
+    #[test]
+    fn file_commands() {
+        let cmd = |path: &str, editor: &str, dir: bool, exec: bool| {
+            file_command(Path::new(path), Some(12), Some(3), editor, dir, exec).join(" ")
+        };
+        // Sin editor decide macOS, salvo lo que al abrirse se ejecuta: eso solo se enseña.
+        assert_eq!(cmd("/x/a.rs", "", false, false), "open /x/a.rs");
+        assert_eq!(cmd("/x/run", "", false, true), "open -R /x/run");
+        assert_eq!(
+            cmd("/x/Mala.app", "code", true, true),
+            "open -R /x/Mala.app"
+        );
+        assert_eq!(cmd("/x/src", "code", true, true), "open /x/src");
+        assert_eq!(cmd("/x/foto.PNG", "code", false, false), "open /x/foto.PNG");
+        assert!(cmd("/x/a.rs", "code", false, false).ends_with(" colibri code -g /x/a.rs:12:3"));
+        assert!(cmd("/x/a.rs", "zed", false, true).ends_with(" colibri zed /x/a.rs:12:3"));
+        assert!(cmd("/x/a.rs", "idea", false, false).ends_with(" colibri idea --line 12 /x/a.rs"));
+        assert!(
+            cmd("/x/a.rs", "nvim-gui -f", false, false).ends_with(" colibri nvim-gui -f /x/a.rs")
+        );
+    }
+
+    #[test]
+    fn url_in_text() {
+        let pr = "https://bitbucket.org/x/pull-requests/new?source=feat-1&t=1";
+        assert_eq!(
+            url(&format!("Para crear el PR: {pr}"), "bitbucket").as_deref(),
+            Some(pr)
+        );
+        assert_eq!(url(&format!("({pr}).  otra"), "new?").as_deref(), Some(pr));
+        assert_eq!(url(&format!("Para crear el PR: {pr}"), "crear"), None);
+        assert_eq!(
+            url(
+                "ver https://es.wikipedia.org/wiki/Rust_(lenguaje), y",
+                "wiki/"
+            )
+            .as_deref(),
+            Some("https://es.wikipedia.org/wiki/Rust_(lenguaje)")
+        );
+        assert_eq!(
+            url("http://a.com y https://b.com/x.", "b.com").as_deref(),
+            Some("https://b.com/x")
+        );
+        assert_eq!(url("https:// nada", "https"), None);
+    }
 
     #[test]
     fn sgr_press_release_and_hover() {
@@ -656,6 +1399,9 @@ fn key_bytes(key: Key, m: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     // Atajos estilo macOS para moverse en la línea.
     if m.mac_cmd {
         return match key {
+            // Con Shift: seleccionar hasta el principio o el final (Shift+Inicio/Fin).
+            Key::ArrowLeft if m.shift => Some(b"\x1b[1;2H".to_vec()),
+            Key::ArrowRight if m.shift => Some(b"\x1b[1;2F".to_vec()),
             Key::ArrowLeft => Some(vec![0x01]),
             Key::ArrowRight => Some(vec![0x05]),
             Key::Backspace => Some(vec![0x15]),

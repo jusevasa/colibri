@@ -7,24 +7,29 @@ mod complete;
 mod config;
 mod debug;
 mod git;
+mod grid;
 mod history;
 mod hotkey;
+mod macos;
 mod menu;
+mod metal;
 mod notify;
 mod overlay;
 mod ports;
 mod proc;
 mod procs;
 mod session;
+mod shell;
 mod state;
 mod view;
 
 use config::{Config, Palette, Shortcut};
-use eframe::egui::{
+use egui::{
     self, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Pos2, Rect,
     Sense, Stroke, StrokeKind, Vec2, ViewportCommand,
 };
 use session::Session;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
@@ -45,28 +50,43 @@ const TAB_COLORS: [(&str, Color32); 7] = [
 const TAB_SLIDE: f32 = 0.16;
 const TRAFFIC_LIGHTS_W: f32 = 78.0;
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Colibrí")
-            // Sin esto eframe pone su propio icono en el Dock al arrancar y tapa el del
-            // bundle (assets/Colibri.icns). Con el icono vacío macOS usa el de Colibri.app.
-            .with_icon(egui::IconData::default())
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([480.0, 300.0])
-            .with_fullsize_content_view(true)
-            .with_titlebar_shown(false)
-            .with_title_shown(false)
-            .with_transparent(true),
-        // ⌘C/⌘X/⌘V los traduce `clip::translate`, que sí ve las imágenes de Continuity.
-        clipboard_shortcuts: false,
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Colibrí",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))),
-    )
+/// Un archivo soltado por el guion de depuración.
+#[derive(Debug)]
+struct Dropped(PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+fn main() -> Result<(), String> {
+    // Con la entrada de texto del sistema activa (hace falta para ver las teclas muertas),
+    // macOS cambiaría la repetición de una tecla mantenida por su menú de acentos. En una
+    // terminal mantener una tecla debe repetirla.
+    unsafe {
+        let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+        defaults.setBool_forKey(
+            false,
+            objc2_foundation::ns_string!("ApplePressAndHoldEnabled"),
+        );
+    }
+    // Sin icono propio: en el Dock va el del bundle (assets/Colibri.icns).
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("Colibrí")
+        .with_inner_size([1180.0, 760.0])
+        .with_min_inner_size([480.0, 300.0])
+        .with_fullsize_content_view(true)
+        .with_titlebar_shown(false)
+        .with_title_shown(false)
+        .with_transparent(true);
+    macos::install();
+    // ⌘C/⌘X/⌘V los traduce `clip::translate` (el lanzador apaga los atajos de egui).
+    shell::run(viewport, |ctx| Box::new(App::new(ctx)))
 }
 
 /// Todo lo que se puede hacer desde un atajo o desde la paleta de comandos.
@@ -194,7 +214,7 @@ struct App {
     /// ventana, se abre una pestaña) las pestañas se recolocan sin animación.
     tab_layout: (f32, f32),
     /// Comandos que muestra el historial, del más reciente al más antiguo.
-    history: Vec<String>,
+    history: Vec<history::Entry>,
     /// Lo que ofrece el desplegable de una caja del prompt (ramas, o carpetas y archivos)
     /// y dónde se ancla en pantalla.
     picks: Vec<overlay::Pick>,
@@ -202,21 +222,33 @@ struct App {
     /// Rama y cambios de la carpeta de la pestaña activa (barra de estado).
     git: git::Watch,
     /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
-    script_keys: Vec<egui::Key>,
+    script_keys: Vec<(egui::Key, egui::Modifiers)>,
     /// Solo para pruebas: eventos de puntero del guion (`press`, `moveto`, `release`).
     script_pointer: Vec<egui::Event>,
+    /// Archivos que el guion suelta sobre la ventana (`drop`).
+    script_drops: Vec<PathBuf>,
+    /// Número que lleva ahora el icono del Dock: pestañas que terminaron sin verse.
+    badge: usize,
+    /// La entrada segura de teclado está puesta.
+    secure: bool,
+    /// Vista previa (Quick Look) abierta desde el desplegable de carpetas.
+    preview: Option<std::process::Child>,
     /// Si macOS puede mover la ventana ahora mismo (se apaga con el puntero sobre las pestañas).
     window_movable: Option<bool>,
+    /// Zona de la terminal en el último cuadro (para que las listas usen todo su ancho).
+    pub term_rect: Rect,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
+        macos::set_context(ctx);
         let cfg = config::load();
         ctx.set_theme(egui::Theme::Dark);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         install_fonts(ctx, &cfg);
         notify::init(ctx);
-        hotkey::set(ctx, &cfg.keys.global_jump);
+        hotkey::set(ctx, hotkey::Global::Jump, &cfg.keys.global_jump);
+        hotkey::set(ctx, hotkey::Global::Focus, &cfg.keys.global_focus);
         let mut app = Self {
             pal: Palette::new(&cfg.theme),
             keys: Keys::new(&cfg.keys),
@@ -259,7 +291,12 @@ impl App {
             git: git::Watch::new(),
             script_keys: Vec::new(),
             script_pointer: Vec::new(),
+            script_drops: Vec::new(),
+            badge: 0,
+            secure: false,
+            preview: None,
             window_movable: None,
+            term_rect: Rect::NOTHING,
             cfg,
         };
         app.state_path = state::path(app.script.is_some());
@@ -418,6 +455,32 @@ impl App {
         self.history = history::load(&shell, &typed);
     }
 
+    /// Abre el historial sobre el prompt, filtrado por lo que ya hay escrito (como prefijo),
+    /// y deja a la vista en el prompt el comando más reciente. False si no hay nada que
+    /// ofrecer o no se está en el prompt.
+    fn open_history(&mut self, ctx: &egui::Context) -> bool {
+        let Some(original) = self
+            .sessions
+            .get(self.active)
+            .filter(|s| s.at_prompt())
+            .map(|s| s.prompt_line().unwrap_or("").to_string())
+        else {
+            return false;
+        };
+        self.load_history();
+        let prefix = original.to_lowercase();
+        self.history
+            .retain(|e| e.cmd != original && e.cmd.to_lowercase().starts_with(&prefix));
+        let (Some(first), Some(s)) = (self.history.first(), self.sessions.get_mut(self.active))
+        else {
+            return false;
+        };
+        s.insert_command(&first.cmd);
+        self.overlay = overlay::Overlay::History { sel: 0, original };
+        ctx.request_repaint();
+        true
+    }
+
     /// ↑ en el prompt abre el historial; en cualquier otro caso la tecla sigue su camino.
     fn history_key(&mut self, ctx: &egui::Context) {
         if !self.cfg.history_popup
@@ -438,8 +501,7 @@ impl App {
         if !take_shortcut(ctx, &up) {
             return;
         }
-        self.load_history();
-        if self.history.is_empty() {
+        if !self.open_history(ctx) {
             // Sin historial que mostrar, el shell recibe su flecha de siempre.
             if let Some(s) = self.sessions.get_mut(self.active) {
                 let app = s
@@ -453,13 +515,7 @@ impl App {
                     b"\x1b[A".to_vec()
                 });
             }
-            return;
         }
-        self.overlay = overlay::Overlay::History {
-            query: String::new(),
-            sel: 0,
-        };
-        ctx.request_repaint();
     }
 
     /// Tab en el prompt: sugiere carpetas y archivos para la palabra que se teclea. Si no se
@@ -519,10 +575,16 @@ impl App {
                 &complete::replacement(&target, only),
             ),
             _ => {
+                // Anclado donde empieza la palabra, para que no se mueva al elegir.
+                let x = s.cursor_px.map_or(0.0, |c| {
+                    c.left() - target.token.chars().count() as f32 * c.width()
+                });
                 self.overlay = overlay::Overlay::Complete {
+                    line: s.prompt_line().unwrap_or("").to_string(),
                     target,
                     items,
-                    sel: 0,
+                    sel: None,
+                    x,
                 };
                 ctx.request_repaint();
             }
@@ -656,7 +718,10 @@ impl App {
         self.pal = Palette::new(&new.theme);
         self.keys = Keys::new(&new.keys);
         if new.keys.global_jump != self.cfg.keys.global_jump {
-            hotkey::set(ctx, &new.keys.global_jump);
+            hotkey::set(ctx, hotkey::Global::Jump, &new.keys.global_jump);
+        }
+        if new.keys.global_focus != self.cfg.keys.global_focus {
+            hotkey::set(ctx, hotkey::Global::Focus, &new.keys.global_focus);
         }
         self.cfg = new;
     }
@@ -766,16 +831,11 @@ impl App {
             }
             Cmd::Restart => self.restart(),
             Cmd::History => {
-                self.overlay = match self.overlay {
-                    overlay::Overlay::History { .. } => overlay::Overlay::None,
-                    _ => {
-                        self.load_history();
-                        overlay::Overlay::History {
-                            query: String::new(),
-                            sel: 0,
-                        }
-                    }
-                };
+                if matches!(self.overlay, overlay::Overlay::History { .. }) {
+                    self.cancel_overlay();
+                } else {
+                    self.open_history(ctx);
+                }
             }
             Cmd::Clear => {
                 if let Some(s) = self.sessions.get_mut(self.active) {
@@ -803,7 +863,13 @@ impl App {
         let Some(script) = self.script.as_mut() else {
             return;
         };
-        ctx.request_repaint_after(Duration::from_millis(30));
+        // Por defecto el guion repinta sin parar, lo que tapa los fallos de «falta pedir un
+        // cuadro». Con `COLIBRI_LAZY` solo despierta cuando toca el siguiente paso.
+        if std::env::var_os("COLIBRI_LAZY").is_some() {
+            ctx.request_repaint_after(script.until_next());
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
         let step = script.next();
         if script.done() && step.is_none() {
             self.script = None;
@@ -864,6 +930,13 @@ impl App {
                 );
             }
             Some(debug::Step::Pref(id, dir)) => self.pref_change(ctx, &id, dir),
+            Some(debug::Step::Preedit(text)) => {
+                self.script_pointer
+                    .push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text,
+                        active_range_chars: None,
+                    }));
+            }
             Some(debug::Step::Name(name)) => {
                 if let Some(s) = self.sessions.get_mut(self.active) {
                     s.name = name;
@@ -872,16 +945,33 @@ impl App {
             Some(debug::Step::Move(from, to)) => self.move_tab(from, to),
             Some(debug::Step::Agent(forward)) => self.step_agent(forward),
             Some(debug::Step::Key(name)) => {
-                let name = match name.as_str() {
+                // «shift+left», «cmd+a»…: modificadores con «+» delante de la tecla.
+                let mut parts: Vec<&str> = name.split('+').collect();
+                let key = parts.pop().unwrap_or_default();
+                let mods = egui::Modifiers {
+                    shift: parts.contains(&"shift"),
+                    alt: parts.contains(&"alt"),
+                    ctrl: parts.contains(&"ctrl"),
+                    mac_cmd: parts.contains(&"cmd"),
+                    command: parts.contains(&"cmd"),
+                };
+                let upper = key.to_uppercase();
+                let key = match key {
                     "up" => "ArrowUp",
                     "down" => "ArrowDown",
+                    "left" => "ArrowLeft",
+                    "right" => "ArrowRight",
                     "enter" => "Enter",
                     "esc" => "Escape",
                     "tab" => "Tab",
+                    "space" => "Space",
                     "paste" => "Paste",
+                    "backspace" => "Backspace",
+                    k if k.len() == 1 => upper.as_str(),
                     other => other,
                 };
-                self.script_keys.extend(egui::Key::from_name(name));
+                self.script_keys
+                    .extend(egui::Key::from_name(key).map(|k| (k, mods)));
             }
             Some(debug::Step::Pointer(kind, x, y)) => {
                 let pos = Pos2::new(x, y);
@@ -904,6 +994,16 @@ impl App {
                     });
                 }
             }
+            Some(debug::Step::Cmd(down)) => {
+                self.script_pointer
+                    .push(egui::Event::ModifiersChanged(egui::Modifiers {
+                        mac_cmd: down,
+                        command: down,
+                        ..Default::default()
+                    }));
+            }
+            Some(debug::Step::Drop(path)) => self.script_drops.push(PathBuf::from(path)),
+            Some(debug::Step::Minimize) => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
             Some(debug::Step::Update) => self.force_update = !self.force_update,
             Some(debug::Step::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
             Some(debug::Step::Wait(_)) | None => {}
@@ -924,6 +1024,7 @@ impl App {
             text_dy: ((cell_h - h) / 2.0).round(),
             pad: self.cfg.padding.clamp(0.0, 64.0),
             blink: self.cfg.cursor_blink,
+            editor: self.cfg.editor.clone(),
             cursor: match self.cfg.cursor.as_str() {
                 "bar" | "beam" => alacritty_terminal::vte::ansi::CursorShape::Beam,
                 "underline" => alacritty_terminal::vte::ansi::CursorShape::Underline,
@@ -1260,24 +1361,38 @@ impl App {
         let mut right_edge = toggle.left() - 24.0;
         let mut restart = false;
         if show_update {
+            // Como las cajas del prompt: fondo de panel y borde fino, con un punto de acento
+            // que avisa de que hay algo nuevo. Sin relleno de color, que desentonaba.
             let pill = Rect::from_min_max(
-                Pos2::new(right_edge - 86.0, cy - 11.0),
+                Pos2::new(right_edge - 92.0, cy - 11.0),
                 Pos2::new(right_edge, cy + 11.0),
             );
             let resp = ui.interact(pill, ui.scope_id().with("update"), Sense::click());
-            let fill = if resp.hovered() {
-                pal.accent
+            let over = resp.hovered();
+            let (fill, border, text) = if over {
+                (
+                    pal.panel.lerp_to_gamma(pal.fg, 0.09),
+                    pal.accent.gamma_multiply(0.7),
+                    pal.fg,
+                )
             } else {
-                pal.accent.gamma_multiply(0.85)
+                (pal.panel, pal.border, pal.fg.gamma_multiply(0.8))
             };
             let p = ui.painter();
             p.rect_filled(pill, CornerRadius::same(6), fill);
+            p.rect_stroke(
+                pill,
+                CornerRadius::same(6),
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
+            p.circle_filled(Pos2::new(pill.left() + 13.0, cy), 3.0, pal.accent);
             p.text(
-                pill.center(),
-                Align2::CENTER_CENTER,
+                Pos2::new(pill.left() + 23.0, cy),
+                Align2::LEFT_CENTER,
                 "Actualizar",
                 FontId::proportional(11.5),
-                pal.bg,
+                text,
             );
             restart = resp.clicked();
             resp.on_hover_text(
@@ -1852,29 +1967,32 @@ impl App {
     }
 }
 
-impl eframe::App for App {
+impl shell::App for App {
     // Fondo de ventana transparente: lo que se ve lo pinta cada panel con su opacidad.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+    fn clear_color(&self) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         raw.events.append(&mut self.script_pointer);
-        for key in self.script_keys.drain(..) {
+        for path in self.script_drops.drain(..) {
+            raw.dropped_files.push(std::sync::Arc::new(Dropped(path)));
+        }
+        for (key, modifiers) in self.script_keys.drain(..) {
             for pressed in [true, false] {
                 raw.events.push(egui::Event::Key {
                     key,
                     physical_key: None,
                     pressed,
                     repeat: false,
-                    modifiers: egui::Modifiers::NONE,
+                    modifiers,
                 });
             }
         }
-        clip::translate(&mut raw.events);
+        clip::translate(ctx, &mut raw.events);
     }
 
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context) {
         self.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
 
         if self.cfg_checked.elapsed() > Duration::from_secs(1) {
@@ -1893,7 +2011,7 @@ impl eframe::App for App {
         for (i, s) in self.sessions.iter_mut().enumerate() {
             s.drain(ctx, &self.pal);
             let watching = self.focused && i == self.active;
-            if s.poll(watching) {
+            if s.poll(ctx, watching) {
                 let what = s
                     .agent
                     .map(|a| a.label().to_string())
@@ -1922,6 +2040,18 @@ impl eframe::App for App {
         menu::install(ctx);
         if menu::take_restart() {
             self.restart();
+        }
+
+        // Carpetas que llegan de Finder («Abrir con», el icono del Dock, el servicio): una
+        // pestaña en cada una (en la carpeta del archivo, si es un archivo).
+        for path in macos::take_opened() {
+            let dir = if path.is_dir() {
+                Some(path)
+            } else {
+                path.parent().map(PathBuf::from)
+            };
+            self.new_tab(ctx, dir);
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
 
         // Atajo global: la app ya viene al frente; ir al agente que terminó.
@@ -1957,6 +2087,21 @@ impl eframe::App for App {
             }
         }
 
+        // El icono del Dock lleva cuántas pestañas terminaron sin que las hayas visto.
+        let unseen = self.sessions.iter().filter(|s| s.unseen).count();
+        if unseen != self.badge {
+            self.badge = unseen;
+            macos::set_badge(unseen);
+        }
+        // La entrada segura es de todo el sistema: solo con Colibrí al frente.
+        let secure = self.cfg.secure_input && self.focused;
+        if secure != self.secure {
+            self.secure = secure;
+            macos::secure_input(secure);
+        }
+        // Sin ventana a la vista, la salida no necesita cuadros a 30 Hz.
+        session::set_hidden(macos::hidden());
+
         self.ports
             .enabled
             .store(self.show_ports || self.show_procs, Ordering::Relaxed);
@@ -1969,12 +2114,29 @@ impl eframe::App for App {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        debug::count_frame();
+        session::frame_painted(self.sessions.get(self.active).map(|s| s.id));
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         self.overlay_ui(&ctx);
         if self.sessions.is_empty() {
             return;
+        }
+        // Archivos soltados desde Finder (o una captura arrastrada): se pegan sus rutas,
+        // igual que con ⌘V.
+        let dropped: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| clip::escape(&f.path().to_string_lossy()))
+                .collect()
+        });
+        if !dropped.is_empty() {
+            if let Some(s) = self.sessions.get_mut(self.active) {
+                s.paste(&format!("{} ", dropped.join(" ")));
+            }
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
         let pal = self.pal.clone();
 
@@ -2020,7 +2182,12 @@ impl eframe::App for App {
             self.history_key(&ctx);
             self.complete_key(&ctx);
         }
-        let keyboard = !self.search_focus && self.overlay == overlay::Overlay::None;
+        // Con las sugerencias abiertas se sigue escribiendo en el shell: la lista se filtra.
+        let keyboard = !self.search_focus
+            && matches!(
+                self.overlay,
+                overlay::Overlay::None | overlay::Overlay::Complete { .. }
+            );
         // Carpeta y rama en cajas, en la propia línea del prompt.
         let chips = self
             .sessions
@@ -2035,6 +2202,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
             .show(ui, |ui| {
+                self.term_rect = ui.max_rect();
                 if let Some(s) = self.sessions.get_mut(self.active) {
                     if let Some((_, info)) = &chips {
                         s.stamp_prompt(
@@ -2103,14 +2271,20 @@ fn prompt_chips(
     enum Icon {
         Folder,
         Branch,
+        Person,
         None,
     }
     // Las cajas se suben un poco dentro de su fila (encima suele haber una línea en blanco,
     // o el margen de la terminal) para dejar aire sobre la línea donde se escribe.
+    // En un prompt remoto comparten fila con el comando: van centradas en ella.
+    let remote = parts.iter().any(|(kind, _)| *kind == session::CHIP_HOST);
+    let (up, down) = if remote { (-2.0, 2.0) } else { (3.0, 5.0) };
     let full = Rect::from_min_max(
-        Pos2::new(full.left(), full.top() - 3.0),
-        Pos2::new(full.right(), full.bottom() - 5.0),
+        Pos2::new(full.left(), full.top() - up),
+        Pos2::new(full.right(), full.bottom() - down),
     );
+    // En una máquina remota las cajas solo informan: los desplegables listan lo de aquí.
+    let live = live && !remote;
     let h = full.height();
     // El mismo tamaño que el texto de la terminal (la caja mide una fila, así que cabe).
     let font = FontId::new(font_size.min(h * 0.8), FontFamily::Name("term-bold".into()));
@@ -2118,6 +2292,7 @@ fn prompt_chips(
         .iter()
         .map(|(kind, text)| match *kind {
             session::CHIP_BRANCH => (Icon::Branch, text.clone(), pal.done),
+            session::CHIP_HOST => (Icon::Person, text.clone(), pal.accent),
             session::CHIP_CHANGES => {
                 let color = if text == "0" { pal.muted } else { pal.ansi[3] };
                 (Icon::None, format!("± {text}"), color)
@@ -2147,7 +2322,7 @@ fn prompt_chips(
         let button = match icon {
             Icon::Folder => Some(session::CHIP_DIR),
             Icon::Branch => Some(session::CHIP_BRANCH),
-            Icon::None => None,
+            Icon::Person | Icon::None => None,
         }
         .filter(|_| live);
         let hovered = button.is_some_and(|chip| {
@@ -2191,6 +2366,18 @@ fn prompt_chips(
                 for dot in [a, b, d] {
                     p.circle_filled(dot, 1.9, color);
                 }
+            }
+            Icon::Person => {
+                // Cabeza y hombros.
+                let stroke = Stroke::new(1.2, color);
+                p.circle_stroke(c + Vec2::new(0.0, -2.5), 2.4, stroke);
+                let shoulders: Vec<Pos2> = (0..=8)
+                    .map(|i| {
+                        let a = std::f32::consts::PI * (1.0 + i as f32 / 8.0);
+                        c + Vec2::new(a.cos() * 4.6, 5.5 + a.sin() * 4.0)
+                    })
+                    .collect();
+                p.add(egui::Shape::line(shoulders, stroke));
             }
             Icon::None => {}
         }
@@ -2356,16 +2543,25 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
     ctx.set_fonts(defs);
 }
 
-/// Indicador de «trabajando»: media luna quieta (círculo con la mitad derecha rellena). No
-/// se anima a propósito: un spinner obligaba a repintar la ventana 30 veces por segundo.
+/// Indicador de «trabajando»: una luna que se ilumina de izquierda a derecha en cuatro
+/// pasos (cuarto, media, tres cuartos, llena) y vuelve a empezar. No pide repintados
+/// propios: avanza con el refresco de 250 ms que ya hay mientras algo trabaja (un spinner
+/// continuo obligaba a repintar la ventana 30 veces por segundo). El paso dura algo más
+/// que ese refresco para que ningún cuadro se salte una fase.
 fn spinner(p: &egui::Painter, center: Pos2, r: f32, color: Color32) {
-    let half: Vec<Pos2> = (0..=12)
+    let step = (p.ctx().input(|i| i.time) / 0.3) as u64 % 4;
+    let lit = (step + 1) as f32 / 4.0;
+    // Parte del círculo a la izquierda de la línea vertical que avanza: el arco que
+    // pasa por el lado izquierdo, entre los dos puntos donde la línea corta el círculo.
+    let cut = (lit * 2.0 - 1.0).clamp(-1.0, 1.0).acos();
+    let arc = 2.0 * (std::f32::consts::PI - cut);
+    let pts: Vec<Pos2> = (0..=16)
         .map(|i| {
-            let a = (i as f32 / 12.0 - 0.5) * std::f32::consts::PI;
-            center + Vec2::new(a.cos(), a.sin()) * r
+            let a = cut + arc * i as f32 / 16.0;
+            center + Vec2::new(a.cos(), -a.sin()) * r
         })
         .collect();
-    p.add(egui::Shape::convex_polygon(half, color, Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
     p.circle_stroke(center, r - 0.6, Stroke::new(1.2, color));
 }
 

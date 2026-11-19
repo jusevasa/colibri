@@ -6,9 +6,10 @@
 //! esa ruta como hacen Terminal o Warp (Claude Code la reconoce y adjunta la imagen); de una
 //! imagen suelta solo se pregunta si la hay, nunca se lee.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Key};
+use egui::{self, Key};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
@@ -19,6 +20,25 @@ enum Clip {
     Image,
     Empty,
 }
+
+impl Clip {
+    fn event(self) -> Option<egui::Event> {
+        match self {
+            Clip::Text(text) => Some(egui::Event::Paste(text.replace("\r\n", "\n"))),
+            Clip::Image => Some(egui::Event::PasteImage(Arc::new(egui::ColorImage::filled(
+                [1, 1],
+                egui::Color32::TRANSPARENT,
+            )))),
+            Clip::Empty => None,
+        }
+    }
+}
+
+/// Cuánto se espera a que llegue lo copiado en otro dispositivo, y cada cuánto se mira.
+const REMOTE_WAIT: Duration = Duration::from_secs(8);
+const REMOTE_RETRY: Duration = Duration::from_millis(150);
+/// Hasta cuándo se reintenta un ⌘V que encontró el portapapeles remoto aún vacío.
+static PENDING: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn read() -> Clip {
     // SAFETY: mensajes a NSPasteboard con los tipos que documenta AppKit; se llama desde el
@@ -76,7 +96,8 @@ unsafe fn file_paths(pb: *mut AnyObject) -> Vec<String> {
     out
 }
 
-fn escape(path: &str) -> String {
+/// La ruta lista para pegarla en el shell: con `\\` delante de lo que este interpretaría.
+pub fn escape(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for c in path.chars() {
         if !(c.is_alphanumeric() || "-_./@+:,%=~".contains(c)) {
@@ -90,8 +111,9 @@ fn escape(path: &str) -> String {
 /// Cambia las pulsaciones de ⌘C, ⌘X y ⌘V por los eventos de portapapeles de egui (eframe
 /// arranca con `clipboard_shortcuts: false`, así que llegan como teclas normales). Con una
 /// imagen y sin texto sale `PasteImage` con una imagen vacía: solo importa el aviso.
-pub fn translate(events: &mut Vec<egui::Event>) {
+pub fn translate(ctx: &egui::Context, events: &mut Vec<egui::Event>) {
     let mut out = Vec::with_capacity(events.len());
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     for ev in events.drain(..) {
         let egui::Event::Key {
             key,
@@ -103,6 +125,8 @@ pub fn translate(events: &mut Vec<egui::Event>) {
             out.push(ev);
             continue;
         };
+        // Cualquier otra tecla cancela un pegado que seguía esperando al iPhone.
+        *pending = None;
         let cmd = modifiers.command_only();
         match key {
             Key::Copy => out.push(egui::Event::Copy),
@@ -110,14 +134,86 @@ pub fn translate(events: &mut Vec<egui::Event>) {
             Key::Cut => out.push(egui::Event::Cut),
             Key::X if cmd => out.push(egui::Event::Cut),
             Key::Paste | Key::V if *key == Key::Paste || cmd => match read() {
-                Clip::Text(text) => out.push(egui::Event::Paste(text.replace("\r\n", "\n"))),
-                Clip::Image => out.push(egui::Event::PasteImage(Arc::new(
-                    egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT),
-                ))),
-                Clip::Empty => {}
+                Clip::Empty => {
+                    let remote = is_remote();
+                    log(remote);
+                    if remote {
+                        *pending = Some(Instant::now() + REMOTE_WAIT);
+                    }
+                }
+                clip => out.extend(clip.event()),
             },
             _ => out.push(ev),
         }
     }
+    // Lo copiado en el iPhone se anuncia antes de haber llegado: el primer ⌘V puede no
+    // encontrar nada todavía. Se reintenta un rato en vez de perder la pulsación.
+    if let Some(deadline) = *pending {
+        match read() {
+            Clip::Empty if Instant::now() < deadline => ctx.request_repaint_after(REMOTE_RETRY),
+            clip => {
+                out.extend(clip.event());
+                *pending = None;
+            }
+        }
+    }
     *events = out;
+}
+
+/// True si lo que hay en el portapapeles viene de otro dispositivo (Continuity).
+fn is_remote() -> bool {
+    // SAFETY: como en `read`.
+    unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            return false;
+        }
+        let types: *mut AnyObject = msg_send![pb, types];
+        if types.is_null() {
+            return false;
+        }
+        let remote = NSString::from_str("com.apple.is-remote-clipboard");
+        msg_send![types, containsObject: &*remote]
+    }
+}
+
+/// Deja constancia de un ⌘V que no encontró nada (solo los *tipos* anunciados, nunca el
+/// contenido) en `~/Library/Logs/Colibri/pegado.log`, para poder diagnosticarlo después.
+fn log(remote: bool) {
+    use std::io::Write;
+    let Some(dir) = dirs::home_dir().map(|h| h.join("Library/Logs/Colibri")) else {
+        return;
+    };
+    let mut types = Vec::new();
+    // SAFETY: como en `read`.
+    unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        let list: *mut AnyObject = if pb.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![pb, types]
+        };
+        if !list.is_null() {
+            let count: usize = msg_send![list, count];
+            for i in 0..count {
+                let t: Option<Retained<NSString>> = msg_send![list, objectAtIndex: i];
+                types.extend(t.map(|t| t.to_string()));
+            }
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("pegado.log"))
+    {
+        let _ = writeln!(
+            f,
+            "{secs} ⌘V sin contenido; remoto={remote}; tipos={types:?}"
+        );
+    }
 }

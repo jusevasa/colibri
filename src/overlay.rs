@@ -2,7 +2,7 @@
 
 use crate::config::{self, Palette};
 use crate::{App, Cmd, elided};
-use eframe::egui::{
+use egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Key, LayerId, Modifiers, Order, Pos2, Rect,
     Sense, Stroke, Vec2,
 };
@@ -48,10 +48,11 @@ pub enum Overlay {
     Rename {
         text: String,
     },
-    /// Comandos usados antes; `sel` 0 es el más reciente.
+    /// Comandos usados antes (`App::history`, ya filtrados); `sel` 0 es el más reciente y
+    /// el elegido está escrito en el prompt. `original` es lo que había antes de abrir.
     History {
-        query: String,
         sel: usize,
+        original: String,
     },
     /// Desplegable de una caja del prompt: lo que ofrece está en `App::picks`.
     Picker {
@@ -59,14 +60,19 @@ pub enum Overlay {
         sel: usize,
     },
     /// Carpetas y archivos que encajan con la palabra que se teclea en el prompt.
+    /// Sin elegir nada (`sel` None) la lista solo se muestra; al elegir, la opción queda
+    /// escrita en el prompt. `line` es la línea del prompt para la que vale la lista (si
+    /// cambia es que se siguió escribiendo y se rehace) y `x`, dónde se ancla.
     Complete {
         target: crate::complete::Target,
         items: Vec<crate::complete::Item>,
-        sel: usize,
+        sel: Option<usize>,
+        line: String,
+        x: f32,
     },
 }
 
-const PREF_ROWS: [(&str, &str); 19] = [
+const PREF_ROWS: [(&str, &str); 22] = [
     ("theme", "Tema"),
     ("font", "Fuente"),
     ("font_size", "Tamaño de fuente"),
@@ -82,11 +88,43 @@ const PREF_ROWS: [(&str, &str); 19] = [
     ("history_popup", "Historial de comandos con ↑"),
     ("complete_popup", "Sugerir carpetas y archivos con ⇥"),
     ("status_bar", "Carpeta y rama en cajas, en el prompt"),
+    ("shell_integration", "Integración con zsh (pestañas nuevas)"),
+    ("editor", "Abrir archivos (⌘+clic) con"),
+    ("secure_input", "Entrada segura de teclado"),
     ("show_agents", "Agentes"),
     ("show_ports", "Puertos"),
     ("show_processes", "Procesos"),
     ("open_file", "Abrir config.toml en el editor…"),
 ];
+
+/// Vista previa de macOS (Quick Look) de un archivo o carpeta. Si ya hay una abierta
+/// se cierra: espacio la abre y la cierra, como en Finder.
+fn quick_look(preview: &mut Option<std::process::Child>, path: Option<std::path::PathBuf>) {
+    if let Some(mut open) = preview.take() {
+        let running = matches!(open.try_wait(), Ok(None));
+        let _ = open.kill();
+        let _ = open.wait();
+        if running {
+            return;
+        }
+    }
+    let Some(path) = path else {
+        return;
+    };
+    if std::env::var_os("COLIBRI_SCRIPT").is_some() {
+        eprintln!("vista previa: {}", path.display());
+        return;
+    }
+    use std::process::Stdio;
+    *preview = std::process::Command::new("qlmanage")
+        .arg("-p")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok();
+}
 
 fn section_before(id: &str) -> Option<&'static str> {
     match id {
@@ -95,6 +133,19 @@ fn section_before(id: &str) -> Option<&'static str> {
         "show_agents" => Some("PANELES VISIBLES AL ABRIR"),
         "open_file" => Some("AVANZADO"),
         _ => None,
+    }
+}
+
+/// «hace 5 min», «hace 3 h»… para una fecha en segundos Unix.
+fn ago(at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    match now.saturating_sub(at) {
+        s if s < 60 => "ahora".to_string(),
+        s if s < 3600 => format!("hace {} min", s / 60),
+        s if s < 86_400 => format!("hace {} h", s / 3600),
+        s => format!("hace {} d", s / 86_400),
     }
 }
 
@@ -171,7 +222,7 @@ impl App {
             return;
         }
         if pressed(ctx, Key::Escape) {
-            self.overlay = Overlay::None;
+            self.cancel_overlay();
             return;
         }
         match self.overlay.clone() {
@@ -179,9 +230,15 @@ impl App {
             Overlay::Palette { query, sel } => self.palette_ui(ctx, query, sel),
             Overlay::Prefs { sel } => self.prefs_ui(ctx, sel),
             Overlay::Rename { text } => self.rename_ui(ctx, text),
-            Overlay::History { query, sel } => self.history_ui(ctx, query, sel),
+            Overlay::History { sel, original } => self.history_ui(ctx, sel, original),
             Overlay::Picker { query, sel } => self.picker_ui(ctx, query, sel),
-            Overlay::Complete { target, items, sel } => self.complete_ui(ctx, target, items, sel),
+            Overlay::Complete {
+                target,
+                items,
+                sel,
+                line,
+                x,
+            } => self.complete_ui(ctx, target, items, sel, line, x),
         }
     }
 
@@ -190,6 +247,20 @@ impl App {
     /// se elige se escribe y ejecuta en el shell, a la vista (`git checkout`, `cd`), para
     /// que cualquier error se lea ahí. Un archivo solo se pega en el prompt.
     fn picker_ui(&mut self, ctx: &egui::Context, mut query: String, mut sel: usize) {
+        // Espacio, en la lista de carpetas y archivos, es la vista previa de Finder (y no
+        // un carácter de la búsqueda).
+        let files = self
+            .picks
+            .iter()
+            .any(|p| matches!(p.kind, PickKind::Dir | PickKind::File));
+        let preview = files
+            && ctx.input_mut(|i| {
+                let key = i.consume_key(Modifiers::NONE, Key::Space);
+                let before = i.events.len();
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Text(t) if t == " "));
+                key || before != i.events.len()
+            });
         if type_into(ctx, &mut query) {
             sel = 0;
         }
@@ -222,6 +293,16 @@ impl App {
         let mut pick = pressed(ctx, Key::Enter)
             .then_some(sel)
             .filter(|_| !items.is_empty());
+        if preview {
+            let path = items.get(sel).and_then(|p| {
+                let cwd = &self.sessions.get(self.active)?.cwd;
+                Some(match p.kind {
+                    PickKind::Parent => cwd.parent()?.to_path_buf(),
+                    _ => cwd.join(&p.name),
+                })
+            });
+            quick_look(&mut self.preview, path);
+        }
 
         const VISIBLE: usize = 10;
         const ROW: f32 = 28.0;
@@ -260,7 +341,10 @@ impl App {
                         } else if branches {
                             ("Buscar rama…".to_string(), pal.muted)
                         } else {
-                            ("Buscar carpeta o archivo…".to_string(), pal.muted)
+                            (
+                                "Buscar carpeta o archivo…  ·  espacio: vista previa".to_string(),
+                                pal.muted,
+                            )
                         };
                         let r = p.text(
                             Pos2::new(head.left() + 14.0, head.center().y),
@@ -389,48 +473,80 @@ impl App {
         }
     }
 
-    fn history_ui(&mut self, ctx: &egui::Context, mut query: String, mut sel: usize) {
-        if type_into(ctx, &mut query) {
-            sel = 0;
+    /// Cierra el overlay deshaciendo lo que hubiera dejado a medias en el prompt: el
+    /// historial devuelve lo que estaba escrito y las sugerencias, la palabra original.
+    pub fn cancel_overlay(&mut self) {
+        let overlay = std::mem::replace(&mut self.overlay, Overlay::None);
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        match overlay {
+            Overlay::History { original, .. } if original.is_empty() => s.input(vec![0x15]),
+            Overlay::History { original, .. } => s.insert_command(&original),
+            Overlay::Complete {
+                target,
+                items,
+                sel: Some(i),
+                ..
+            } => {
+                let written = crate::complete::replacement(&target, &items[i]);
+                s.replace_word(written.chars().count(), &target.token);
+            }
+            _ => {}
         }
-        let words: Vec<String> = query
-            .to_lowercase()
-            .split_whitespace()
-            .map(str::to_string)
-            .collect();
-        let items: Vec<&String> = self
-            .history
-            .iter()
-            .filter(|c| {
-                let l = c.to_lowercase();
-                words.iter().all(|w| l.contains(w))
-            })
-            .collect();
-        if pressed(ctx, Key::ArrowUp) && !items.is_empty() {
-            sel = (sel + 1).min(items.len() - 1);
+    }
+
+    /// Historial sobre el prompt, como ↑ en el shell pero viendo la lista: el comando
+    /// elegido está siempre escrito en el prompt, así que Enter lo ejecuta y cualquier otra
+    /// tecla cierra la lista y lo edita. El más reciente va abajo; ↑ va hacia los antiguos.
+    fn history_ui(&mut self, ctx: &egui::Context, mut sel: usize, original: String) {
+        let n = self.history.len();
+        if n == 0 {
+            self.overlay = Overlay::None;
+            return;
+        }
+        let before = sel;
+        if pressed(ctx, Key::ArrowUp) {
+            sel = (sel + 1).min(n - 1);
         }
         if pressed(ctx, Key::ArrowDown) {
-            // Bajar desde el más reciente cierra la lista, como volver al prompt vacío.
+            // Bajar desde el más reciente vuelve a lo que había escrito.
             if sel == 0 {
-                self.overlay = Overlay::None;
+                self.cancel_overlay();
                 return;
             }
             sel -= 1;
         }
-        sel = sel.min(items.len().saturating_sub(1));
-        let mut pick = pressed(ctx, Key::Enter)
-            .then_some(sel)
-            .filter(|_| !items.is_empty());
+        let run = pressed(ctx, Key::Enter);
+        let keep = pressed(ctx, Key::Tab) || pressed(ctx, Key::ArrowRight);
+        // Lo que quede sin consumir es para el shell: se cierra y la tecla sigue su camino.
+        let other = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Text(_)
+                        | egui::Event::Paste(_)
+                        | egui::Event::Key { pressed: true, .. }
+                )
+            })
+        });
+        let mut pick = None;
 
-        const VISIBLE: usize = 8;
+        const VISIBLE: usize = 9;
         const ROW: f32 = 26.0;
-        const FOOT: f32 = 30.0;
+        const FOOT: f32 = 28.0;
         let pal = self.pal.clone();
         let mono = FontId::monospace(12.5);
         let small = FontId::proportional(11.0);
         let screen = ctx.content_rect();
-        let width = 640.0_f32.min(screen.width() - 16.0);
-        let height = items.len().clamp(1, VISIBLE) as f32 * ROW + FOOT + 8.0;
+        // Todo el ancho de la terminal: los comandos largos se ven enteros.
+        let area = if self.term_rect.is_positive() {
+            self.term_rect
+        } else {
+            screen
+        };
+        let width = (area.width() - 16.0).max(200.0);
+        let height = n.min(VISIBLE) as f32 * ROW + FOOT + 8.0;
         let cursor = self
             .sessions
             .get(self.active)
@@ -448,10 +564,9 @@ impl App {
         } else {
             cursor.bottom() + 6.0
         };
-        let max_x = (screen.right() - width - 8.0).max(screen.left() + 8.0);
-        let x = cursor.left().clamp(screen.left() + 8.0, max_x);
+        let x = area.left() + 8.0;
         let first = sel.saturating_sub(VISIBLE - 1);
-        let last = (first + VISIBLE).min(items.len());
+        let last = (first + VISIBLE).min(n);
 
         let out = egui::Area::new(Id::unique("history"))
             .order(Order::Foreground)
@@ -465,27 +580,11 @@ impl App {
                         ui.set_width(width);
                         ui.spacing_mut().item_spacing = Vec2::ZERO;
                         ui.add_space(4.0);
-                        if items.is_empty() {
-                            let (r, _) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), ROW),
-                                Sense::hover(),
-                            );
-                            ui.painter().text(
-                                Pos2::new(r.left() + 14.0, r.center().y),
-                                Align2::LEFT_CENTER,
-                                "Ningún comando coincide",
-                                mono.clone(),
-                                pal.muted,
-                            );
-                        }
                         for i in (first..last).rev() {
                             let (r, resp) = ui.allocate_exact_size(
                                 Vec2::new(ui.available_width(), ROW),
                                 Sense::click(),
                             );
-                            if resp.hovered() && ui.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
-                                sel = i;
-                            }
                             if resp.clicked() {
                                 pick = Some(i);
                             }
@@ -496,14 +595,31 @@ impl App {
                                     CornerRadius::same(5),
                                     pal.accent.gamma_multiply(0.16),
                                 );
+                            } else if resp.hovered() {
+                                p.rect_filled(
+                                    r.shrink2(Vec2::new(4.0, 1.0)),
+                                    CornerRadius::same(5),
+                                    pal.fg.gamma_multiply(0.04),
+                                );
                             }
-                            let label = items[i].replace('\n', " ↵ ");
+                            let entry = &self.history[i];
+                            let when = entry.at.map(ago).unwrap_or_default();
+                            let when_w = if when.is_empty() { 0.0 } else { 86.0 };
+                            let label = entry.cmd.replace('\n', " ↵ ");
                             let color = if i == sel { pal.fg } else { pal.muted };
-                            let g = elided(ui.ctx(), &label, &mono, color, r.width() - 28.0);
+                            let g =
+                                elided(ui.ctx(), &label, &mono, color, r.width() - 28.0 - when_w);
                             p.galley(
                                 Pos2::new(r.left() + 14.0, r.center().y - g.size().y / 2.0),
                                 g,
                                 color,
+                            );
+                            p.text(
+                                Pos2::new(r.right() - 14.0, r.center().y),
+                                Align2::RIGHT_CENTER,
+                                when,
+                                small.clone(),
+                                pal.muted.gamma_multiply(0.8),
                             );
                         }
                         ui.add_space(4.0);
@@ -516,22 +632,21 @@ impl App {
                             [foot.left_top(), foot.right_top()],
                             Stroke::new(1.0, pal.border),
                         );
-                        let (shown, color) = if query.is_empty() {
-                            ("Escribe para filtrar".to_string(), pal.muted)
+                        let left = if original.is_empty() {
+                            format!("{} de {n}", sel + 1)
                         } else {
-                            (query.clone(), pal.fg)
+                            format!("{} de {n}  ·  empiezan por «{original}»", sel + 1)
                         };
-                        p.text(
-                            Pos2::new(foot.left() + 14.0, foot.center().y),
-                            Align2::LEFT_CENTER,
-                            format!("›  {shown}"),
-                            mono.clone(),
-                            color,
+                        let g = elided(ui.ctx(), &left, &small, pal.muted, foot.width() - 330.0);
+                        p.galley(
+                            Pos2::new(foot.left() + 14.0, foot.center().y - g.size().y / 2.0),
+                            g,
+                            pal.muted,
                         );
                         p.text(
                             Pos2::new(foot.right() - 14.0, foot.center().y),
                             Align2::RIGHT_CENTER,
-                            "↑↓ elegir  ·  ↩ insertar  ·  esc cerrar",
+                            "↑↓ elegir  ·  ↩ ejecutar  ·  ⇥ editar  ·  esc cancelar",
                             small.clone(),
                             pal.muted,
                         );
@@ -539,57 +654,66 @@ impl App {
             });
 
         if let Some(i) = pick {
-            let cmd = items[i].clone();
+            sel = i;
+        }
+        if sel != before
+            && let Some(s) = self.sessions.get_mut(self.active)
+        {
+            s.insert_command(&self.history[sel].cmd);
+        }
+        if run {
             self.overlay = Overlay::None;
             if let Some(s) = self.sessions.get_mut(self.active) {
-                s.insert_command(&cmd);
+                s.input(b"\r".to_vec());
             }
-        } else if clicked_outside(ctx, out.response.rect) {
+        } else if keep || other || pick.is_some() || clicked_outside(ctx, out.response.rect) {
             self.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::History { query, sel };
+            self.overlay = Overlay::History { sel, original };
         }
     }
 
+    /// Sugerencias de carpetas y archivos bajo la palabra que se teclea. Abierta, el teclado
+    /// sigue llegando al shell: escribir o borrar rehace la lista con lo nuevo. Tab y las
+    /// flechas eligen, y lo elegido queda escrito en el prompt al momento; Enter lo acepta
+    /// (sin nada elegido, Enter es del shell) y Esc devuelve la palabra original.
     fn complete_ui(
         &mut self,
         ctx: &egui::Context,
-        target: crate::complete::Target,
-        items: Vec<crate::complete::Item>,
-        mut sel: usize,
+        mut target: crate::complete::Target,
+        mut items: Vec<crate::complete::Item>,
+        mut sel: Option<usize>,
+        mut line: String,
+        x: f32,
     ) {
-        // Seguir escribiendo o borrar cierra la lista y la tecla llega al shell: se vuelve
-        // a pulsar Tab para ver las sugerencias de lo nuevo.
-        let keeps_open = |key: &Key| {
-            matches!(
-                key,
-                Key::ArrowUp | Key::ArrowDown | Key::Tab | Key::Enter | Key::Escape
-            )
-        };
-        let other_input = ctx.input(|i| {
-            i.events.iter().any(|e| match e {
-                egui::Event::Text(_) | egui::Event::Paste(_) => true,
-                egui::Event::Key {
-                    key, pressed: true, ..
-                } => !keeps_open(key),
-                _ => false,
-            })
-        });
-        if other_input || items.is_empty() {
+        use crate::complete;
+        let Some(s) = self.sessions.get(self.active) else {
             self.overlay = Overlay::None;
             return;
+        };
+        if s.prompt_line() != Some(line.as_str()) {
+            let fresh = s
+                .prompt_line()
+                .and_then(|l| complete::target(l).map(|t| (l.to_string(), t)))
+                .map(|(l, t)| (complete::candidates(&s.cwd, &t), l, t))
+                .filter(|(found, ..)| !found.is_empty());
+            let Some((found, l, t)) = fresh else {
+                self.overlay = Overlay::None;
+                return;
+            };
+            (items, line, target, sel) = (found, l, t, None);
         }
         let n = items.len();
+        let mut next = sel;
         if pressed(ctx, Key::ArrowDown) || pressed(ctx, Key::Tab) {
-            sel = (sel + 1) % n;
+            next = Some(sel.map_or(0, |i| (i + 1) % n));
         }
         if pressed(ctx, Key::ArrowUp)
             || ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::Tab))
         {
-            sel = (sel + n - 1) % n;
+            next = Some(sel.map_or(n - 1, |i| (i + n - 1) % n));
         }
-        sel = sel.min(n - 1);
-        let mut pick = pressed(ctx, Key::Enter).then_some(sel);
+        let mut accept = sel.is_some() && pressed(ctx, Key::Enter);
 
         const VISIBLE: usize = 8;
         const ROW: f32 = 28.0;
@@ -600,32 +724,29 @@ impl App {
         let screen = ctx.content_rect();
         let width = 440.0_f32.min(screen.width() - 16.0);
         let height = n.min(VISIBLE) as f32 * ROW + FOOT + 8.0;
-        let cursor = self
-            .sessions
-            .get(self.active)
-            .and_then(|s| s.cursor_px)
-            .unwrap_or_else(|| {
-                Rect::from_min_size(
-                    Pos2::new(screen.left() + 16.0, screen.bottom() - 40.0),
-                    Vec2::new(8.0, 18.0),
-                )
-            });
-        // Encima del cursor; si no cabe, debajo.
-        let above = cursor.top() - height - 6.0;
-        let y = if above >= screen.top() + crate::TAB_BAR_H {
-            above
+        let cursor = s.cursor_px.unwrap_or_else(|| {
+            Rect::from_min_size(
+                Pos2::new(screen.left() + 16.0, screen.bottom() - 40.0),
+                Vec2::new(8.0, 18.0),
+            )
+        });
+        // Debajo de lo que se escribe; si no cabe (prompt al fondo de la ventana), encima.
+        let below = cursor.bottom() + 6.0;
+        let y = if below + height <= screen.bottom() - 4.0 {
+            below
         } else {
-            cursor.bottom() + 6.0
+            (cursor.top() - height - 6.0).max(screen.top() + crate::TAB_BAR_H)
         };
         let max_x = (screen.right() - width - 8.0).max(screen.left() + 8.0);
-        let x = cursor.left().clamp(screen.left() + 8.0, max_x);
-        let first = (sel + 1).saturating_sub(VISIBLE);
+        let x_at = x.clamp(screen.left() + 8.0, max_x);
+        let shown = next.unwrap_or(0);
+        let first = (shown + 1).saturating_sub(VISIBLE);
         let last = (first + VISIBLE).min(n);
         let needle = target.prefix.to_lowercase();
 
         let out = egui::Area::new(Id::unique("complete"))
             .order(Order::Foreground)
-            .fixed_pos(Pos2::new(x, y))
+            .fixed_pos(Pos2::new(x_at, y))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(pal.panel)
@@ -640,33 +761,39 @@ impl App {
                                 Vec2::new(ui.available_width(), ROW),
                                 Sense::click(),
                             );
-                            if resp.hovered() && ui.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
-                                sel = i;
-                            }
                             if resp.clicked() {
-                                pick = Some(i);
+                                next = Some(i);
+                                accept = true;
                             }
+                            let chosen = next == Some(i);
                             let p = ui.painter();
-                            if i == sel {
+                            if chosen {
                                 p.rect_filled(
                                     r.shrink2(Vec2::new(4.0, 1.0)),
                                     CornerRadius::same(5),
-                                    pal.accent.gamma_multiply(0.16),
+                                    pal.accent.gamma_multiply(0.22),
+                                );
+                            } else if resp.hovered() {
+                                p.rect_filled(
+                                    r.shrink2(Vec2::new(4.0, 1.0)),
+                                    CornerRadius::same(5),
+                                    pal.fg.gamma_multiply(0.04),
                                 );
                             }
                             let icon = Pos2::new(r.left() + 20.0, r.center().y);
-                            crate::file_icon(p, icon, item.is_dir, pal.muted);
+                            let icon_color = if chosen { pal.fg } else { pal.muted };
+                            crate::file_icon(p, icon, item.is_dir, icon_color);
                             // El trozo que coincide con lo tecleado va resaltado.
-                            let shown = if item.is_dir {
+                            let name = if item.is_dir {
                                 format!("{}/", item.name)
                             } else {
                                 item.name.clone()
                             };
-                            let hit = shown
+                            let hit = name
                                 .to_lowercase()
                                 .find(&needle)
-                                .filter(|at| !needle.is_empty() && shown.is_char_boundary(*at))
-                                .filter(|at| shown.is_char_boundary(at + needle.len()));
+                                .filter(|at| !needle.is_empty() && name.is_char_boundary(*at))
+                                .filter(|at| name.is_char_boundary(at + needle.len()));
                             let mut job = egui::text::LayoutJob::default();
                             let mut add = |text: &str, color: Color32| {
                                 job.append(
@@ -679,18 +806,18 @@ impl App {
                                     },
                                 );
                             };
-                            let dim = if i == sel {
-                                pal.fg.gamma_multiply(0.75)
+                            let dim = if chosen {
+                                pal.fg
                             } else {
-                                pal.muted
+                                pal.fg.gamma_multiply(0.7)
                             };
                             match hit {
                                 Some(at) => {
-                                    add(&shown[..at], dim);
-                                    add(&shown[at..at + needle.len()], pal.fg);
-                                    add(&shown[at + needle.len()..], dim);
+                                    add(&name[..at], dim);
+                                    add(&name[at..at + needle.len()], pal.accent);
+                                    add(&name[at + needle.len()..], dim);
                                 }
-                                None => add(&shown, dim),
+                                None => add(&name, dim),
                             }
                             let kind = if item.is_dir { "Carpeta" } else { "Archivo" };
                             let kind_w = 64.0;
@@ -721,35 +848,56 @@ impl App {
                             [foot.left_top(), foot.right_top()],
                             Stroke::new(1.0, pal.border),
                         );
+                        let count = match next {
+                            Some(i) => format!("{} de {n}", i + 1),
+                            None => format!("{n} opciones"),
+                        };
                         p.text(
                             Pos2::new(foot.left() + 14.0, foot.center().y),
                             Align2::LEFT_CENTER,
-                            format!("{} de {n}", sel + 1),
+                            count,
                             small.clone(),
                             pal.muted,
                         );
                         p.text(
                             Pos2::new(foot.right() - 14.0, foot.center().y),
                             Align2::RIGHT_CENTER,
-                            "⇥ ↑↓ elegir  ·  ↩ insertar  ·  esc cerrar",
+                            "⇥ ↑↓ elegir  ·  escribe para filtrar  ·  esc cerrar",
                             small.clone(),
                             pal.muted,
                         );
                     });
             });
 
-        if let Some(i) = pick {
-            self.overlay = Overlay::None;
-            if let Some(s) = self.sessions.get_mut(self.active) {
-                s.replace_word(
-                    target.token.chars().count(),
-                    &crate::complete::replacement(&target, &items[i]),
-                );
+        // Lo elegido se escribe en el prompt en lugar de lo que hubiera (la palabra
+        // original o la opción anterior).
+        if next != sel
+            && let (Some(i), Some(s)) = (next, self.sessions.get_mut(self.active))
+        {
+            let written = match sel {
+                Some(j) => complete::replacement(&target, &items[j]),
+                None => target.token.clone(),
+            };
+            s.replace_word(
+                written.chars().count(),
+                &complete::replacement(&target, &items[i]),
+            );
+            match s.prompt_line() {
+                Some(l) => line = l.to_string(),
+                None => accept = true,
             }
-        } else if clicked_outside(ctx, out.response.rect) {
+            sel = next;
+        }
+        if accept || clicked_outside(ctx, out.response.rect) {
             self.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::Complete { target, items, sel };
+            self.overlay = Overlay::Complete {
+                target,
+                items,
+                sel,
+                line,
+                x,
+            };
         }
     }
 
@@ -962,6 +1110,10 @@ impl App {
             "history_popup" => (String::new(), Some(c.history_popup)),
             "complete_popup" => (String::new(), Some(c.complete_popup)),
             "status_bar" => (String::new(), Some(c.status_bar)),
+            "shell_integration" => (String::new(), Some(c.shell_integration)),
+            "editor" if c.editor.is_empty() => ("Lo que diga macOS".to_string(), None),
+            "editor" => (c.editor.clone(), None),
+            "secure_input" => (String::new(), Some(c.secure_input)),
             "show_agents" => (String::new(), Some(c.show_agents)),
             "show_ports" => (String::new(), Some(c.show_ports)),
             "show_processes" => (String::new(), Some(c.show_processes)),
@@ -1026,6 +1178,13 @@ impl App {
             "history_popup" => c.history_popup = !c.history_popup,
             "complete_popup" => c.complete_popup = !c.complete_popup,
             "status_bar" => c.status_bar = !c.status_bar,
+            "shell_integration" => c.shell_integration = !c.shell_integration,
+            "editor" => {
+                let editors = ["", "code", "cursor", "zed", "subl", "idea", "xed"];
+                let i = cycle(editors.len(), editors.iter().position(|e| *e == c.editor));
+                c.editor = editors[i].to_string();
+            }
+            "secure_input" => c.secure_input = !c.secure_input,
             "show_agents" => c.show_agents = !c.show_agents,
             "show_ports" => c.show_ports = !c.show_ports,
             "show_processes" => c.show_processes = !c.show_processes,

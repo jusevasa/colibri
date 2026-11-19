@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use eframe::egui::{self, Key};
+use egui::{self, Key};
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 
@@ -46,6 +46,15 @@ unsafe extern "C" {
         out: *mut *mut c_void,
     ) -> i32;
     fn UnregisterEventHotKey(hotkey: *mut c_void) -> i32;
+    fn GetEventParameter(
+        event: *mut c_void,
+        name: u32,
+        kind: u32,
+        actual_kind: *mut u32,
+        size: usize,
+        actual_size: *mut usize,
+        out: *mut c_void,
+    ) -> i32;
 }
 
 /// 'keyb' y kEventHotKeyPressed.
@@ -56,17 +65,69 @@ const SIGNATURE: u32 = 0x636C_6272;
 
 static PRESSED: AtomicBool = AtomicBool::new(false);
 static CTX: OnceLock<egui::Context> = OnceLock::new();
-/// El hotkey registrado (un `EventHotKeyRef`), o 0 si no hay ninguno.
-static CURRENT: Mutex<usize> = Mutex::new(0);
+/// Los hotkeys registrados (un `EventHotKeyRef` cada uno), o 0 donde no hay.
+static CURRENT: Mutex<[usize; 2]> = Mutex::new([0; 2]);
+
+/// Qué hace cada atajo global.
+#[derive(Clone, Copy)]
+pub enum Global {
+    /// Trae Colibrí al frente y va al agente que terminó.
+    Jump = 0,
+    /// Trae Colibrí al frente; si ya lo está, lo oculta (ir y volver con la misma tecla).
+    Focus = 1,
+}
+
+/// '----' (el objeto del evento) y 'hkid' (su tipo: un `EventHotKeyId`).
+const PARAM_DIRECT: u32 = 0x2D2D_2D2D;
+const TYPE_HOTKEY_ID: u32 = 0x686B_6964;
 
 /// Corre en el hilo principal, dentro del bucle de eventos de la app.
-extern "C" fn on_hotkey(_next: *mut c_void, _event: *mut c_void, _user: *mut c_void) -> i32 {
-    PRESSED.store(true, Ordering::Relaxed);
+extern "C" fn on_hotkey(_next: *mut c_void, event: *mut c_void, _user: *mut c_void) -> i32 {
+    let mut which = EventHotKeyId {
+        signature: 0,
+        id: 0,
+    };
+    unsafe {
+        GetEventParameter(
+            event,
+            PARAM_DIRECT,
+            TYPE_HOTKEY_ID,
+            std::ptr::null_mut(),
+            std::mem::size_of::<EventHotKeyId>(),
+            std::ptr::null_mut(),
+            (&raw mut which).cast(),
+        );
+    }
+    let focus = which.id == Global::Focus as u32 + 1;
+    if !focus {
+        PRESSED.store(true, Ordering::Relaxed);
+    }
     unsafe {
         // Traer la app al frente aquí mismo: en segundo plano la ventana puede no repintar.
         let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         if !app.is_null() {
-            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            let active: bool = msg_send![app, isActive];
+            if focus && active {
+                let nil: *mut AnyObject = std::ptr::null_mut();
+                let _: () = msg_send![app, hide: nil];
+            } else {
+                // Una ventana minimizada no vuelve sola al activar la app.
+                let windows: *mut AnyObject = msg_send![app, windows];
+                let count: usize = if windows.is_null() {
+                    0
+                } else {
+                    msg_send![windows, count]
+                };
+                for i in 0..count {
+                    let window: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                    let mini: bool = msg_send![window, isMiniaturized];
+                    if mini {
+                        let nil: *mut AnyObject = std::ptr::null_mut();
+                        let _: () = msg_send![window, deminiaturize: nil];
+                    }
+                }
+                let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            }
         }
     }
     if let Some(ctx) = CTX.get() {
@@ -75,11 +136,12 @@ extern "C" fn on_hotkey(_next: *mut c_void, _event: *mut c_void, _user: *mut c_v
     0
 }
 
-/// Registra `text` ("ctrl+alt+cmd+j") como atajo global, sustituyendo al anterior.
+/// Registra `text` ("ctrl+alt+cmd+j") como ese atajo global, sustituyendo al anterior.
 /// Vacío o no reconocido = sin atajo global. Devuelve false si no se pudo registrar.
 /// Debe llamarse desde el hilo principal.
-pub fn set(ctx: &egui::Context, text: &str) -> bool {
-    let mut current = CURRENT.lock().unwrap();
+pub fn set(ctx: &egui::Context, which: Global, text: &str) -> bool {
+    let mut all = CURRENT.lock().unwrap();
+    let current = &mut all[which as usize];
     unsafe {
         if *current != 0 {
             UnregisterEventHotKey(*current as *mut c_void);
@@ -108,7 +170,7 @@ pub fn set(ctx: &egui::Context, text: &str) -> bool {
             modifiers,
             EventHotKeyId {
                 signature: SIGNATURE,
-                id: 1,
+                id: which as u32 + 1,
             },
             GetApplicationEventTarget(),
             0,
@@ -205,6 +267,8 @@ mod tests {
         let sc = Shortcut::parse("ctrl+alt+cmd+j").unwrap();
         assert_eq!(carbon(&sc), Some((0x26, 0x0100 | 0x0800 | 0x1000)));
         // Sin modificadores (o solo shift) no se registra.
+        let sc = Shortcut::parse("ctrl+alt+cmd+space").unwrap();
+        assert_eq!(carbon(&sc), Some((0x31, 0x0100 | 0x0800 | 0x1000)));
         assert_eq!(carbon(&Shortcut::parse("j").unwrap()), None);
         assert_eq!(carbon(&Shortcut::parse("shift+j").unwrap()), None);
     }

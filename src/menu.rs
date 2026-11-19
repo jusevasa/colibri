@@ -4,7 +4,6 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use eframe::egui;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{AllocAnyThread, class, define_class, msg_send, sel};

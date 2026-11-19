@@ -5,7 +5,6 @@
 //! Si se ejecuta el binario suelto, se usa `osascript` como respaldo, sin clic.
 
 use block2::{DynBlock, RcBlock};
-use eframe::egui;
 use objc2::rc::Retained;
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, define_class, msg_send};

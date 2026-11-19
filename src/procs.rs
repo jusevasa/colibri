@@ -30,7 +30,7 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    pub fn start(ctx: eframe::egui::Context) -> Self {
+    pub fn start(ctx: egui::Context) -> Self {
         let data = Arc::new(Mutex::new(Snapshot::default()));
         let enabled = Arc::new(AtomicBool::new(false));
         let (d, e) = (data.clone(), enabled.clone());

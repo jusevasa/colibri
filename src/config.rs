@@ -1,6 +1,6 @@
 //! Configuración en ~/.config/colibri/config.toml (se recarga sola al guardar).
 
-use eframe::egui::{Color32, Key, Modifiers};
+use egui::{Color32, Key, Modifiers};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -36,6 +36,14 @@ pub struct Config {
     pub complete_popup: bool,
     /// Barra inferior con la carpeta, la rama de git y los archivos con cambios.
     pub status_bar: bool,
+    /// Marca el prompt de zsh desde el propio shell (ver `assets/shell/zshenv.zsh`).
+    pub shell_integration: bool,
+    /// Con qué se abre un archivo al hacer ⌘+clic en su ruta: `code`, `cursor`, `zed`…
+    /// (admite argumentos). Vacío = la aplicación que macOS tenga para ese archivo.
+    pub editor: String,
+    /// Entrada segura de teclado: con Colibrí al frente, ninguna otra aplicación puede
+    /// leer lo que tecleas (como «Secure Keyboard Entry» de Terminal.app).
+    pub secure_input: bool,
     /// Qué apartados del panel lateral están visibles al abrir.
     pub show_agents: bool,
     pub show_ports: bool,
@@ -80,6 +88,9 @@ pub struct Keys {
     /// Lo mismo, pero global: funciona aunque Colibrí no tenga el foco y lo trae al frente.
     /// Vacío = desactivado.
     pub global_jump: String,
+    /// Global: trae Colibrí al frente desde cualquier aplicación y, si ya lo está, lo
+    /// oculta. Vacío = desactivado.
+    pub global_focus: String,
     /// Muestra u oculta los dos apartados a la vez.
     pub toggle_panel: String,
     pub toggle_agents: String,
@@ -114,6 +125,9 @@ impl Default for Config {
             history_popup: true,
             complete_popup: true,
             status_bar: true,
+            shell_integration: true,
+            editor: String::new(),
+            secure_input: false,
             show_agents: false,
             show_ports: false,
             show_processes: false,
@@ -159,6 +173,7 @@ impl Default for Keys {
             prev_agent: "cmd+alt+up".into(),
             jump_finished: "cmd+j".into(),
             global_jump: "ctrl+alt+cmd+j".into(),
+            global_focus: "ctrl+alt+cmd+space".into(),
             toggle_panel: "cmd+b".into(),
             toggle_agents: "cmd+shift+a".into(),
             toggle_ports: "cmd+shift+p".into(),
@@ -179,7 +194,9 @@ const HEADER: &str = "\
 # Colibrí — configuración. Los cambios se aplican al guardar.
 # Atajos: combina cmd, ctrl, shift, alt con una tecla: \"cmd+shift+j\", \"cmd+alt+right\", \"ctrl+tab\".
 # Fijo: cmd+1..9 va a la pestaña N.
-# global_jump funciona desde cualquier aplicación (trae Colibrí al frente); \"\" lo desactiva.
+# global_jump y global_focus funcionan desde cualquier aplicación: el primero trae Colibrí
+# al frente y va al agente que terminó; el segundo lo trae al frente o, si ya lo está, lo
+# oculta. \"\" los desactiva.
 # Colores en formato #rrggbb.
 
 ";

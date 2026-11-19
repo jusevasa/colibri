@@ -4,26 +4,269 @@ use crate::config::{Config, Palette};
 use crate::proc;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
-use alacritty_terminal::grid::{Dimensions, Row, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::grid::{Dimensions, Grid, Row, Scroll};
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::Rgb;
-use eframe::egui;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Marcas (carácter de ancho cero en la primera celda de cada dato) de una línea de cajas.
 pub const CHIP_DIR: char = '\u{E0D0}';
 pub const CHIP_BRANCH: char = '\u{E0D1}';
 pub const CHIP_CHANGES: char = '\u{E0D2}';
+/// Prompt de una máquina remota (ssh), sellado en su propia fila: «usuario@máquina», un
+/// hueco de relleno al principio y la última celda del prompt (ahí empieza el comando).
+pub const CHIP_HOST: char = '\u{E0D3}';
+const CHIP_PAD: char = '\u{E0D4}';
+const CHIP_END: char = '\u{E0D5}';
+
+/// Trozo de un comando que se colorea al escribir en una máquina remota.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Tok {
+    Command,
+    Flag,
+    Str,
+}
+
+/// Colorea un comando por encima: la orden (y la que siga a `|`, `&&`, `;`), las opciones
+/// y las cadenas entre comillas. Devuelve tramos [inicio, fin) en caracteres.
+pub fn tokenize(text: &[char]) -> Vec<(usize, usize, Tok)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut command = true;
+    while i < text.len() {
+        let c = text[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if c == '\'' || c == '"' {
+            i += 1;
+            while i < text.len() && text[i] != c {
+                i += if text[i] == '\\' && c == '"' { 2 } else { 1 };
+            }
+            i = (i + 1).min(text.len());
+            out.push((start, i, Tok::Str));
+            command = false;
+            continue;
+        }
+        while i < text.len() && !text[i].is_whitespace() && !"'\"".contains(text[i]) {
+            i += 1;
+        }
+        let word: String = text[start..i].iter().collect();
+        if matches!(word.as_str(), "|" | "||" | "&&" | ";" | "&") {
+            command = true;
+        } else if command {
+            // «VAR=valor orden» y «sudo orden»: la orden es lo siguiente.
+            let prefix = word.contains('=') || matches!(word.as_str(), "sudo" | "env" | "time");
+            out.push((start, i, Tok::Command));
+            command = prefix;
+        } else if word.starts_with('-') && word.len() > 1 {
+            out.push((start, i, Tok::Flag));
+        }
+    }
+    out
+}
+
+/// Un prompt remoto reconocido en una línea: la máquina y la carpeta que nombra (si las
+/// nombra) y cuántos caracteres ocupa (hasta donde empieza el comando).
+#[derive(PartialEq, Debug)]
+pub struct RemotePrompt {
+    pub host: Option<String>,
+    pub dir: Option<String>,
+    pub len: usize,
+}
+
+const PROMPT_SYMBOLS: &str = "$#%>❯➜λ";
+
+/// Reconoce los prompts habituales de un servidor:
+/// - `usuario@máquina:carpeta$ ` y `[usuario@máquina carpeta]# ` (bash), con `(entorno) `;
+/// - `➜  carpeta ` de oh-my-zsh, con su `git:(rama) ✗ ` opcional;
+/// - en general, una o dos palabras y un símbolo de prompt: `~/app $ `, `máquina% `.
+pub fn remote_prompt(text: &[char]) -> Option<RemotePrompt> {
+    user_host_prompt(text)
+        .or_else(|| arrow_prompt(text))
+        .or_else(|| plain_prompt(text))
+}
+
+fn word(text: &[char], from: usize, to: usize) -> String {
+    text[from..to].iter().collect()
+}
+
+fn user_host_prompt(text: &[char]) -> Option<RemotePrompt> {
+    let name = |c: char| c.is_alphanumeric() || "._-".contains(c);
+    let mut i = 0;
+    while text.get(i) == Some(&'(') {
+        let close = text[i..].iter().position(|c| *c == ')')? + i;
+        if text.get(close + 1) != Some(&' ') {
+            return None;
+        }
+        i = close + 2;
+    }
+    if text.get(i) == Some(&'[') {
+        i += 1;
+    }
+    let start = i;
+    while text.get(i).is_some_and(|c| name(*c)) {
+        i += 1;
+    }
+    if i == start || text.get(i) != Some(&'@') {
+        return None;
+    }
+    let at = i;
+    i += 1;
+    while text.get(i).is_some_and(|c| name(*c)) {
+        i += 1;
+    }
+    if i == at + 1 || !matches!(text.get(i), Some(':' | ' ')) {
+        return None;
+    }
+    let host = (start, i);
+    i += 1;
+    let dir_start = i;
+    while text.get(i).is_some_and(|c| !c.is_whitespace() && *c != ']') {
+        i += 1;
+    }
+    let mut dir_end = i;
+    let symbol = |c: Option<&char>| c.is_some_and(|c| "$#%>".contains(*c));
+    if text.get(i) == Some(&']') {
+        i += 1;
+        if text.get(i) == Some(&' ') {
+            i += 1;
+        }
+        if !symbol(text.get(i)) {
+            return None;
+        }
+        i += 1;
+    } else if dir_end > dir_start && symbol(text.get(dir_end - 1)) {
+        // `carpeta$`: el símbolo va pegado a la carpeta.
+        dir_end -= 1;
+    } else if text.get(i) == Some(&' ') && symbol(text.get(i + 1)) {
+        i += 2;
+    } else {
+        return None;
+    }
+    if dir_end == dir_start || text.get(i) != Some(&' ') {
+        return None;
+    }
+    Some(RemotePrompt {
+        host: Some(word(text, host.0, host.1)),
+        dir: Some(word(text, dir_start, dir_end)),
+        len: i + 1,
+    })
+}
+
+/// `➜  carpeta ` (tema robbyrussell de oh-my-zsh), seguido o no de `git:(rama) ` y `✗ `.
+fn arrow_prompt(text: &[char]) -> Option<RemotePrompt> {
+    if !matches!(text.first(), Some('➜' | '❯')) {
+        return None;
+    }
+    let mut i = 1;
+    while text.get(i) == Some(&' ') {
+        i += 1;
+    }
+    let start = i;
+    while text.get(i).is_some_and(|c| !c.is_whitespace()) {
+        i += 1;
+    }
+    if start == 1 || i == start || text.get(i) != Some(&' ') {
+        return None;
+    }
+    let dir = word(text, start, i);
+    i += 1;
+    let rest: String = text[i..].iter().collect();
+    if rest.starts_with("git:(") {
+        let close = rest.find(") ")?;
+        i += rest[..close + 2].chars().count();
+        if text.get(i) == Some(&'✗') && text.get(i + 1) == Some(&' ') {
+            i += 2;
+        }
+    }
+    Some(RemotePrompt {
+        host: None,
+        dir: Some(dir),
+        len: i,
+    })
+}
+
+/// Una o dos palabras y un símbolo de prompt seguido de espacio.
+fn plain_prompt(text: &[char]) -> Option<RemotePrompt> {
+    let end = (0..text.len().min(80)).find(|&i| {
+        PROMPT_SYMBOLS.contains(text[i])
+            && text.get(i + 1) == Some(&' ')
+            && (i == 0 || text[i - 1] == ' ' || "$#%>".contains(text[i]))
+    })?;
+    let before: String = text[..end].iter().collect();
+    let words: Vec<&str> = before.split_whitespace().collect();
+    // Ni frases ni porcentajes («50% », «Uso: 41.3% de…»).
+    let number = before.trim_end().ends_with(|c: char| c.is_ascii_digit());
+    let odd = |w: &&str| w.contains(['=', '|', '"', '\'', ':']);
+    if words.len() > 2 || number || words.iter().any(odd) {
+        return None;
+    }
+    let dir = words
+        .iter()
+        .find(|w| w.starts_with('~') || w.starts_with('/'))
+        .map(|w| w.to_string());
+    Some(RemotePrompt {
+        host: None,
+        dir,
+        len: end + 2,
+    })
+}
+
+/// «usuario@máquina» y carpeta del título de la ventana, que casi todos los servidores
+/// ponen a `usuario@máquina: carpeta` (bash de Debian/Ubuntu, oh-my-zsh…).
+pub fn title_host(title: &str) -> Option<(String, Option<String>)> {
+    let title = title.trim();
+    let (who, dir) = match title.split_once(':') {
+        Some((who, dir)) => (who.trim(), Some(dir.trim()).filter(|d| !d.is_empty())),
+        None => (title, None),
+    };
+    let (user, host) = who.split_once('@')?;
+    let name =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || "._-".contains(c));
+    (name(user) && name(host)).then(|| (who.to_string(), dir.map(str::to_string)))
+}
+
+/// A qué máquina se conecta un `ssh …` (o `sshpass … ssh …`), por sus argumentos.
+pub fn ssh_target(args: &[String]) -> Option<String> {
+    let from = args
+        .iter()
+        .rposition(|a| a.rsplit('/').next() == Some("ssh"))?
+        + 1;
+    let mut skip = false;
+    for arg in &args[from..] {
+        if skip {
+            skip = false;
+        } else if let Some(flag) = arg.strip_prefix('-') {
+            // Opciones que llevan valor aparte: `-p 22`, `-i clave`…
+            skip = flag.len() == 1 && "bcDEeFIiJLlmOopQRSWw".contains(flag);
+        } else {
+            return Some(arg.clone());
+        }
+    }
+    None
+}
+
+/// Cómo acabó el comando anterior a un prompt marcado: código de salida y milisegundos.
+fn tag_result(link: &Hyperlink) -> Option<(i32, u64)> {
+    let mut parts = link.uri().split(';').skip(1);
+    let status = parts.next()?.strip_prefix("s=")?.parse().ok()?;
+    let ms = parts.next()?.strip_prefix("t=")?.parse().ok()?;
+    Some((status, ms))
+}
 
 /// Una línea de cajas visible: fila en pantalla, celdas que ocupa su texto, dónde empieza
 /// lo siguiente a su derecha y los datos (marca + texto) de cada caja.
@@ -35,6 +278,162 @@ pub struct ChipRow {
     /// Celdas que ocupa el símbolo del prompt («❯ ») al inicio de la fila siguiente; 0 si
     /// esa fila no empieza por un símbolo suelto.
     pub symbol: usize,
+    /// Prompt remoto: las cajas van en la misma fila que el comando, que empieza en `end`.
+    pub inline: bool,
+    /// Cómo acabó el comando anterior a este prompt (código, milisegundos), si se sabe.
+    pub result: Option<(i32, u64)>,
+    /// Tramos del comando remoto a colorear: (fila, columna inicial, final, qué es).
+    pub tokens: Vec<(i32, usize, usize, Tok)>,
+}
+
+/// Esquema del hiperenlace con el que la integración de zsh (`assets/shell/zshenv.zsh`)
+/// envuelve el prompt: sus celdas quedan marcadas en la rejilla con la carpeta en la que
+/// se pintó, codificada byte a byte como `%XX`.
+const PROMPT_URI: &str = "colibri-prompt:";
+
+/// La marca de prompt de una celda, si la tiene.
+fn prompt_tag(cell: &Cell) -> Option<Hyperlink> {
+    cell.hyperlink()
+        .filter(|link| link.uri().starts_with(PROMPT_URI))
+}
+
+/// La carpeta que lleva una marca de prompt.
+fn tag_dir(link: &Hyperlink) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    // Tras la carpeta puede venir «;s=…;t=…» (ver `tag_result`).
+    let uri = &link.uri()[PROMPT_URI.len()..];
+    let raw = uri.split(';').next().unwrap_or(uri).as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = (raw[i] == b'%')
+            .then(|| raw.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(raw[i]);
+                i += 1;
+            }
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
+}
+
+/// Las dos rutas nombran la misma carpeta (el shell da la ruta lógica, con enlaces
+/// simbólicos; el sistema, la física).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// Última marca de prompt leída, ya resuelta: el prompt se resella en cada cuadro y la
+/// marca casi nunca cambia, así que ni se vuelve a decodificar ni se vuelve a comparar
+/// con la carpeta del sondeo (que son dos llamadas al sistema si hay enlaces simbólicos).
+struct TagCache {
+    uri: String,
+    dir: PathBuf,
+    /// Carpeta del sondeo con la que se comparó, y si era la misma.
+    cwd: PathBuf,
+    same: bool,
+}
+
+/// Celdas de una línea de cajas: carácter y, en la primera de cada dato, su marca.
+type ChipCells = Vec<(char, Option<char>)>;
+
+/// Lo que debe decir una línea de cajas de `cols` celdas: «carpeta rama cambios».
+fn chip_cells(dir: &Path, branch: Option<&str>, changes: Option<usize>, cols: usize) -> ChipCells {
+    let extras: Vec<(char, String)> = [
+        branch.map(|b| (CHIP_BRANCH, b.to_string())),
+        branch.and(changes).map(|n| (CHIP_CHANGES, n.to_string())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let extras_len: usize = extras.iter().map(|(_, t)| t.chars().count() + 1).sum();
+    let mut path: Vec<char> = proc::pretty_path(dir).chars().collect();
+    let (max_path, extras) = if cols >= extras_len + 6 {
+        (cols - extras_len, extras)
+    } else {
+        (cols, Vec::new())
+    };
+    if path.len() > max_path && max_path > 1 {
+        // Se recorta por el principio: lo que importa es dónde acaba la ruta.
+        path = std::iter::once('…')
+            .chain(path[path.len() - (max_path - 1)..].iter().copied())
+            .collect();
+    }
+    let mut want = ChipCells::new();
+    for (kind, text) in
+        std::iter::once((CHIP_DIR, path.into_iter().collect::<String>())).chain(extras)
+    {
+        if !want.is_empty() {
+            want.push((' ', None));
+        }
+        for (i, c) in text.chars().enumerate() {
+            want.push((c, (i == 0).then_some(kind)));
+        }
+    }
+    want.truncate(cols);
+    want
+}
+
+/// Escribe una línea de cajas en la rejilla (si no dice ya eso). Lo que el shell tuviera
+/// a la derecha (el reloj de powerlevel10k) se borra: la línea es solo de las cajas. La
+/// línea conserva la marca de prompt.
+fn write_chips(
+    grid: &mut Grid<Cell>,
+    line: Line,
+    want: &[(char, Option<char>)],
+    tag: Option<Hyperlink>,
+) {
+    let cols = grid.columns();
+    let at = |col: usize| want.get(col).copied().unwrap_or((' ', None));
+    let same = (0..cols).all(|col| {
+        let cell = &grid[line][Column(col)];
+        (if cell.c == '\0' { ' ' } else { cell.c }, chip_kind(cell)) == at(col)
+    });
+    if same {
+        return;
+    }
+    for col in 0..cols {
+        let (c, kind) = at(col);
+        let mut cell = Cell {
+            c,
+            ..Default::default()
+        };
+        if let Some(kind) = kind {
+            cell.push_zerowidth(kind);
+        }
+        cell.set_hyperlink(tag.clone());
+        grid[line][Column(col)] = cell;
+    }
+}
+
+/// Dos celdas son del mismo prompt: llevan la marca del mismo hiperenlace (cada vez que
+/// el shell pinta el prompt es un hiperenlace nuevo, aunque la carpeta sea la misma).
+fn same_prompt(a: &Option<Hyperlink>, b: &Option<Hyperlink>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a.id() == b.id())
+}
+
+/// Carpeta con el `.zshenv` de la integración, escrito (o actualizado) en el momento.
+fn zsh_integration_dir() -> Option<PathBuf> {
+    let dir = dirs::cache_dir()?.join("colibri").join("zsh");
+    let file = dir.join(".zshenv");
+    let body = include_str!("../assets/shell/zshenv.zsh");
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(body) {
+        std::fs::create_dir_all(&dir).ok()?;
+        std::fs::write(&file, body).ok()?;
+    }
+    Some(dir)
 }
 
 fn is_blank(c: char) -> bool {
@@ -45,7 +444,7 @@ fn chip_kind(cell: &Cell) -> Option<char> {
     cell.zerowidth()?
         .iter()
         .copied()
-        .find(|c| [CHIP_DIR, CHIP_BRANCH, CHIP_CHANGES].contains(c))
+        .find(|c| (CHIP_DIR..=CHIP_END).contains(c))
 }
 
 /// Dónde acaba el texto de la izquierda de una fila (antes de un hueco de 3 o más
@@ -66,16 +465,80 @@ fn text_extent(row: &Row<Cell>, cols: usize) -> (usize, usize) {
     (end, cols)
 }
 
+/// Ritmo de repintado por la salida de los programas. Pintar un cuadro es barato, pero un
+/// agente que anima su pantalla manda decenas de trozos de salida por segundo y cada uno
+/// pedía un cuadro: con varias pestañas trabajando la ventana se repintaba ~100 veces por
+/// segundo, casi todas sin nada nuevo que ver. Ahora:
+/// - la pestaña visible se repinta como mucho cada `OUTPUT_FRAME`;
+/// - salvo justo después de una tecla (`ECHO_WINDOW`): el eco de lo que escribes va al
+///   momento, que es donde se nota la latencia;
+/// - una pestaña que no se ve solo necesita ponerse al día cada `BACKGROUND_FRAME` (su
+///   indicador de «trabajando» y su título).
+const OUTPUT_FRAME: u64 = 33;
+const ECHO_WINDOW: u64 = 150;
+const BACKGROUND_FRAME: u64 = 250;
+
+static ACTIVE_ID: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_INPUT: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+static HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// La ventana no se ve (minimizada, tapada, en otro escritorio): la salida de la pestaña
+/// activa deja de pedir cuadros a 30 Hz y se pone al día como las de segundo plano.
+pub fn set_hidden(hidden: bool) {
+    HIDDEN.store(hidden, Ordering::Relaxed);
+}
+
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// La pestaña que se está viendo, y que se acaba de pintar un cuadro. Lo llama la
+/// interfaz en cada cuadro.
+pub fn frame_painted(active: Option<u64>) {
+    ACTIVE_ID.store(active.unwrap_or(u64::MAX), Ordering::Relaxed);
+    LAST_FRAME.store(now_ms(), Ordering::Relaxed);
+}
+
 #[derive(Clone)]
 pub struct Listener {
+    id: u64,
     tx: Sender<Event>,
     ctx: egui::Context,
 }
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
+        // Lo que solo cambia lo que se ve puede esperar; lo demás (respuestas que el
+        // programa está esperando, portapapeles, fin del proceso) se atiende ya.
+        let visual = matches!(
+            event,
+            Event::Wakeup
+                | Event::Title(_)
+                | Event::ResetTitle
+                | Event::MouseCursorDirty
+                | Event::CursorBlinkingChange
+        );
         let _ = self.tx.send(event);
-        self.ctx.request_repaint();
+        if !visual {
+            return self.ctx.request_repaint();
+        }
+        if ACTIVE_ID.load(Ordering::Relaxed) != self.id || HIDDEN.load(Ordering::Relaxed) {
+            return self
+                .ctx
+                .request_repaint_after(Duration::from_millis(BACKGROUND_FRAME));
+        }
+        let now = now_ms();
+        let since_frame = now.saturating_sub(LAST_FRAME.load(Ordering::Relaxed));
+        let typing = now.saturating_sub(LAST_INPUT.load(Ordering::Relaxed)) < ECHO_WINDOW;
+        if typing {
+            return self.ctx.request_repaint();
+        }
+        // Con espera (aunque sea de 1 ms) egui pinta un solo cuadro; `request_repaint()`
+        // pinta dos seguidos, y eso doblaba los cuadros de cualquier salida continua.
+        let wait = OUTPUT_FRAME.saturating_sub(since_frame).max(1);
+        self.ctx.request_repaint_after(Duration::from_millis(wait));
     }
 }
 
@@ -182,6 +645,10 @@ pub struct Session {
     pub cwd: PathBuf,
     pub fg_pid: i32,
     pub fg_name: String,
+    /// Hay un ssh (o similar) entre el shell y el proceso en primer plano.
+    remote: bool,
+    /// A dónde apunta ese ssh, por sus argumentos (por si el servidor no dice su nombre).
+    remote_target: Option<String>,
     pub agent: Option<Agent>,
 
     /// Hay algo corriendo: un agente trabajando o un comando en primer plano.
@@ -203,7 +670,16 @@ pub struct Session {
     pub chips_px: Vec<(egui::Rect, Vec<(char, String)>)>,
     /// Filas en pantalla que se pintan corridas a la izquierda (sin el símbolo del prompt)
     /// y cuántas celdas; el ratón tiene que deshacer ese corrimiento.
-    pub row_shifts: Vec<(i32, usize)>,
+    pub row_shifts: Vec<(i32, i32)>,
+    /// Texto a medio componer (tecla muerta: «˜» antes de la «ñ»; o un método de entrada),
+    /// que aún no se ha enviado al programa. Se pinta en el cursor, subrayado.
+    pub preedit: String,
+    /// Cuadro en que llegó ese texto (para saber si una tecla es posterior a él).
+    pub preedit_frame: u64,
+    tag_cache: Option<TagCache>,
+    /// Lo último que se selló en el prompt actual (marca y celdas), para volver a ponerlo
+    /// si el shell repinta ese prompt cuando ya no lo es.
+    last_chips: Option<(String, ChipCells)>,
     /// Comando sugerido en gris en el prompt vacío (al restaurar una pestaña donde corría
     /// un agente). No está escrito en el shell: se acepta con Tab/→ o se ejecuta con
     /// Enter; cualquier otra tecla lo descarta.
@@ -233,6 +709,7 @@ impl Session {
         };
         let (tx, rx) = channel();
         let listener = Listener {
+            id,
             tx,
             ctx: ctx.clone(),
         };
@@ -250,8 +727,32 @@ impl Session {
             "TERM_PROGRAM_VERSION".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         );
+        // Claude Code (y lo que use `supports-hyperlinks`) solo emite hiperenlaces OSC 8 en
+        // las terminales que conoce; así los emite aquí, y ⌘+clic los abre enteros aunque
+        // la dirección ocupe varias líneas.
+        env.insert("FORCE_HYPERLINK".to_string(), "1".to_string());
         if std::env::var_os("LANG").is_none() {
             env.insert("LANG".to_string(), "en_US.UTF-8".to_string());
+        }
+        // Integración con zsh: se arranca con ZDOTDIR en una carpeta propia cuyo `.zshenv`
+        // restaura el ZDOTDIR del usuario, carga su `.zshenv` y añade el gancho que marca
+        // el prompt. Con otros shells no hay marca y el prompt se reconoce por su texto.
+        if cfg.shell_integration
+            && shell.rsplit('/').next() == Some("zsh")
+            && let Some(dir) = zsh_integration_dir()
+        {
+            // Color con el que zsh pinta la selección dentro del comando.
+            let sel = cfg.theme.selection.trim();
+            if sel.len() == 7
+                && sel.starts_with('#')
+                && sel[1..].bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                env.insert("COLIBRI_SELECTION".to_string(), sel.to_string());
+            }
+            if let Ok(orig) = std::env::var("ZDOTDIR") {
+                env.insert("COLIBRI_ZDOTDIR".to_string(), orig);
+            }
+            env.insert("ZDOTDIR".to_string(), dir.to_string_lossy().into_owned());
         }
         let cwd = cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir);
         let options = tty::Options {
@@ -297,6 +798,8 @@ impl Session {
             cwd: cwd.unwrap_or_default(),
             fg_pid: shell_pid,
             fg_name: String::new(),
+            remote: false,
+            remote_target: None,
             agent: None,
             busy: false,
             busy_since: now,
@@ -311,6 +814,10 @@ impl Session {
             cursor_px: None,
             chips_px: Vec::new(),
             row_shifts: Vec::new(),
+            preedit: String::new(),
+            preedit_frame: 0,
+            tag_cache: None,
+            last_chips: None,
             suggestion: None,
             line: Some(String::new()),
             typed: Vec::new(),
@@ -331,6 +838,7 @@ impl Session {
         self.suggestion = None;
         self.track(&bytes);
         self.last_input = Instant::now();
+        LAST_INPUT.store(now_ms(), Ordering::Relaxed);
         self.term.lock().scroll_display(Scroll::Bottom);
         self.send(bytes);
     }
@@ -424,19 +932,15 @@ impl Session {
     /// quedar en la rejilla, las cajas persisten: suben con el historial y cada prompt
     /// conserva lo que valía cuando se usó. Mientras el prompt es el actual se va
     /// actualizando (y se vuelve a sellar si el shell lo repinta).
-    pub fn stamp_prompt(&self, branch: Option<&str>, changes: Option<usize>) {
-        if !self.at_prompt() {
-            return;
-        }
-        let needle = if dirs::home_dir().as_deref() == Some(self.cwd.as_path()) {
-            "~".to_string()
-        } else {
-            format!("/{}", proc::base_name(&self.cwd))
-        };
-        if needle == "/" {
-            return;
-        }
+    pub fn stamp_prompt(&mut self, branch: Option<&str>, changes: Option<usize>) {
+        use alacritty_terminal::term::TermMode;
         let mut term = self.term.lock();
+        if term
+            .mode()
+            .intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+        {
+            return;
+        }
         let grid = term.grid_mut();
         let cols = grid.columns();
         // Un comando largo ocupa varias filas: se sube hasta donde empieza.
@@ -448,77 +952,243 @@ impl Session {
         {
             line -= 1;
         }
-        // La línea donde se escribe empieza por el símbolo del prompt; si está vacía es
-        // que el shell está imprimiendo algo (un bucle, una función), no esperando.
-        if is_blank(grid[Line(line)][Column(0)].c) || line < 1 {
-            return;
+        // Al pulsar Enter zsh puede repintar el prompt (powerlevel10k lo hace si cambió la
+        // hora), y eso pisa las cajas cuando ese prompt ya ha dejado de ser el actual. El
+        // repintado vuelve a traer la marca, así que se resellan los prompts marcados de
+        // la pantalla que no sean línea de cajas: con lo último que se selló si es el mismo
+        // sitio, o solo con su carpeta.
+        let rows = grid.screen_lines() as i32;
+        for r in 0..rows - 1 {
+            let head = &grid[Line(r)][Column(0)];
+            let tag = prompt_tag(head);
+            if r + 1 == line || tag.is_none() || chip_kind(head) == Some(CHIP_DIR) {
+                continue;
+            }
+            // Solo la penúltima fila de un prompt de varias líneas.
+            let below = prompt_tag(&grid[Line(r + 1)][Column(0)]);
+            let after = (r + 2 < rows).then(|| prompt_tag(&grid[Line(r + 2)][Column(0)]));
+            if !same_prompt(&tag, &below) || after.is_some_and(|a| same_prompt(&tag, &a)) {
+                continue;
+            }
+            let Some(link) = &tag else { continue };
+            let want = match &self.last_chips {
+                Some((uri, cells)) if uri == link.uri() => {
+                    cells.iter().copied().take(cols).collect()
+                }
+                _ => chip_cells(&tag_dir(link), None, None, cols),
+            };
+            write_chips(grid, Line(r), &want, tag);
         }
-        let line = Line(line - 1);
-        let (end, next) = text_extent(&grid[line], cols);
-        if chip_kind(&grid[line][Column(0)]) != Some(CHIP_DIR) {
-            let text: String = (0..end).map(|col| grid[line][Column(col)].c).collect();
-            if !(text.starts_with('~') || text.starts_with('/')) || !text.contains(&needle) {
+        // Dentro de una sesión ssh no hay integración: el prompt es el de la máquina remota
+        // y se reconoce por su texto (`remote_prompt`). La máquina y la carpeta salen, por
+        // este orden, del título que publica el servidor, del propio prompt y del comando
+        // `ssh`. Se guardan como caracteres de ancho cero en la primera celda (no caben en
+        // las del prompt, que puede ser un simple «➜ ~»), y la última celda marca dónde
+        // empieza el comando.
+        if self.remote && prompt_tag(&grid[Line(line)][Column(0)]).is_none() {
+            let row = &grid[Line(line)];
+            if chip_kind(&row[Column(0)]) == Some(CHIP_PAD) {
                 return;
             }
-        }
-
-        // Lo que debe decir la línea: «carpeta rama cambios». Lo que el shell ponga a la
-        // derecha (el reloj de powerlevel10k) se borra: la línea es solo de las cajas.
-        let _ = next;
-        let avail = cols;
-        let extras: Vec<(char, String)> = [
-            branch.map(|b| (CHIP_BRANCH, b.to_string())),
-            branch.and(changes).map(|n| (CHIP_CHANGES, n.to_string())),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        let extras_len: usize = extras.iter().map(|(_, t)| t.chars().count() + 1).sum();
-        let mut path: Vec<char> = proc::pretty_path(&self.cwd).chars().collect();
-        let (max_path, extras) = if avail >= extras_len + 6 {
-            (avail - extras_len, extras)
-        } else {
-            (avail, Vec::new())
-        };
-        if path.len() > max_path && max_path > 1 {
-            // Se recorta por el principio: lo que importa es dónde acaba la ruta.
-            path = std::iter::once('…')
-                .chain(path[path.len() - (max_path - 1)..].iter().copied())
-                .collect();
-        }
-        let mut want: Vec<(char, Option<char>)> = Vec::new();
-        for (kind, text) in
-            std::iter::once((CHIP_DIR, path.into_iter().collect::<String>())).chain(extras)
-        {
-            if !want.is_empty() {
-                want.push((' ', None));
+            let text: Vec<char> = (0..cols.min(200)).map(|col| row[Column(col)].c).collect();
+            let Some(found) = remote_prompt(&text) else {
+                return;
+            };
+            let titled = title_host(self.clean_title());
+            let dir = titled
+                .as_ref()
+                .and_then(|(_, dir)| dir.clone())
+                .or(found.dir);
+            let host = titled
+                .map(|(host, _)| host)
+                .or(found.host)
+                .or_else(|| self.remote_target.clone());
+            // El cursor tiene que estar ya en el comando: si no, esa línea no es un prompt.
+            let at = grid.cursor.point;
+            let typing = at.line.0 > line || at.column.0 + 1 >= found.len;
+            if host.is_none() && dir.is_none() || found.len < 2 || found.len > cols || !typing {
+                return;
             }
-            for (i, c) in text.chars().enumerate() {
-                want.push((c, (i == 0).then_some(kind)));
+            // Las celdas conservan su texto (sigue ahí para copiarlo); solo se marcan.
+            let first = &mut grid[Line(line)][Column(0)];
+            first.push_zerowidth(CHIP_PAD);
+            for (kind, text) in [(CHIP_HOST, &host), (CHIP_DIR, &dir)] {
+                if let Some(text) = text {
+                    first.push_zerowidth(kind);
+                    text.chars().for_each(|c| first.push_zerowidth(c));
+                }
             }
-        }
-        want.truncate(cols);
-
-        let span = cols;
-        let same = (0..span).all(|col| {
-            let cell = &grid[line][Column(col)];
-            let have = (if cell.c == '\0' { ' ' } else { cell.c }, chip_kind(cell));
-            have == want.get(col).copied().unwrap_or((' ', None))
-        });
-        if same {
+            grid[Line(line)][Column(found.len - 1)].push_zerowidth(CHIP_END);
             return;
         }
-        for col in 0..span {
-            let (c, kind) = want.get(col).copied().unwrap_or((' ', None));
-            let mut cell = Cell {
-                c,
-                ..Default::default()
-            };
-            if let Some(kind) = kind {
-                cell.push_zerowidth(kind);
-            }
-            grid[line][Column(col)] = cell;
+        if line < 1 {
+            return;
         }
+        // Con la integración del shell el prompt viene marcado: se sabe sin adivinar que
+        // el cursor está en un prompt (no hace falta esperar al sondeo de procesos), qué
+        // filas ocupa y en qué carpeta se pintó (la del sondeo llega un poco después de un
+        // `cd`). La fila de encima solo es del prompt si también lleva la marca; si no, el
+        // prompt es de una línea y se deja como está.
+        let tag = prompt_tag(&grid[Line(line)][Column(0)]);
+        // Dentro de una sesión ssh no hay integración: el prompt es el de la máquina
+        // remota y se reconoce por su texto (ver `remote_prompt`).
+        if let Some(link) = &tag {
+            if !same_prompt(&tag, &prompt_tag(&grid[Line(line - 1)][Column(0)])) {
+                return;
+            }
+            let cache = match self.tag_cache.take() {
+                Some(c) if c.uri == link.uri() && c.cwd == self.cwd => c,
+                old => {
+                    let dir = match old {
+                        Some(c) if c.uri == link.uri() => c.dir,
+                        _ => tag_dir(link),
+                    };
+                    TagCache {
+                        uri: link.uri().to_string(),
+                        same: same_dir(&dir, &self.cwd),
+                        cwd: self.cwd.clone(),
+                        dir,
+                    }
+                }
+            };
+            self.tag_cache = Some(cache);
+        }
+        let cached = self.tag_cache.as_ref().filter(|_| tag.is_some());
+        let dir: &Path = cached.map_or(&self.cwd, |c| &c.dir);
+        if tag.is_none() {
+            // Sin marca (otro shell, integración apagada) se reconoce por el texto, y solo
+            // si el shell está en primer plano. La línea donde se escribe empieza por el
+            // símbolo del prompt; si está vacía es que el shell está imprimiendo algo (un
+            // bucle, una función), no esperando.
+            if self.fg_pid != self.shell_pid || is_blank(grid[Line(line)][Column(0)].c) {
+                return;
+            }
+            let needle = if dirs::home_dir().as_deref() == Some(dir) {
+                "~".to_string()
+            } else {
+                format!("/{}", proc::base_name(dir))
+            };
+            if needle == "/" {
+                return;
+            }
+            let row = &grid[Line(line - 1)];
+            if chip_kind(&row[Column(0)]) != Some(CHIP_DIR) {
+                let (end, _) = text_extent(row, cols);
+                let text: String = (0..end).map(|col| row[Column(col)].c).collect();
+                if !(text.starts_with('~') || text.starts_with('/')) || !text.contains(&needle) {
+                    return;
+                }
+            }
+        }
+        let line = Line(line - 1);
+        // La rama y los cambios son los de la carpeta del sondeo: hasta que este alcance a
+        // la del prompt solo se pone la carpeta.
+        let (branch, changes) = if cached.is_none_or(|c| c.same) {
+            (branch, changes)
+        } else {
+            (None, None)
+        };
+
+        let want = chip_cells(dir, branch, changes, cols);
+        if self
+            .last_chips
+            .as_ref()
+            .is_none_or(|(_, cells)| *cells != want)
+            && let Some(link) = &tag
+        {
+            self.last_chips = Some((link.uri().to_string(), want.clone()));
+        }
+        write_chips(grid, line, &want, tag);
+    }
+
+    /// El programa en primer plano es una conexión a otra máquina (o corre dentro de una).
+    pub fn remote(&self) -> bool {
+        self.remote
+    }
+
+    /// Celdas de lo que se está escribiendo en el prompt, una por carácter y en orden, y
+    /// dónde está el cursor. Solo con la integración del shell (el prompt marcado dice
+    /// dónde acaba el prompt y empieza el comando) y con el shell esperando; lo usan la
+    /// selección y el clic dentro del comando, que se le piden a zle con teclas.
+    /// El cursor está en el comando que se escribe en un prompt marcado, aunque el comando
+    /// ocupe varias líneas (un comando pegado o sacado del historial con saltos de línea):
+    /// la fila marcada más cercana por encima del cursor es su prompt. Basta para mandar
+    /// a zle las teclas de selección; para contar celdas hace falta `input_cells`.
+    pub fn in_command(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        if self.fg_pid != self.shell_pid {
+            return false;
+        }
+        let term = self.term.lock();
+        if term
+            .mode()
+            .intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+        {
+            return false;
+        }
+        let grid = term.grid();
+        let cursor = grid.cursor.point.line.0;
+        let top = (cursor - 200).max(-(grid.history_size() as i32));
+        (top..=cursor)
+            .rev()
+            .any(|line| prompt_tag(&grid[Line(line)][Column(0)]).is_some())
+    }
+
+    pub fn input_cells(&self) -> Option<(Vec<Point>, Point)> {
+        use alacritty_terminal::term::TermMode;
+        if self.fg_pid != self.shell_pid {
+            return None;
+        }
+        let term = self.term.lock();
+        if term
+            .mode()
+            .intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+        {
+            return None;
+        }
+        let grid = term.grid();
+        let cols = grid.columns();
+        let wraps = |line: i32| {
+            grid[Line(line)][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        };
+        let cursor = grid.cursor.point;
+        let mut first = cursor.line.0;
+        while first > 0 && wraps(first - 1) {
+            first -= 1;
+        }
+        let prompt = (0..cols)
+            .take_while(|&col| prompt_tag(&grid[Line(first)][Column(col)]).is_some())
+            .count();
+        if prompt == 0 {
+            return None;
+        }
+        let mut last = cursor.line.0;
+        while last + 1 < grid.screen_lines() as i32 && wraps(last) {
+            last += 1;
+        }
+        let mut cells = Vec::new();
+        for line in first..=last {
+            for col in if line == first { prompt } else { 0 }..cols {
+                let cell = &grid[Line(line)][Column(col)];
+                if !cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    cells.push(Point::new(Line(line), Column(col)));
+                }
+            }
+        }
+        // Lo escrito acaba en la última celda con algo; los espacios de antes del cursor
+        // sí cuentan (se han tecleado).
+        while cells
+            .last()
+            .is_some_and(|p| *p >= cursor && is_blank(grid[p.line][p.column].c))
+        {
+            cells.pop();
+        }
+        Some((cells, cursor))
     }
 
     /// Líneas de cajas visibles ahora mismo.
@@ -527,41 +1197,105 @@ impl Session {
         let grid = term.grid();
         let cols = grid.columns();
         let offset = grid.display_offset() as i32;
+        let screen = grid.screen_lines() as i32;
         let mut out = Vec::new();
-        for row in 0..grid.screen_lines() as i32 {
+        for row in 0..screen {
             let cells = &grid[Line(row - offset)];
-            if chip_kind(&cells[Column(0)]) != Some(CHIP_DIR) {
-                continue;
-            }
-            let (end, next) = text_extent(cells, cols);
+            let inline = match chip_kind(&cells[Column(0)]) {
+                Some(CHIP_DIR) => false,
+                Some(CHIP_PAD) => true,
+                _ => continue,
+            };
+            let (end, next) = if inline {
+                // El prompt remoto acaba en la celda marcada; detrás va el comando.
+                let end = (0..cols)
+                    .find(|&col| chip_kind(&cells[Column(col)]) == Some(CHIP_END))
+                    .map_or(cols, |col| col + 1);
+                (end, end)
+            } else {
+                text_extent(cells, cols)
+            };
             let mut parts: Vec<(char, String)> = Vec::new();
-            for col in 0..end {
-                let cell = &cells[Column(col)];
-                if let Some(kind) = chip_kind(cell) {
-                    parts.push((kind, String::new()));
+            if inline {
+                // Los datos van en la primera celda, como caracteres de ancho cero.
+                for c in cells[Column(0)].zerowidth().into_iter().flatten() {
+                    if [CHIP_HOST, CHIP_DIR].contains(c) {
+                        parts.push((*c, String::new()));
+                    } else if let Some((_, text)) = parts.last_mut() {
+                        text.push(*c);
+                    }
                 }
-                if let Some((_, text)) = parts.last_mut() {
-                    text.push(cell.c);
+            } else {
+                for col in 0..end {
+                    let cell = &cells[Column(col)];
+                    if let Some(kind) = chip_kind(cell) {
+                        parts.push((kind, String::new()));
+                    }
+                    if let Some((_, text)) = parts.last_mut() {
+                        text.push(cell.c);
+                    }
                 }
             }
             for (_, text) in &mut parts {
                 *text = text.trim().to_string();
             }
             // La fila de debajo es donde se escribe: suele empezar por «❯ », «$ », «% »…
-            let symbol = if row + 1 < grid.screen_lines() as i32 && cols > 2 {
+            let symbol = if !inline && row + 1 < screen && cols > 2 {
                 let below = &grid[Line(row + 1 - offset)];
+                // Con la marca de la integración se sabe exactamente cuánto ocupa.
+                let tagged = (0..cols)
+                    .take_while(|&col| prompt_tag(&below[Column(col)]).is_some())
+                    .count();
                 let (c0, c1) = (below[Column(0)].c, below[Column(1)].c);
                 let lone = !is_blank(c0) && !c0.is_alphanumeric() && !"/~.-_".contains(c0);
-                if lone && is_blank(c1) { 2 } else { 0 }
+                if tagged > 0 {
+                    tagged
+                } else if lone && is_blank(c1) {
+                    2
+                } else {
+                    0
+                }
             } else {
                 0
             };
+            // El comando remoto, que puede seguir en las filas de debajo si no cabe.
+            let mut tokens = Vec::new();
+            if inline {
+                let mut at: Vec<(i32, usize)> = Vec::new();
+                let mut text: Vec<char> = Vec::new();
+                let mut r = row;
+                loop {
+                    let line = &grid[Line(r - offset)];
+                    for col in if r == row { end } else { 0 }..cols {
+                        at.push((r, col));
+                        text.push(line[Column(col)].c);
+                    }
+                    let wraps = line[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+                    if !wraps || r + 1 >= screen {
+                        break;
+                    }
+                    r += 1;
+                }
+                for (from, to, tok) in tokenize(&text) {
+                    // Un tramo por fila.
+                    let mut start = from;
+                    for i in from..=to {
+                        if i == to || at[i].0 != at[start].0 {
+                            tokens.push((at[start].0, at[start].1, at[i - 1].1 + 1, tok));
+                            start = i;
+                        }
+                    }
+                }
+            }
             out.push(ChipRow {
                 row,
                 end,
                 next,
                 parts,
                 symbol,
+                inline,
+                result: prompt_tag(&cells[Column(0)]).as_ref().and_then(tag_result),
+                tokens,
             });
         }
         out
@@ -570,7 +1304,13 @@ impl Session {
     /// Deja `cmd` escrito en el prompt, en lugar de lo que hubiera, sin ejecutarlo.
     pub fn insert_command(&mut self, cmd: &str) {
         self.input(vec![0x15]);
-        self.paste(cmd);
+        // Una sola línea se teclea tal cual: pegada, zsh la deja resaltada, y el historial
+        // la va cambiando con cada flecha. Con saltos de línea hay que pegarla.
+        if cmd.chars().any(char::is_control) {
+            self.paste(cmd);
+        } else {
+            self.input(cmd.as_bytes().to_vec());
+        }
         self.line = Some(cmd.to_string());
     }
 
@@ -672,8 +1412,10 @@ impl Session {
 
     /// Actualiza proceso en primer plano y estado. Devuelve true si algo acaba de terminar
     /// sin que lo estuvieras viendo.
-    pub fn poll(&mut self, watching: bool) -> bool {
+    pub fn poll(&mut self, ctx: &egui::Context, watching: bool) -> bool {
         let now = Instant::now();
+        let before = (self.fg_pid, self.busy);
+        let mut moved = false;
         let interval = if self.dirty { 200 } else { 1000 };
         let due = now.duration_since(self.last_poll) >= Duration::from_millis(interval);
         if due && (self.dirty || self.busy) {
@@ -693,6 +1435,26 @@ impl Session {
                         self.fg_name = arg0.rsplit('/').next().unwrap_or(arg0).to_string();
                     }
                 }
+                // ¿Sesión remota? Se mira el proceso en primer plano y sus padres hasta el
+                // shell: `sshpass … ssh`, o lo que el propio ssh lance en local.
+                self.remote = false;
+                self.remote_target = None;
+                let (mut pid, mut hops) = (fg, 0);
+                while pid != self.shell_pid && pid > 1 && hops < 6 {
+                    let name = proc::name(pid);
+                    if matches!(
+                        name.as_str(),
+                        "ssh" | "sshpass" | "autossh" | "slogin" | "mosh-client"
+                    ) {
+                        self.remote = true;
+                        self.remote_target = ssh_target(&proc::args(pid));
+                        break;
+                    }
+                    let Some(parent) = proc::parent(pid) else {
+                        break;
+                    };
+                    (pid, hops) = (parent, hops + 1);
+                }
                 self.agent = if fg == self.shell_pid {
                     None
                 } else {
@@ -700,6 +1462,7 @@ impl Session {
                 };
             }
             if let Some(dir) = proc::cwd(fg).or_else(|| proc::cwd(self.shell_pid)) {
+                moved = dir != self.cwd;
                 self.cwd = dir;
             }
         }
@@ -737,6 +1500,13 @@ impl Session {
             }
         }
         self.busy = busy;
+        // Esto corre en `logic()`, y lo que cambia aquí (carpeta, proceso, «trabajando»)
+        // se dibuja en `ui()`: sin pedir otro cuadro, el cambio no se vería hasta la
+        // siguiente tecla. Era el caso de `cd`: el sondeo llega después de que el shell
+        // pinte el prompt, y las cajas no se sellaban porque la carpeta aún era la vieja.
+        if moved || before != (self.fg_pid, self.busy) {
+            ctx.request_repaint();
+        }
         notify
     }
 
@@ -808,5 +1578,103 @@ impl Drop for Session {
         if self.master_fd >= 0 {
             unsafe { libc::close(self.master_fd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn remote_prompts() {
+        let p = remote_prompt(&chars("muy@aid-muysabaneta:~$ docker ps")).unwrap();
+        assert_eq!(p.host.as_deref(), Some("muy@aid-muysabaneta"));
+        assert_eq!((p.dir.as_deref(), p.len), (Some("~"), 23));
+        let p = remote_prompt(&chars("[root@db01 /var/log]# ")).unwrap();
+        assert_eq!(p.host.as_deref(), Some("root@db01"));
+        assert_eq!((p.dir.as_deref(), p.len), (Some("/var/log"), 22));
+        let p = remote_prompt(&chars("(venv) ana@web.local:~/app$ ")).unwrap();
+        assert_eq!(p.dir.as_deref(), Some("~/app"));
+        // oh-my-zsh: sin máquina en el prompt.
+        let p = remote_prompt(&chars("➜  ~ docker ps")).unwrap();
+        assert_eq!((p.host, p.dir.as_deref(), p.len), (None, Some("~"), 5));
+        let p = remote_prompt(&chars("➜  app git:(main) ✗ ls")).unwrap();
+        assert_eq!((p.dir.as_deref(), p.len), (Some("app"), 20));
+        // Genéricos.
+        let p = remote_prompt(&chars("~/app $ ls")).unwrap();
+        assert_eq!((p.dir.as_deref(), p.len), (Some("~/app"), 8));
+        assert_eq!(remote_prompt(&chars("servidor% ")).unwrap().len, 10);
+        // Salida normal no es un prompt.
+        assert_eq!(remote_prompt(&chars("Welcome to Ubuntu 22.04")), None);
+        assert_eq!(
+            remote_prompt(&chars(
+                "Last login: Thu Nov 19 14:41:17 2026 from 127.0.0.1"
+            )),
+            None
+        );
+        assert_eq!(
+            remote_prompt(&chars("  System load:  0.26   Processes: 185")),
+            None
+        );
+        assert_eq!(remote_prompt(&chars("Descargando 50% hecho")), None);
+        assert_eq!(remote_prompt(&chars("  Swap usage:   2% ")), None);
+    }
+
+    #[test]
+    fn host_from_title_and_args() {
+        assert_eq!(
+            title_host("muy@aid-muysabaneta: ~/app"),
+            Some(("muy@aid-muysabaneta".into(), Some("~/app".into())))
+        );
+        assert_eq!(
+            title_host("muy@aid:~"),
+            Some(("muy@aid".into(), Some("~".into())))
+        );
+        assert_eq!(title_host("ssh muy@tunnel.muy.com.co -p 1054"), None);
+        assert_eq!(title_host("vim notas.txt"), None);
+        let args = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            ssh_target(&args("sshpass -p clave ssh muy@tunnel.muy.com.co -p 1054")).as_deref(),
+            Some("muy@tunnel.muy.com.co")
+        );
+        assert_eq!(
+            ssh_target(&args("/usr/bin/ssh -p 22 -i k web01 uptime")).as_deref(),
+            Some("web01")
+        );
+    }
+
+    #[test]
+    fn command_tokens() {
+        let toks = tokenize(&chars("docker logs --follow 'mi app' | grep -i error"));
+        assert_eq!(
+            toks,
+            vec![
+                (0, 6, Tok::Command),
+                (12, 20, Tok::Flag),
+                (21, 29, Tok::Str),
+                (32, 36, Tok::Command),
+                (37, 39, Tok::Flag),
+            ]
+        );
+        assert_eq!(
+            tokenize(&chars("sudo systemctl restart x"))[1],
+            (5, 14, Tok::Command)
+        );
+    }
+
+    #[test]
+    fn prompt_result_from_tag() {
+        let link = Hyperlink::new(
+            None::<String>,
+            "colibri-prompt:/tmp/a%20b;s=255;t=1095".into(),
+        );
+        assert_eq!(tag_result(&link), Some((255, 1095)));
+        assert_eq!(tag_dir(&link), PathBuf::from("/tmp/a b"));
+        let plain = Hyperlink::new(None::<String>, "colibri-prompt:/tmp".into());
+        assert_eq!(tag_result(&plain), None);
     }
 }

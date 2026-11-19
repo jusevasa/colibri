@@ -8,13 +8,21 @@ description = "Terminal rápida para correr varios agentes"
 alacritty_terminal = "0.26"
 block2 = "0.6"
 dirs = "7"
-eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "clipboard", "system_fonts"] }
+egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard"] }
+egui_system_font_provider = "0.37"
 libc = "0.2"
 objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-core-graphics = "0.3"
 objc2-foundation = "0.3"
+objc2-metal = "0.3"
+objc2-quartz-core = "0.3"
+raw-window-handle = "0.6"
 objc2-user-notifications = "0.3"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+winit = "0.30"
 
 [profile.release]
 opt-level = 3
@@ -25,3 +33,10 @@ panic = "abort"
 
 [profile.dev]
 opt-level = 1
+
+# Como release pero con símbolos, para perfilar con `sample` o Instruments:
+# cargo build --profile profiling  →  target/profiling/colibri
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
