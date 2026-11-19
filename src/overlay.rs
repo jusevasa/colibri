@@ -7,6 +7,34 @@ use eframe::egui::{
     Sense, Stroke, Vec2,
 };
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum PickKind {
+    Branch,
+    CurrentBranch,
+    Parent,
+    Dir,
+    File,
+}
+
+/// Una fila del desplegable de una caja del prompt.
+pub struct Pick {
+    pub kind: PickKind,
+    pub name: String,
+}
+
+/// Argumento listo para el shell: entre comillas simples si hace falta.
+fn shell_arg(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || "-_./@+".contains(c));
+    if plain {
+        text.to_string()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub enum Overlay {
     None,
@@ -22,6 +50,11 @@ pub enum Overlay {
     },
     /// Comandos usados antes; `sel` 0 es el más reciente.
     History {
+        query: String,
+        sel: usize,
+    },
+    /// Desplegable de una caja del prompt: lo que ofrece está en `App::picks`.
+    Picker {
         query: String,
         sel: usize,
     },
@@ -47,7 +80,7 @@ const PREF_ROWS: [(&str, &str); 18] = [
     ("notify", "Notificar cuando algo termina"),
     ("history_popup", "Historial de comandos con ↑"),
     ("complete_popup", "Sugerir carpetas y archivos con ⇥"),
-    ("status_bar", "Barra de carpeta y rama"),
+    ("status_bar", "Carpeta y rama en cajas, en el prompt"),
     ("show_agents", "Agentes"),
     ("show_ports", "Puertos"),
     ("show_processes", "Procesos"),
@@ -146,11 +179,215 @@ impl App {
             Overlay::Prefs { sel } => self.prefs_ui(ctx, sel),
             Overlay::Rename { text } => self.rename_ui(ctx, text),
             Overlay::History { query, sel } => self.history_ui(ctx, query, sel),
+            Overlay::Picker { query, sel } => self.picker_ui(ctx, query, sel),
             Overlay::Complete { target, items, sel } => self.complete_ui(ctx, target, items, sel),
         }
     }
 
     /// Lista de comandos anclada al cursor: el más reciente abajo, ↑ va hacia los antiguos.
+    /// Desplegable bajo una caja del prompt: buscador arriba y las opciones debajo. Lo que
+    /// se elige se escribe y ejecuta en el shell, a la vista (`git checkout`, `cd`), para
+    /// que cualquier error se lea ahí. Un archivo solo se pega en el prompt.
+    fn picker_ui(&mut self, ctx: &egui::Context, mut query: String, mut sel: usize) {
+        if type_into(ctx, &mut query) {
+            sel = 0;
+        }
+        let q = query.trim().to_lowercase();
+        let branches = self
+            .picks
+            .iter()
+            .any(|p| matches!(p.kind, PickKind::Branch | PickKind::CurrentBranch));
+        // Los ocultos (.git, .env…) solo salen si se buscan con el punto por delante.
+        let items: Vec<&Pick> = self
+            .picks
+            .iter()
+            .filter(|p| match p.kind {
+                PickKind::Parent => q.is_empty() || "..".starts_with(&q),
+                PickKind::Dir | PickKind::File
+                    if p.name.starts_with('.') && !q.starts_with('.') =>
+                {
+                    false
+                }
+                _ => p.name.to_lowercase().contains(&q),
+            })
+            .collect();
+        if pressed(ctx, Key::ArrowDown) && !items.is_empty() {
+            sel = (sel + 1) % items.len();
+        }
+        if pressed(ctx, Key::ArrowUp) && !items.is_empty() {
+            sel = (sel + items.len() - 1) % items.len();
+        }
+        sel = sel.min(items.len().saturating_sub(1));
+        let mut pick = pressed(ctx, Key::Enter)
+            .then_some(sel)
+            .filter(|_| !items.is_empty());
+
+        const VISIBLE: usize = 10;
+        const ROW: f32 = 28.0;
+        const HEAD: f32 = 34.0;
+        let pal = self.pal.clone();
+        let mono = FontId::monospace(12.5);
+        let screen = ctx.content_rect();
+        let width = 440.0_f32.min(screen.width() - 16.0);
+        let height = HEAD + items.len().clamp(1, VISIBLE) as f32 * ROW + 8.0;
+        let max_x = (screen.right() - width - 8.0).max(screen.left() + 8.0);
+        let max_y = (screen.bottom() - height - 8.0).max(screen.top() + 8.0);
+        let pos = Pos2::new(
+            self.pick_anchor.x.clamp(screen.left() + 8.0, max_x),
+            (self.pick_anchor.y + 4.0).min(max_y),
+        );
+        let first = sel.saturating_sub(VISIBLE - 1);
+
+        let out = egui::Area::new(Id::unique("picker"))
+            .order(Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing = Vec2::ZERO;
+                        let (head, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), HEAD),
+                            Sense::hover(),
+                        );
+                        let p = ui.painter();
+                        let (shown, color) = if !query.is_empty() {
+                            (query.clone(), pal.fg)
+                        } else if branches {
+                            ("Buscar rama…".to_string(), pal.muted)
+                        } else {
+                            ("Buscar carpeta o archivo…".to_string(), pal.muted)
+                        };
+                        let r = p.text(
+                            Pos2::new(head.left() + 14.0, head.center().y),
+                            Align2::LEFT_CENTER,
+                            shown,
+                            mono.clone(),
+                            color,
+                        );
+                        let caret_x = if query.is_empty() {
+                            head.left() + 13.0
+                        } else {
+                            r.right() + 1.0
+                        };
+                        p.line_segment(
+                            [
+                                Pos2::new(caret_x, head.center().y - 7.0),
+                                Pos2::new(caret_x, head.center().y + 7.0),
+                            ],
+                            Stroke::new(1.5, pal.accent),
+                        );
+                        p.line_segment(
+                            [head.left_bottom(), head.right_bottom()],
+                            Stroke::new(1.0, pal.border),
+                        );
+                        ui.add_space(4.0);
+                        if items.is_empty() {
+                            let (r, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ROW),
+                                Sense::hover(),
+                            );
+                            ui.painter().text(
+                                Pos2::new(r.left() + 14.0, r.center().y),
+                                Align2::LEFT_CENTER,
+                                "Nada coincide",
+                                mono.clone(),
+                                pal.muted,
+                            );
+                        }
+                        for (i, item) in items.iter().enumerate().skip(first).take(VISIBLE) {
+                            let (r, resp) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), ROW),
+                                Sense::click(),
+                            );
+                            if resp.hovered() && ui.input(|inp| inp.pointer.delta() != Vec2::ZERO) {
+                                sel = i;
+                            }
+                            if resp.clicked() {
+                                pick = Some(i);
+                            }
+                            let p = ui.painter();
+                            if i == sel {
+                                p.rect_filled(
+                                    r.shrink2(Vec2::new(4.0, 1.0)),
+                                    CornerRadius::same(5),
+                                    pal.accent.gamma_multiply(0.16),
+                                );
+                            }
+                            let icon_at = Pos2::new(r.left() + 20.0, r.center().y);
+                            let (label, color, note) = match item.kind {
+                                PickKind::CurrentBranch => (item.name.clone(), pal.done, "actual"),
+                                PickKind::Branch => (item.name.clone(), pal.fg, ""),
+                                PickKind::Parent => {
+                                    p.text(
+                                        icon_at,
+                                        Align2::CENTER_CENTER,
+                                        "↑",
+                                        mono.clone(),
+                                        pal.muted,
+                                    );
+                                    (".. (carpeta superior)".to_string(), pal.muted, "")
+                                }
+                                PickKind::Dir => {
+                                    crate::file_icon(p, icon_at, true, pal.accent);
+                                    (item.name.clone(), pal.fg, "")
+                                }
+                                PickKind::File => {
+                                    crate::file_icon(p, icon_at, false, pal.muted);
+                                    (item.name.clone(), pal.fg, "")
+                                }
+                            };
+                            let text_x = if branches {
+                                r.left() + 14.0
+                            } else {
+                                r.left() + 38.0
+                            };
+                            let g =
+                                elided(ui.ctx(), &label, &mono, color, r.right() - text_x - 70.0);
+                            p.galley(Pos2::new(text_x, r.center().y - g.size().y / 2.0), g, color);
+                            if !note.is_empty() {
+                                p.text(
+                                    Pos2::new(r.right() - 14.0, r.center().y),
+                                    Align2::RIGHT_CENTER,
+                                    note,
+                                    FontId::proportional(11.0),
+                                    pal.muted,
+                                );
+                            }
+                        }
+                        ui.add_space(4.0);
+                    });
+            });
+
+        if let Some(i) = pick {
+            let (kind, name) = (items[i].kind, items[i].name.clone());
+            self.overlay = Overlay::None;
+            if let Some(s) = self.sessions.get_mut(self.active) {
+                let run = match kind {
+                    PickKind::CurrentBranch => None,
+                    PickKind::Branch => Some(format!("git checkout {}", shell_arg(&name))),
+                    PickKind::Parent => Some("cd ..".to_string()),
+                    PickKind::Dir => Some(format!("cd {}", shell_arg(&name))),
+                    PickKind::File => {
+                        s.paste(&format!("{} ", shell_arg(&name)));
+                        None
+                    }
+                };
+                if let Some(cmd) = run {
+                    s.insert_command(&cmd);
+                    s.input(b"\r".to_vec());
+                }
+            }
+        } else if clicked_outside(ctx, out.response.rect) {
+            self.overlay = Overlay::None;
+        } else {
+            self.overlay = Overlay::Picker { query, sel };
+        }
+    }
+
     fn history_ui(&mut self, ctx: &egui::Context, mut query: String, mut sel: usize) {
         if type_into(ctx, &mut query) {
             sel = 0;

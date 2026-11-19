@@ -79,6 +79,7 @@ pub fn show(
     m: &Metrics,
     focused: bool,
     keyboard: bool,
+    chips: bool,
 ) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let origin = rect.min + Vec2::new(m.pad, m.pad / 2.0);
@@ -107,6 +108,21 @@ pub fn show(
 
     handle_input(ui, s, &resp, rect, origin, m, keyboard);
 
+    // Las líneas de cajas no se pintan como texto: en su sitio van las cajas, que dibuja
+    // quien llama a partir de `s.chips_px`.
+    let chip_rows = if chips { s.chip_rows() } else { Vec::new() };
+    s.chips_px = chip_rows
+        .iter()
+        .map(|c| {
+            let top = origin.y + c.row as f32 * m.cell_h;
+            let right = if c.next >= cols { cols } else { c.next - 2 };
+            let area = Rect::from_min_max(
+                Pos2::new(origin.x, top),
+                Pos2::new(origin.x + right as f32 * m.cell_w, top + m.cell_h),
+            );
+            (area, c.parts.clone())
+        })
+        .collect();
     let painter = ui.painter().with_clip_rect(rect);
     let mut bgs: Vec<BgRun> = Vec::new();
     let mut texts: Vec<TextRun> = Vec::new();
@@ -135,6 +151,9 @@ pub fn show(
             }
             let row = ind.point.line.0 + offset;
             let col = ind.point.column.0;
+            if chip_rows.iter().any(|c| c.row == row && col < c.end) {
+                continue;
+            }
             let width = if flags.contains(Flags::WIDE_CHAR) {
                 2
             } else {
@@ -199,7 +218,8 @@ pub fn show(
                 _ => {
                     let mut text = String::from(c);
                     if let Some(z) = zero {
-                        text.extend(z.iter());
+                        // Las marcas de las cajas no son texto (se ven si las cajas están apagadas).
+                        text.extend(z.iter().filter(|c| !('\u{E0D0}'..='\u{E0D2}').contains(*c)));
                     }
                     texts.push(TextRun {
                         row,

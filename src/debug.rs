@@ -1,7 +1,7 @@
 //! Guion de depuración: COLIBRI_SCRIPT=archivo ejecuta pasos y guarda capturas del propio render.
 //! Pasos (uno por línea): `type <texto>` (\n = Enter), `wait <ms>`, `tab`, `select <n>`,
 //! `move <de> <a>`, `agent next|prev`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`,
-//! `open palette|prefs|history`, `key up|down|enter|esc|tab`,
+//! `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab`,
 //! `press <x> <y>`, `moveto <x> <y>`, `release <x> <y>`, `rclick <x> <y>`, `pref <id> <+1|-1>`, `update`, `quit`.
 
 use std::collections::VecDeque;

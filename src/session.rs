@@ -4,8 +4,10 @@ use crate::config::{Config, Palette};
 use crate::proc;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, Row, Scroll};
+use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::tty;
 use alacritty_terminal::vte::ansi::Rgb;
@@ -17,6 +19,49 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
+
+/// Marcas (carácter de ancho cero en la primera celda de cada dato) de una línea de cajas.
+pub const CHIP_DIR: char = '\u{E0D0}';
+pub const CHIP_BRANCH: char = '\u{E0D1}';
+pub const CHIP_CHANGES: char = '\u{E0D2}';
+
+/// Una línea de cajas visible: fila en pantalla, celdas que ocupa su texto, dónde empieza
+/// lo siguiente a su derecha y los datos (marca + texto) de cada caja.
+pub struct ChipRow {
+    pub row: i32,
+    pub end: usize,
+    pub next: usize,
+    pub parts: Vec<(char, String)>,
+}
+
+fn is_blank(c: char) -> bool {
+    c == ' ' || c == '\0'
+}
+
+fn chip_kind(cell: &Cell) -> Option<char> {
+    cell.zerowidth()?
+        .iter()
+        .copied()
+        .find(|c| [CHIP_DIR, CHIP_BRANCH, CHIP_CHANGES].contains(c))
+}
+
+/// Dónde acaba el texto de la izquierda de una fila (antes de un hueco de 3 o más
+/// espacios) y dónde empieza lo que haya después; `cols` si no hay nada más.
+fn text_extent(row: &Row<Cell>, cols: usize) -> (usize, usize) {
+    let (mut end, mut gap) = (0, 0);
+    for col in 0..cols {
+        if is_blank(row[Column(col)].c) {
+            gap += 1;
+        } else {
+            if gap >= 3 && end > 0 {
+                return (end, col);
+            }
+            gap = 0;
+            end = col + 1;
+        }
+    }
+    (end, cols)
+}
 
 #[derive(Clone)]
 pub struct Listener {
@@ -151,6 +196,8 @@ pub struct Session {
     pub scroll_acc: f32,
     /// Celda del cursor en pantalla en el último cuadro (para anclar el historial).
     pub cursor_px: Option<egui::Rect>,
+    /// Líneas de cajas en pantalla: su hueco y los datos de cada caja (se fija al pintar).
+    pub chips_px: Vec<(egui::Rect, Vec<(char, String)>)>,
     /// Lo tecleado en el prompt desde el último Enter. None = se perdió la pista
     /// (hubo teclas de edición: flechas, tabulador…).
     line: Option<String>,
@@ -252,6 +299,7 @@ impl Session {
             last_poll: old,
             scroll_acc: 0.0,
             cursor_px: None,
+            chips_px: Vec::new(),
             line: Some(String::new()),
             typed: Vec::new(),
             activity: 0,
@@ -339,6 +387,145 @@ impl Session {
                 .lock()
                 .mode()
                 .intersects(TermMode::ALT_SCREEN | TermMode::MOUSE_MODE)
+    }
+
+    /// Convierte la línea del prompt que nombra la carpeta (la de encima de donde se escribe,
+    /// en prompts de dos líneas como el de powerlevel10k) en una «línea de cajas»: reescribe
+    /// sus celdas con carpeta, rama y cambios, cada dato marcado en su primera celda. Al
+    /// quedar en la rejilla, las cajas persisten: suben con el historial y cada prompt
+    /// conserva lo que valía cuando se usó. Mientras el prompt es el actual se va
+    /// actualizando (y se vuelve a sellar si el shell lo repinta).
+    pub fn stamp_prompt(&self, branch: Option<&str>, changes: Option<usize>) {
+        if !self.at_prompt() {
+            return;
+        }
+        let needle = if dirs::home_dir().as_deref() == Some(self.cwd.as_path()) {
+            "~".to_string()
+        } else {
+            format!("/{}", proc::base_name(&self.cwd))
+        };
+        if needle == "/" {
+            return;
+        }
+        let mut term = self.term.lock();
+        let grid = term.grid_mut();
+        let cols = grid.columns();
+        // Un comando largo ocupa varias filas: se sube hasta donde empieza.
+        let mut line = grid.cursor.point.line.0;
+        while line > 0
+            && grid[Line(line - 1)][Column(cols - 1)]
+                .flags
+                .contains(Flags::WRAPLINE)
+        {
+            line -= 1;
+        }
+        // La línea donde se escribe empieza por el símbolo del prompt; si está vacía es
+        // que el shell está imprimiendo algo (un bucle, una función), no esperando.
+        if is_blank(grid[Line(line)][Column(0)].c) || line < 1 {
+            return;
+        }
+        let line = Line(line - 1);
+        let (end, next) = text_extent(&grid[line], cols);
+        if chip_kind(&grid[line][Column(0)]) != Some(CHIP_DIR) {
+            let text: String = (0..end).map(|col| grid[line][Column(col)].c).collect();
+            if !(text.starts_with('~') || text.starts_with('/')) || !text.contains(&needle) {
+                return;
+            }
+        }
+
+        // Lo que debe decir la línea: «carpeta rama cambios». Lo que el shell ponga a la
+        // derecha (el reloj de powerlevel10k) se borra: la línea es solo de las cajas.
+        let _ = next;
+        let avail = cols;
+        let extras: Vec<(char, String)> = [
+            branch.map(|b| (CHIP_BRANCH, b.to_string())),
+            branch.and(changes).map(|n| (CHIP_CHANGES, n.to_string())),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let extras_len: usize = extras.iter().map(|(_, t)| t.chars().count() + 1).sum();
+        let mut path: Vec<char> = proc::pretty_path(&self.cwd).chars().collect();
+        let (max_path, extras) = if avail >= extras_len + 6 {
+            (avail - extras_len, extras)
+        } else {
+            (avail, Vec::new())
+        };
+        if path.len() > max_path && max_path > 1 {
+            // Se recorta por el principio: lo que importa es dónde acaba la ruta.
+            path = std::iter::once('…')
+                .chain(path[path.len() - (max_path - 1)..].iter().copied())
+                .collect();
+        }
+        let mut want: Vec<(char, Option<char>)> = Vec::new();
+        for (kind, text) in
+            std::iter::once((CHIP_DIR, path.into_iter().collect::<String>())).chain(extras)
+        {
+            if !want.is_empty() {
+                want.push((' ', None));
+            }
+            for (i, c) in text.chars().enumerate() {
+                want.push((c, (i == 0).then_some(kind)));
+            }
+        }
+        want.truncate(cols);
+
+        let span = cols;
+        let same = (0..span).all(|col| {
+            let cell = &grid[line][Column(col)];
+            let have = (if cell.c == '\0' { ' ' } else { cell.c }, chip_kind(cell));
+            have == want.get(col).copied().unwrap_or((' ', None))
+        });
+        if same {
+            return;
+        }
+        for col in 0..span {
+            let (c, kind) = want.get(col).copied().unwrap_or((' ', None));
+            let mut cell = Cell {
+                c,
+                ..Default::default()
+            };
+            if let Some(kind) = kind {
+                cell.push_zerowidth(kind);
+            }
+            grid[line][Column(col)] = cell;
+        }
+    }
+
+    /// Líneas de cajas visibles ahora mismo.
+    pub fn chip_rows(&self) -> Vec<ChipRow> {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cols = grid.columns();
+        let offset = grid.display_offset() as i32;
+        let mut out = Vec::new();
+        for row in 0..grid.screen_lines() as i32 {
+            let cells = &grid[Line(row - offset)];
+            if chip_kind(&cells[Column(0)]) != Some(CHIP_DIR) {
+                continue;
+            }
+            let (end, next) = text_extent(cells, cols);
+            let mut parts: Vec<(char, String)> = Vec::new();
+            for col in 0..end {
+                let cell = &cells[Column(col)];
+                if let Some(kind) = chip_kind(cell) {
+                    parts.push((kind, String::new()));
+                }
+                if let Some((_, text)) = parts.last_mut() {
+                    text.push(cell.c);
+                }
+            }
+            for (_, text) in &mut parts {
+                *text = text.trim().to_string();
+            }
+            out.push(ChipRow {
+                row,
+                end,
+                next,
+                parts,
+            });
+        }
+        out
     }
 
     /// Deja `cmd` escrito en el prompt, en lugar de lo que hubiera, sin ejecutarlo.

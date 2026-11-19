@@ -29,7 +29,6 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 const TAB_BAR_H: f32 = 38.0;
-const STATUS_H: f32 = 32.0;
 /// Colores que se le pueden poner a una pestaña desde su menú (clic derecho).
 /// El nombre es el que se guarda en `session.toml`.
 const TAB_COLORS: [(&str, Color32); 7] = [
@@ -193,6 +192,10 @@ struct App {
     tab_layout: (f32, f32),
     /// Comandos que muestra el historial, del más reciente al más antiguo.
     history: Vec<String>,
+    /// Lo que ofrece el desplegable de una caja del prompt (ramas, o carpetas y archivos)
+    /// y dónde se ancla en pantalla.
+    picks: Vec<overlay::Pick>,
+    pick_anchor: Pos2,
     /// Rama y cambios de la carpeta de la pestaña activa (barra de estado).
     git: git::Watch,
     /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
@@ -248,6 +251,8 @@ impl App {
             drag_tab: None,
             tab_layout: (0.0, 0.0),
             history: Vec::new(),
+            picks: Vec::new(),
+            pick_anchor: Pos2::ZERO,
             git: git::Watch::new(),
             script_keys: Vec::new(),
             script_pointer: Vec::new(),
@@ -333,6 +338,61 @@ impl App {
             state::save(&path, &now);
             self.saved = now;
         }
+    }
+
+    /// Abre el desplegable de una caja del prompt, anclado en `at`: las ramas del repo
+    /// (caja de la rama) o lo que hay en la carpeta (caja de la carpeta).
+    fn open_picker(&mut self, ctx: &egui::Context, chip: char, at: Pos2) {
+        use overlay::{Pick, PickKind};
+        let Some(cwd) = self.sessions.get(self.active).map(|s| s.cwd.clone()) else {
+            return;
+        };
+        let mut picks: Vec<Pick> = Vec::new();
+        if chip == session::CHIP_BRANCH {
+            let current = git::branch(&cwd);
+            for name in git::branches(&cwd) {
+                let kind = if Some(&name) == current.as_ref() {
+                    PickKind::CurrentBranch
+                } else {
+                    PickKind::Branch
+                };
+                picks.push(Pick { kind, name });
+            }
+            // La rama en la que estás va primero.
+            picks.sort_by_key(|p| p.kind != PickKind::CurrentBranch);
+        } else {
+            if cwd.parent().is_some() {
+                picks.push(Pick {
+                    kind: PickKind::Parent,
+                    name: "..".into(),
+                });
+            }
+            let mut entries: Vec<(bool, String)> = std::fs::read_dir(&cwd)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    Some((!e.path().is_dir(), name))
+                })
+                .collect();
+            // Carpetas primero, luego archivos; cada grupo por nombre.
+            entries.sort_by(|a, b| (a.0, a.1.to_lowercase()).cmp(&(b.0, b.1.to_lowercase())));
+            picks.extend(entries.into_iter().take(2000).map(|(file, name)| Pick {
+                kind: if file { PickKind::File } else { PickKind::Dir },
+                name,
+            }));
+        }
+        if picks.is_empty() {
+            return;
+        }
+        self.picks = picks;
+        self.pick_anchor = at;
+        self.overlay = overlay::Overlay::Picker {
+            query: String::new(),
+            sel: 0,
+        };
+        ctx.request_repaint();
     }
 
     /// Lee el historial del shell y le suma lo tecleado aquí (primero la pestaña activa).
@@ -757,6 +817,20 @@ impl App {
                     match what.as_str() {
                         "prefs" => Cmd::Prefs,
                         "history" => Cmd::History,
+                        "branches" | "dirs" => {
+                            let at = self
+                                .sessions
+                                .get(self.active)
+                                .and_then(|s| s.chips_px.last().map(|(r, _)| r.left_bottom()))
+                                .unwrap_or(Pos2::new(40.0, 80.0));
+                            let kind = if what == "dirs" {
+                                session::CHIP_DIR
+                            } else {
+                                session::CHIP_BRANCH
+                            };
+                            self.open_picker(ctx, kind, at);
+                            return;
+                        }
                         _ => Cmd::Palette,
                     },
                 );
@@ -1917,24 +1991,41 @@ impl eframe::App for App {
             self.complete_key(&ctx);
         }
         let keyboard = !self.search_focus && self.overlay == overlay::Overlay::None;
-        if self.cfg.status_bar
-            && let Some(s) = self.sessions.get(self.active)
-        {
-            let (cwd, activity) = (s.cwd.clone(), s.activity);
-            let info = self.git.info(&ctx, &cwd, activity);
-            egui::Panel::bottom("status")
-                .exact_size(STATUS_H)
-                .show_separator_line(false)
-                .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
-                .show(ui, |ui| status_bar(ui, &pal, &cwd, info.as_ref()));
-        }
+        // Carpeta y rama en cajas, en la propia línea del prompt.
+        let chips = self
+            .sessions
+            .get(self.active)
+            .filter(|_| self.cfg.status_bar)
+            .map(|s| (s.cwd.clone(), s.activity))
+            .map(|(cwd, activity)| {
+                let info = self.git.info(&ctx, &cwd, activity);
+                (cwd, info)
+            });
+        let mut chip_clicked = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
             .show(ui, |ui| {
                 if let Some(s) = self.sessions.get_mut(self.active) {
-                    view::show(ui, s, &pal, &metrics, focused, keyboard);
+                    if let Some((_, info)) = &chips {
+                        s.stamp_prompt(
+                            info.as_ref().map(|i| i.branch.as_str()),
+                            info.as_ref().and_then(|i| i.changes),
+                        );
+                    }
+                    view::show(ui, s, &pal, &metrics, focused, keyboard, chips.is_some());
+                    // Solo las cajas del prompt en uso son botones; las de arriba son historia.
+                    let live = s.at_prompt().then(|| s.chips_px.len().saturating_sub(1));
+                    for (i, (area, parts)) in s.chips_px.iter().enumerate() {
+                        if let Some(hit) = prompt_chips(ui, &pal, *area, parts, live == Some(i)) {
+                            chip_clicked = Some(hit);
+                        }
+                    }
                 }
             });
+
+        if let Some((chip, rect)) = chip_clicked {
+            self.open_picker(&ctx, chip, rect.left_bottom());
+        }
 
         // Los spinners se animan a ~30 cuadros por segundo con la ventana al frente;
         // en segundo plano basta con refrescar de vez en cuando.
@@ -1945,26 +2036,40 @@ impl eframe::App for App {
     }
 }
 
-/// Barra bajo la terminal: una caja por dato (carpeta, rama de git, archivos con cambios).
-fn status_bar(ui: &mut egui::Ui, pal: &Palette, cwd: &std::path::Path, git: Option<&git::Info>) {
+/// Una caja por dato (carpeta, rama de git, archivos con cambios) de una línea de cajas,
+/// pintadas en `full`: el hueco de esa línea en pantalla. Con `live`, las cajas de la
+/// carpeta y de la rama se pueden pulsar: devuelve cuál (su marca) y dónde está.
+fn prompt_chips(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    full: Rect,
+    parts: &[(char, String)],
+    live: bool,
+) -> Option<(char, Rect)> {
+    let mut clicked = None;
     #[derive(Clone, Copy)]
     enum Icon {
         Folder,
         Branch,
         None,
     }
-    let full = ui.max_rect();
-    let font = FontId::new(11.5, FontFamily::Name("term-bold".into()));
-    let mut chips = vec![(Icon::Folder, proc::pretty_path(cwd), pal.fg)];
-    if let Some(info) = git {
-        chips.push((Icon::Branch, info.branch.clone(), pal.done));
-        if let Some(n) = info.changes {
-            let color = if n > 0 { pal.ansi[3] } else { pal.muted };
-            chips.push((Icon::None, format!("± {n}"), color));
-        }
-    }
-    let p = ui.painter();
-    let mut x = full.left() + 10.0;
+    let h = full.height();
+    let font = FontId::new(
+        (h * 0.66).clamp(9.0, 11.5),
+        FontFamily::Name("term-bold".into()),
+    );
+    let chips: Vec<(Icon, String, Color32)> = parts
+        .iter()
+        .map(|(kind, text)| match *kind {
+            session::CHIP_BRANCH => (Icon::Branch, text.clone(), pal.done),
+            session::CHIP_CHANGES => {
+                let color = if text == "0" { pal.muted } else { pal.ansi[3] };
+                (Icon::None, format!("± {text}"), color)
+            }
+            _ => (Icon::Folder, text.clone(), pal.fg),
+        })
+        .collect();
+    let mut x = full.left();
     // La carpeta se recorta por el inicio si no cabe; las demás cajas tienen prioridad.
     let others: f32 = chips.len().saturating_sub(1) as f32 * 120.0;
     for (icon, text, color) in chips {
@@ -1979,15 +2084,31 @@ fn status_bar(ui: &mut egui::Ui, pal: &Palette, cwd: &std::path::Path, git: Opti
         };
         let galley = elided(ui.ctx(), &text, &font, color, max_w);
         let w = 9.0 + icon_w + galley.size().x + 9.0;
-        let rect = Rect::from_min_size(Pos2::new(x, full.center().y - 11.0), Vec2::new(w, 22.0));
-        if rect.right() > full.right() - 6.0 {
+        let rect = Rect::from_min_size(Pos2::new(x, full.top()), Vec2::new(w, h));
+        if rect.right() > full.right() {
             break;
         }
+        let button = match icon {
+            Icon::Folder => Some((session::CHIP_DIR, "Ir a otra carpeta")),
+            Icon::Branch => Some((session::CHIP_BRANCH, "Cambiar de rama")),
+            Icon::None => None,
+        }
+        .filter(|_| live);
+        let hovered = button.is_some_and(|(chip, tip)| {
+            let resp = ui.interact(rect, ui.scope_id().with(("chip", chip)), Sense::click());
+            if resp.clicked() {
+                clicked = Some((chip, rect));
+            }
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(tip)
+                .hovered()
+        });
+        let p = ui.painter();
         p.rect_filled(rect, CornerRadius::same(5), pal.panel);
         p.rect_stroke(
             rect,
             CornerRadius::same(5),
-            Stroke::new(1.0, pal.border),
+            Stroke::new(1.0, if hovered { color } else { pal.border }),
             StrokeKind::Inside,
         );
         let c = Pos2::new(rect.left() + 9.0 + 6.0, rect.center().y);
@@ -2019,6 +2140,7 @@ fn status_bar(ui: &mut egui::Ui, pal: &Palette, cwd: &std::path::Path, git: Opti
         );
         x = rect.right() + 6.0;
     }
+    clicked
 }
 
 /// Carpeta (con su pestaña) u hoja de archivo, dibujadas a mano.

@@ -106,6 +106,31 @@ pub fn branch(dir: &Path) -> Option<String> {
     })
 }
 
+/// Ramas locales del repo de `dir`, de la que tuvo el commit más reciente a la más antigua.
+pub fn branches(dir: &Path) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn changes(dir: &Path) -> Option<usize> {
     // --no-optional-locks: no tocar el índice, para no estorbar a un git que esté corriendo.
     let out = std::process::Command::new("git")
