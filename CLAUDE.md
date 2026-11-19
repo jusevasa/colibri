@@ -33,7 +33,7 @@ No hay pruebas de interfaz; en su lugar existe un guion de depuración (`src/deb
 COLIBRI_SCRIPT=pasos.txt COLIBRI_CONFIG=/ruta/tmp/config.toml cargo run
 ```
 
-Un paso por línea: `type <texto>` (`\n` = Enter), `wait <ms>`, `tab`, `select <n>`, `move <de> <a>`, `agent next|prev`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`, `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab` (pulsa la tecla como si viniera del teclado), `press|moveto|release <x> <y>` (puntero simulado, en puntos de la ventana), `rclick <x> <y>` (clic derecho), `pref <id> <+1|-1>`, `update` (fuerza el botón «Actualizar»), `quit`. Las líneas que no se reconocen se ignoran en silencio. Los `id` de `pref` son los de `PREF_ROWS` en `src/overlay.rs`.
+Un paso por línea: `type <texto>` (`\n` = Enter), `wait <ms>`, `tab`, `select <n>`, `move <de> <a>`, `agent next|prev`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`, `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab|paste` (pulsa la tecla como si viniera del teclado; `paste` equivale a ⌘V), `press|moveto|release <x> <y>` (puntero simulado, en puntos de la ventana), `rclick <x> <y>` (clic derecho), `pref <id> <+1|-1>`, `update` (fuerza el botón «Actualizar»), `quit`. Las líneas que no se reconocen se ignoran en silencio. Los `id` de `pref` son los de `PREF_ROWS` en `src/overlay.rs`.
 
 Variables de entorno para no pisar los archivos reales del usuario:
 
@@ -53,6 +53,7 @@ Al añadir una función a la interfaz que deba poder verificarse, añade tambié
 - **`history.rs`** — lee el historial del shell (zsh, bash, fish; respeta `$HISTFILE`) para la lista que abre `↑` en el prompt.
 - **`complete.rs`** — sugerencias de carpetas y archivos para la palabra que se teclea en el prompt (Tab); solo lee el disco.
 - **`git.rs`** — rama (`.git/HEAD`) y archivos con cambios (`git status` en un hilo) para las cajas del prompt.
+- **`clip.rs`** — ⌘C/⌘X/⌘V: eframe arranca con `clipboard_shortcuts: false` y `clip::translate` (en `raw_input_hook`) convierte esas teclas en `Copy`/`Cut`/`Paste`/`PasteImage` leyendo NSPasteboard. Orden al pegar: archivos (`public.file-url`: lo que deja Finder y lo que llega del iPhone por Continuity) → se pega la ruta escapada; texto → se pega; imagen suelta (captura) → Ctrl+V para que el programa la lea él mismo, sin que Colibrí la toque. egui por sí solo ignoraba el ⌘V con archivos.
 - **`hotkey.rs`**, **`menu.rs`** — FFI de macOS: atajo global (Carbon) y «Reiniciar Colibrí» en el menú de la aplicación.
 - **`state.rs`** — pestañas abiertas persistidas en `session.toml` (carpeta, nombre y agente; no los procesos).
 - **`proc.rs`** — consultas puntuales por pid vía libc/libproc (cwd, argv, padre, nombre). **`procs.rs`** y **`ports.rs`** — hilos de fondo que ejecutan `ps`/`vm_stat` y `lsof` y publican en un `Arc<Mutex<…>>`.

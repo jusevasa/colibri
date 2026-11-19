@@ -2,6 +2,7 @@
 //! Sin telemetría: la app no abre ninguna conexión de red propia.
 
 mod blur;
+mod clip;
 mod complete;
 mod config;
 mod debug;
@@ -57,6 +58,8 @@ fn main() -> eframe::Result {
             .with_titlebar_shown(false)
             .with_title_shown(false)
             .with_transparent(true),
+        // ⌘C/⌘X/⌘V los traduce `clip::translate`, que sí ve las imágenes de Continuity.
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -875,6 +878,7 @@ impl App {
                     "enter" => "Enter",
                     "esc" => "Escape",
                     "tab" => "Tab",
+                    "paste" => "Paste",
                     other => other,
                 };
                 self.script_keys.extend(egui::Key::from_name(name));
@@ -1869,6 +1873,7 @@ impl eframe::App for App {
                 });
             }
         }
+        clip::translate(&mut raw.events);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

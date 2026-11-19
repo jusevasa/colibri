@@ -1,7 +1,7 @@
 //! Guion de depuración: COLIBRI_SCRIPT=archivo ejecuta pasos y guarda capturas del propio render.
 //! Pasos (uno por línea): `type <texto>` (\n = Enter), `wait <ms>`, `tab`, `select <n>`,
 //! `move <de> <a>`, `agent next|prev`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`,
-//! `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab`,
+//! `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab|paste`,
 //! `press <x> <y>`, `moveto <x> <y>`, `release <x> <y>`, `rclick <x> <y>`, `pref <id> <+1|-1>`, `update`, `quit`.
 
 use std::collections::VecDeque;
@@ -28,7 +28,8 @@ pub enum Step {
     Pref(String, i32),
     /// Pone nombre a la pestaña activa.
     Name(String),
-    /// Pulsa una tecla como si viniera del teclado: `key up|down|enter|esc|tab`.
+    /// Pulsa una tecla como si viniera del teclado: `key up|down|enter|esc|tab|paste`
+    /// (`paste` hace lo mismo que ⌘V con lo que haya en el portapapeles).
     Key(String),
     /// Puntero simulado, en puntos de la ventana: `press`, `moveto` o `release` + `<x> <y>`;
     /// `rclick` es un clic derecho completo.
