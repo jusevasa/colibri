@@ -204,6 +204,10 @@ pub struct Session {
     /// Filas en pantalla que se pintan corridas a la izquierda (sin el símbolo del prompt)
     /// y cuántas celdas; el ratón tiene que deshacer ese corrimiento.
     pub row_shifts: Vec<(i32, usize)>,
+    /// Comando sugerido en gris en el prompt vacío (al restaurar una pestaña donde corría
+    /// un agente). No está escrito en el shell: se acepta con Tab/→ o se ejecuta con
+    /// Enter; cualquier otra tecla lo descarta.
+    pub suggestion: Option<String>,
     /// Lo tecleado en el prompt desde el último Enter. None = se perdió la pista
     /// (hubo teclas de edición: flechas, tabulador…).
     line: Option<String>,
@@ -307,6 +311,7 @@ impl Session {
             cursor_px: None,
             chips_px: Vec::new(),
             row_shifts: Vec::new(),
+            suggestion: None,
             line: Some(String::new()),
             typed: Vec::new(),
             activity: 0,
@@ -323,6 +328,7 @@ impl Session {
 
     /// Entrada del usuario (teclado o pegar).
     pub fn input(&mut self, bytes: Vec<u8>) {
+        self.suggestion = None;
         self.track(&bytes);
         self.last_input = Instant::now();
         self.term.lock().scroll_display(Scroll::Bottom);
@@ -368,6 +374,22 @@ impl Session {
                         line.push(c);
                     }
                 }
+            }
+        }
+    }
+
+    /// La sugerencia, si ahora mismo se puede mostrar: prompt del shell y nada escrito.
+    pub fn suggested(&self) -> Option<&str> {
+        let text = self.suggestion.as_deref()?;
+        (self.line.as_deref() == Some("") && self.at_prompt()).then_some(text)
+    }
+
+    /// Escribe la sugerencia en el prompt y, con `run`, la ejecuta.
+    pub fn accept_suggestion(&mut self, run: bool) {
+        if let Some(cmd) = self.suggestion.take() {
+            self.insert_command(&cmd);
+            if run {
+                self.input(b"\r".to_vec());
             }
         }
     }

@@ -271,7 +271,8 @@ impl App {
     }
 
     /// Reabre las pestañas de la última vez, cada una en su carpeta. Donde corría Claude Code
-    /// deja escrito `claude --continue` sin ejecutarlo: Enter retoma esa conversación.
+    /// deja `claude --continue` como sugerencia en gris (no lo escribe en el shell): Enter
+    /// retoma esa conversación, Tab o → lo deja escrito para editarlo.
     fn restore_tabs(&mut self, ctx: &egui::Context) {
         let Some(path) = self.state_path.clone().filter(|_| self.cfg.restore_tabs) else {
             return;
@@ -295,7 +296,7 @@ impl App {
             }
             if tab.agent == "claude" && self.sessions.len() > before {
                 if let Some(s) = self.sessions.last_mut() {
-                    s.input(b"claude --continue".to_vec());
+                    s.suggestion = Some("claude --continue".into());
                 }
             }
         }
@@ -460,6 +461,30 @@ impl App {
 
     /// Tab en el prompt: sugiere carpetas y archivos para la palabra que se teclea. Si no se
     /// sabe qué hay escrito, o nada coincide, el Tab le llega al shell como siempre.
+    /// Con una sugerencia en gris en el prompt: Enter la ejecuta, Tab o → la dejan escrita.
+    fn suggest_key(&mut self, ctx: &egui::Context) {
+        let Some(s) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        if s.suggested().is_none() {
+            return;
+        }
+        let key = |key| Shortcut {
+            cmd: false,
+            ctrl: false,
+            shift: false,
+            alt: false,
+            key,
+        };
+        if take_shortcut(ctx, &key(egui::Key::Enter)) {
+            s.accept_suggestion(true);
+        } else if take_shortcut(ctx, &key(egui::Key::Tab))
+            || take_shortcut(ctx, &key(egui::Key::ArrowRight))
+        {
+            s.accept_suggestion(false);
+        }
+    }
+
     fn complete_key(&mut self, ctx: &egui::Context) {
         if !self.cfg.complete_popup {
             return;
@@ -1988,6 +2013,7 @@ impl eframe::App for App {
         let metrics = self.metrics(&ctx);
         let focused = self.focused;
         if !self.search_focus && self.overlay == overlay::Overlay::None {
+            self.suggest_key(&ctx);
             self.history_key(&ctx);
             self.complete_key(&ctx);
         }
@@ -2014,6 +2040,25 @@ impl eframe::App for App {
                         );
                     }
                     view::show(ui, s, &pal, &metrics, focused, keyboard, chips.is_some());
+                    // Sugerencia en gris a partir del cursor, con qué tecla hace qué.
+                    if let (Some(text), Some(cell)) = (s.suggested(), s.cursor_px) {
+                        let p = ui.painter();
+                        let at = cell.min + Vec2::new(3.0, metrics.text_dy);
+                        let r = p.text(
+                            at,
+                            Align2::LEFT_TOP,
+                            text,
+                            metrics.font.clone(),
+                            pal.muted.gamma_multiply(0.8),
+                        );
+                        p.text(
+                            Pos2::new(r.right() + 14.0, cell.center().y),
+                            Align2::LEFT_CENTER,
+                            "↩ ejecutar  ·  ⇥ escribir",
+                            FontId::proportional(10.5),
+                            pal.muted.gamma_multiply(0.55),
+                        );
+                    }
                     // Solo las cajas del prompt en uso son botones; las de arriba son historia.
                     let live = s.at_prompt().then(|| s.chips_px.len().saturating_sub(1));
                     for (i, (area, parts)) in s.chips_px.iter().enumerate() {
@@ -2098,26 +2143,34 @@ fn prompt_chips(
             break;
         }
         let button = match icon {
-            Icon::Folder => Some((session::CHIP_DIR, "Ir a otra carpeta")),
-            Icon::Branch => Some((session::CHIP_BRANCH, "Cambiar de rama")),
+            Icon::Folder => Some(session::CHIP_DIR),
+            Icon::Branch => Some(session::CHIP_BRANCH),
             Icon::None => None,
         }
         .filter(|_| live);
-        let hovered = button.is_some_and(|(chip, tip)| {
+        let hovered = button.is_some_and(|chip| {
             let resp = ui.interact(rect, ui.scope_id().with(("chip", chip)), Sense::click());
             if resp.clicked() {
                 clicked = Some((chip, rect));
             }
             resp.on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text(tip)
                 .hovered()
         });
+        // Al pasar el ratón la caja solo se aclara un poco: sin borde de color ni rótulo.
+        let (fill, border) = if hovered {
+            (
+                pal.panel.lerp_to_gamma(pal.fg, 0.09),
+                pal.border.lerp_to_gamma(pal.fg, 0.12),
+            )
+        } else {
+            (pal.panel, pal.border)
+        };
         let p = ui.painter();
-        p.rect_filled(rect, CornerRadius::same(5), pal.panel);
+        p.rect_filled(rect, CornerRadius::same(5), fill);
         p.rect_stroke(
             rect,
             CornerRadius::same(5),
-            Stroke::new(1.0, if hovered { color } else { pal.border }),
+            Stroke::new(1.0, border),
             StrokeKind::Inside,
         );
         let c = Pos2::new(rect.left() + 9.0 + 6.0, rect.center().y);
