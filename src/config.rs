@@ -20,6 +20,9 @@ pub struct Config {
     pub blur: bool,
     /// Forma del cursor: "block", "bar" o "underline".
     pub cursor: String,
+    /// El cursor parpadea mientras no escribes (repinta dos veces por segundo con la
+    /// ventana al frente).
+    pub cursor_blink: bool,
     pub scrollback: usize,
     /// Vacío = $SHELL
     pub shell: String,
@@ -103,6 +106,7 @@ impl Default for Config {
             opacity: 1.0,
             blur: false,
             cursor: "block".into(),
+            cursor_blink: false,
             scrollback: 10_000,
             shell: String::new(),
             notify: true,

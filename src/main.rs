@@ -894,6 +894,7 @@ impl App {
             cell_h,
             text_dy: ((cell_h - h) / 2.0).round(),
             pad: self.cfg.padding.clamp(0.0, 64.0),
+            blink: self.cfg.cursor_blink,
             cursor: match self.cfg.cursor.as_str() {
                 "bar" | "beam" => alacritty_terminal::vte::ansi::CursorShape::Beam,
                 "underline" => alacritty_terminal::vte::ansi::CursorShape::Underline,
@@ -2016,7 +2017,10 @@ impl eframe::App for App {
                     // Solo las cajas del prompt en uso son botones; las de arriba son historia.
                     let live = s.at_prompt().then(|| s.chips_px.len().saturating_sub(1));
                     for (i, (area, parts)) in s.chips_px.iter().enumerate() {
-                        if let Some(hit) = prompt_chips(ui, &pal, *area, parts, live == Some(i)) {
+                        let size = metrics.font.size;
+                        if let Some(hit) =
+                            prompt_chips(ui, &pal, *area, parts, live == Some(i), size)
+                        {
                             chip_clicked = Some(hit);
                         }
                     }
@@ -2045,6 +2049,7 @@ fn prompt_chips(
     full: Rect,
     parts: &[(char, String)],
     live: bool,
+    font_size: f32,
 ) -> Option<(char, Rect)> {
     let mut clicked = None;
     #[derive(Clone, Copy)]
@@ -2053,11 +2058,15 @@ fn prompt_chips(
         Branch,
         None,
     }
-    let h = full.height();
-    let font = FontId::new(
-        (h * 0.66).clamp(9.0, 11.5),
-        FontFamily::Name("term-bold".into()),
+    // Las cajas se suben un poco dentro de su fila (encima suele haber una línea en blanco,
+    // o el margen de la terminal) para dejar aire sobre la línea donde se escribe.
+    let full = Rect::from_min_max(
+        Pos2::new(full.left(), full.top() - 3.0),
+        Pos2::new(full.right(), full.bottom() - 5.0),
     );
+    let h = full.height();
+    // El mismo tamaño que el texto de la terminal (la caja mide una fila, así que cabe).
+    let font = FontId::new(font_size.min(h * 0.8), FontFamily::Name("term-bold".into()));
     let chips: Vec<(Icon, String, Color32)> = parts
         .iter()
         .map(|(kind, text)| match *kind {

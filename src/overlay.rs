@@ -66,13 +66,14 @@ pub enum Overlay {
     },
 }
 
-const PREF_ROWS: [(&str, &str); 18] = [
+const PREF_ROWS: [(&str, &str); 19] = [
     ("theme", "Tema"),
     ("font", "Fuente"),
     ("font_size", "Tamaño de fuente"),
     ("line_height", "Interlineado"),
     ("padding", "Margen"),
     ("cursor", "Cursor"),
+    ("cursor_blink", "Cursor parpadeante"),
     ("opacity", "Opacidad del fondo"),
     ("blur", "Desenfocar el fondo"),
     ("scrollback", "Historial por pestaña"),
@@ -953,6 +954,7 @@ impl App {
                 .to_string(),
                 None,
             ),
+            "cursor_blink" => (String::new(), Some(c.cursor_blink)),
             "scrollback" => (format!("{} líneas", c.scrollback), None),
             "blur" => (String::new(), Some(c.blur)),
             "restore_tabs" => (String::new(), Some(c.restore_tabs)),
@@ -1018,6 +1020,7 @@ impl App {
                     (c.scrollback as i64 + 1000 * dir as i64).clamp(1000, 100_000) as usize
             }
             "blur" => c.blur = !c.blur,
+            "cursor_blink" => c.cursor_blink = !c.cursor_blink,
             "restore_tabs" => c.restore_tabs = !c.restore_tabs,
             "notify" => c.notify = !c.notify,
             "history_popup" => c.history_popup = !c.history_popup,

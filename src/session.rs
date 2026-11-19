@@ -32,6 +32,9 @@ pub struct ChipRow {
     pub end: usize,
     pub next: usize,
     pub parts: Vec<(char, String)>,
+    /// Celdas que ocupa el símbolo del prompt («❯ ») al inicio de la fila siguiente; 0 si
+    /// esa fila no empieza por un símbolo suelto.
+    pub symbol: usize,
 }
 
 fn is_blank(c: char) -> bool {
@@ -198,6 +201,9 @@ pub struct Session {
     pub cursor_px: Option<egui::Rect>,
     /// Líneas de cajas en pantalla: su hueco y los datos de cada caja (se fija al pintar).
     pub chips_px: Vec<(egui::Rect, Vec<(char, String)>)>,
+    /// Filas en pantalla que se pintan corridas a la izquierda (sin el símbolo del prompt)
+    /// y cuántas celdas; el ratón tiene que deshacer ese corrimiento.
+    pub row_shifts: Vec<(i32, usize)>,
     /// Lo tecleado en el prompt desde el último Enter. None = se perdió la pista
     /// (hubo teclas de edición: flechas, tabulador…).
     line: Option<String>,
@@ -300,6 +306,7 @@ impl Session {
             scroll_acc: 0.0,
             cursor_px: None,
             chips_px: Vec::new(),
+            row_shifts: Vec::new(),
             line: Some(String::new()),
             typed: Vec::new(),
             activity: 0,
@@ -518,11 +525,21 @@ impl Session {
             for (_, text) in &mut parts {
                 *text = text.trim().to_string();
             }
+            // La fila de debajo es donde se escribe: suele empezar por «❯ », «$ », «% »…
+            let symbol = if row + 1 < grid.screen_lines() as i32 && cols > 2 {
+                let below = &grid[Line(row + 1 - offset)];
+                let (c0, c1) = (below[Column(0)].c, below[Column(1)].c);
+                let lone = !is_blank(c0) && !c0.is_alphanumeric() && !"/~.-_".contains(c0);
+                if lone && is_blank(c1) { 2 } else { 0 }
+            } else {
+                0
+            };
             out.push(ChipRow {
                 row,
                 end,
                 next,
                 parts,
+                symbol,
             });
         }
         out
@@ -533,6 +550,11 @@ impl Session {
         self.input(vec![0x15]);
         self.paste(cmd);
         self.line = Some(cmd.to_string());
+    }
+
+    /// Tiempo desde la última tecla (el cursor no parpadea mientras se escribe).
+    pub fn since_input(&self) -> Duration {
+        self.last_input.elapsed()
     }
 
     /// Informes de ratón: van al programa sin mover el scroll.

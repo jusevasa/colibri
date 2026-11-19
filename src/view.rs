@@ -22,6 +22,8 @@ pub struct Metrics {
     pub pad: f32,
     /// Forma del cursor cuando el programa no pide una.
     pub cursor: CursorShape,
+    /// El cursor parpadea mientras no se escribe.
+    pub blink: bool,
 }
 
 struct TextRun {
@@ -82,9 +84,11 @@ pub fn show(
     chips: bool,
 ) {
     let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-    let origin = rect.min + Vec2::new(m.pad, m.pad / 2.0);
+    // Arriba va el margen entero: la primera fila (a menudo las cajas del prompt) no debe
+    // quedar pegada a la barra de pestañas. Abajo basta con la mitad.
+    let origin = rect.min + Vec2::new(m.pad, m.pad);
     let cols = ((rect.width() - m.pad * 2.0) / m.cell_w).floor().max(2.0) as usize;
-    let lines = ((rect.height() - m.pad) / m.cell_h).floor().max(1.0) as usize;
+    let lines = ((rect.height() - m.pad * 1.5) / m.cell_h).floor().max(1.0) as usize;
     s.resize(cols, lines, m.cell_w, m.cell_h);
 
     // El foco de teclado es de la terminal (Tab, flechas y Esc no navegan la interfaz),
@@ -123,6 +127,21 @@ pub fn show(
             (area, c.parts.clone())
         })
         .collect();
+    // Bajo una línea de cajas no se pinta el símbolo del prompt («❯ »): la fila se corre a
+    // la izquierda para que se escriba desde el borde, y el cursor ahí es una barra.
+    s.row_shifts = chip_rows
+        .iter()
+        .filter(|c| c.symbol > 0)
+        .map(|c| (c.row + 1, c.symbol))
+        .collect();
+    let shifts = s.row_shifts.clone();
+    let shift_of = |row: i32| {
+        shifts
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map_or(0, |(_, n)| *n)
+    };
+    let prompt_bar = !shifts.is_empty() && s.at_prompt();
     let painter = ui.painter().with_clip_rect(rect);
     let mut bgs: Vec<BgRun> = Vec::new();
     let mut texts: Vec<TextRun> = Vec::new();
@@ -136,10 +155,16 @@ pub fn show(
         let offset = content.display_offset as i32;
         let colors = content.colors;
         let selection = content.selection;
+        let cursor_row = content.cursor.point.line.0 + offset;
         cursor = (
             content.cursor.shape,
-            content.cursor.point.line.0 + offset,
-            content.cursor.point.column.0,
+            cursor_row,
+            content
+                .cursor
+                .point
+                .column
+                .0
+                .saturating_sub(shift_of(cursor_row)),
         );
         let mut under_cursor = None;
 
@@ -154,6 +179,11 @@ pub fn show(
             if chip_rows.iter().any(|c| c.row == row && col < c.end) {
                 continue;
             }
+            let shift = shift_of(row);
+            if col < shift {
+                continue;
+            }
+            let col = col - shift;
             let width = if flags.contains(Flags::WIDE_CHAR) {
                 2
             } else {
@@ -283,35 +313,44 @@ pub fn show(
     } else {
         shape
     };
+    // En el prompt con cajas el cursor va del color de acento, como el resto del prompt.
+    let cursor_color = if prompt_bar { pal.accent } else { pal.cursor };
+    // Parpadeo: fijo mientras se escribe y medio segundo después; luego alterna cada 500 ms.
+    let blink_on = !m.blink || !focused || {
+        let ms = s.since_input().as_millis() as u64;
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500 - ms % 500));
+        (ms / 500) % 2 == 0
+    };
     if shape != CursorShape::Hidden && crow >= 0 && (crow as usize) < lines {
         let min = cell_pos(crow, ccol);
         let cell = Rect::from_min_size(min, Vec2::new(m.cell_w, m.cell_h));
         s.cursor_px = Some(cell);
         if !focused {
             painter.rect_stroke(cell, 0.0, Stroke::new(1.0, pal.cursor), StrokeKind::Inside);
-        } else {
+        } else if blink_on {
             match shape {
                 CursorShape::Beam => {
                     painter.rect_filled(
                         Rect::from_min_size(min, Vec2::new(2.0, m.cell_h)),
-                        0.0,
-                        pal.cursor,
+                        1.0,
+                        cursor_color,
                     );
                 }
                 CursorShape::Underline => {
                     let r = Rect::from_min_max(Pos2::new(min.x, min.y + m.cell_h - 2.0), cell.max);
-                    painter.rect_filled(r, 0.0, pal.cursor);
+                    painter.rect_filled(r, 0.0, cursor_color);
                 }
                 CursorShape::HollowBlock => {
                     painter.rect_stroke(
                         cell,
                         0.0,
-                        Stroke::new(1.0, pal.cursor),
+                        Stroke::new(1.0, cursor_color),
                         StrokeKind::Inside,
                     );
                 }
                 _ => {
-                    painter.rect_filled(cell, 0.0, pal.cursor);
+                    painter.rect_filled(cell, 0.0, cursor_color);
                     if let Some((c, bold)) = cursor_cell_fg {
                         if c != ' ' && c != '\0' {
                             let font = if bold { m.bold.clone() } else { m.font.clone() };
@@ -342,8 +381,14 @@ pub fn show(
 fn grid_point(pos: Pos2, origin: Pos2, m: &Metrics, s: &Session, offset: usize) -> (Point, Side) {
     let x = ((pos.x - origin.x) / m.cell_w).max(0.0);
     let y = ((pos.y - origin.y) / m.cell_h).max(0.0);
-    let col = (x.floor() as usize).min(s.size.cols - 1);
     let row = (y.floor() as usize).min(s.size.lines - 1);
+    // Las filas pintadas sin el símbolo del prompt están corridas a la izquierda.
+    let shift = s
+        .row_shifts
+        .iter()
+        .find(|(r, _)| *r == row as i32)
+        .map_or(0, |(_, n)| *n);
+    let col = (x.floor() as usize + shift).min(s.size.cols - 1);
     let side = if x.fract() > 0.5 {
         Side::Right
     } else {
