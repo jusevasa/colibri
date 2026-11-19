@@ -936,7 +936,6 @@ impl App {
         let ctx = ui.ctx().clone();
         let pal = self.pal.clone();
         let full = ui.max_rect();
-        let time = ui.input(|i| i.time);
         let n = self.sessions.len().max(1);
         let show_update = self.update_ready || self.force_update;
         let right_reserved = if show_update { 252.0 } else { 158.0 };
@@ -1056,7 +1055,7 @@ impl App {
             let ind = Pos2::new(rect.left() + 14.0, rect.center().y);
             if s.busy {
                 let color = s.agent.map(|a| a.color()).unwrap_or(pal.accent);
-                spinner(p, ind, 5.0, color, time);
+                spinner(p, ind, 5.0, color);
             } else if s.unseen {
                 p.circle_filled(ind, 4.0, pal.done);
             } else if let Some(a) = s.agent {
@@ -1340,7 +1339,6 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal.clone();
-        let time = ui.input(|i| i.time);
         let title_font = FontId::proportional(13.0);
         let small = FontId::proportional(11.5);
         let mut select = None;
@@ -1400,7 +1398,7 @@ impl App {
 
                 let dot = Pos2::new(tx + 4.0, rect.top() + 49.0);
                 let (label, color) = if s.busy {
-                    spinner(p, dot, 4.0, agent.color(), time);
+                    spinner(p, dot, 4.0, agent.color());
                     ("Trabajando…".to_string(), pal.fg)
                 } else if s.unseen {
                     p.circle_filled(dot, 3.5, pal.done);
@@ -2081,11 +2079,10 @@ impl eframe::App for App {
             self.open_picker(&ctx, chip, rect.left_bottom());
         }
 
-        // Los spinners se animan a ~30 cuadros por segundo con la ventana al frente;
-        // en segundo plano basta con refrescar de vez en cuando.
+        // El indicador de «trabajando» no se anima; basta un refresco pausado para notar
+        // cuándo termina la tarea.
         if self.sessions.iter().any(|s| s.busy) {
-            let ms = if self.focused { 33 } else { 250 };
-            ctx.request_repaint_after(Duration::from_millis(ms));
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 }
@@ -2359,15 +2356,17 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
     ctx.set_fonts(defs);
 }
 
-fn spinner(p: &egui::Painter, center: Pos2, r: f32, color: Color32, time: f64) {
-    let start = (time * 5.5) as f32;
-    let points: Vec<Pos2> = (0..=14)
+/// Indicador de «trabajando»: media luna quieta (círculo con la mitad derecha rellena). No
+/// se anima a propósito: un spinner obligaba a repintar la ventana 30 veces por segundo.
+fn spinner(p: &egui::Painter, center: Pos2, r: f32, color: Color32) {
+    let half: Vec<Pos2> = (0..=12)
         .map(|i| {
-            let a = start + i as f32 / 14.0 * std::f32::consts::PI * 1.5;
+            let a = (i as f32 / 12.0 - 0.5) * std::f32::consts::PI;
             center + Vec2::new(a.cos(), a.sin()) * r
         })
         .collect();
-    p.add(egui::Shape::line(points, Stroke::new(1.6, color)));
+    p.add(egui::Shape::convex_polygon(half, color, Stroke::NONE));
+    p.circle_stroke(center, r - 0.6, Stroke::new(1.2, color));
 }
 
 /// Iconos dibujados a mano: no dependen de qué glifos tenga la fuente.
