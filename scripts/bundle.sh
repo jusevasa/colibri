@@ -3,6 +3,10 @@
 set -e
 cd "$(dirname "$0")/.."
 cargo build --release
+# La versión sale de Cargo.toml (única fuente: «0.2.0-beta.1»); el número de compilación
+# es el de commits, que solo crece. «Acerca de Colibrí» enseña «versión (compilación)».
+VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+BUILD=$(git rev-list --count HEAD 2>/dev/null || echo 0)
 APP=target/Colibri.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -19,7 +23,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>colibri</string>
   <key>CFBundleIconFile</key><string>Colibri</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
   <!-- Carpetas: «Abrir con → Colibrí», soltarlas en el icono del Dock y
