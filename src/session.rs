@@ -655,6 +655,8 @@ pub struct Session {
     pub cwd: PathBuf,
     pub fg_pid: i32,
     pub fg_name: String,
+    /// Nombre del proceso en primer plano tal cual lo da el sistema, para notar un `exec`.
+    fg_comm: String,
     /// Hay un ssh (o similar) entre el shell y el proceso en primer plano.
     remote: bool,
     /// A dónde apunta ese ssh, por sus argumentos (por si el servidor no dice su nombre).
@@ -817,6 +819,7 @@ impl Session {
             cwd: cwd.unwrap_or_default(),
             fg_pid: shell_pid,
             fg_name: String::new(),
+            fg_comm: String::new(),
             remote: false,
             remote_target: None,
             agent: None,
@@ -1535,9 +1538,14 @@ impl Session {
             self.last_poll = now;
             self.dirty = false;
             let fg = proc::foreground_pid(self.master_fd).unwrap_or(self.shell_pid);
-            if fg != self.fg_pid || self.fg_name.is_empty() {
+            // Se mira también el nombre: si el sondeo cae entre el `fork` del shell y el
+            // `exec` del programa, el pid nuevo aún se llama «zsh»; tras el `exec` el pid es
+            // el mismo, y sin esto la pestaña se quedaba en «zsh», sin agente y «Corriendo…».
+            let comm = proc::name(fg);
+            if fg != self.fg_pid || comm != self.fg_comm || self.fg_name.is_empty() {
                 self.fg_pid = fg;
-                self.fg_name = proc::name(fg);
+                self.fg_comm = comm.clone();
+                self.fg_name = comm;
                 if self
                     .fg_name
                     .chars()
