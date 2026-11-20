@@ -41,9 +41,11 @@ pub trait App {
     /// La ventana se cerró: la aplicación suelta lo suyo (pestañas, procesos).
     fn window_closed(&mut self, win: WindowId);
 
-    /// Cuántas ventanas nuevas quiere abrir la aplicación (se mira tras cada evento).
-    fn new_windows(&mut self) -> usize {
-        0
+    /// Las ventanas nuevas que quiere abrir la aplicación (se mira al arrancar y tras cada
+    /// evento), en orden: cada una con su posición y tamaño (`[x, y, ancho, alto]` en
+    /// puntos: la esquina de la ventana y el tamaño del contenido) o donde toque.
+    fn new_windows(&mut self) -> Vec<Option<[f32; 4]>> {
+        Vec::new()
     }
 
     /// Permite tocar la entrada cruda antes de que egui la vea.
@@ -205,12 +207,19 @@ struct Running {
 
 impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
     /// Crea una ventana con su pintor y su egui, y se la presenta a la aplicación.
-    fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<WindowId, String> {
+    fn open_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        frame: Option<[f32; 4]>,
+    ) -> Result<WindowId, String> {
         let ctx = egui::Context::default();
         // Escritorio: las ventanas hijas no se incrustan (aquí no hay ninguna).
         ctx.set_embed_viewports(false);
 
         let mut viewport = self.viewport.clone();
+        if let Some([_, _, w, h]) = frame {
+            viewport = viewport.with_inner_size([w, h]);
+        }
         // Como eframe: una ventana no nace más grande que el mayor monitor.
         if let Some(size) = viewport.inner_size {
             let mut largest = egui::Vec2::ZERO;
@@ -224,8 +233,23 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
                 viewport = viewport.with_inner_size(size.min(largest));
             }
         }
-        // Las ventanas nuevas, en cascada desde la que está al frente (como Terminal).
-        if let Some(front) = self.front()
+        // Donde se guardó, si cae en alguna pantalla (pudo desconectarse); si no, en
+        // cascada desde la que está al frente (como Terminal).
+        let saved_at = frame.map(|[x, y, ..]| egui::pos2(x, y)).filter(|p| {
+            event_loop.available_monitors().any(|m| {
+                let scale = m.scale_factor();
+                let at = m.position().to_logical::<f32>(scale);
+                let size = m.size().to_logical::<f32>(scale);
+                egui::Rect::from_min_size(
+                    egui::pos2(at.x, at.y),
+                    egui::vec2(size.width, size.height),
+                )
+                .contains(*p)
+            })
+        });
+        if let Some(at) = saved_at {
+            viewport = viewport.with_position(at);
+        } else if let Some(front) = self.front()
             && let Ok(at) = front.window.outer_position()
         {
             let at = at.to_logical::<f32>(front.window.scale_factor());
@@ -292,13 +316,6 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
         // ⌘C/⌘X/⌘V llegan como teclas: los traduce la aplicación (`clip::translate`).
         state.set_clipboard_shortcuts(false);
 
-        if self.app.is_none() {
-            let create = self
-                .create
-                .take()
-                .ok_or_else(|| "la aplicación ya se había creado".to_owned())?;
-            self.app = Some(create());
-        }
         if let Some(app) = &mut self.app {
             app.window_opened(id, &ctx);
         }
@@ -360,9 +377,9 @@ impl<F> Runner<F> {
             return;
         }
 
-        let wanted = self.app.as_mut().map_or(0, |app| app.new_windows());
-        for _ in 0..wanted {
-            if let Err(error) = self.open_window(event_loop) {
+        let wanted = self.app.as_mut().map(|app| app.new_windows());
+        for frame in wanted.into_iter().flatten() {
+            if let Err(error) = self.open_window(event_loop, frame) {
                 eprintln!("{error}");
             }
         }
@@ -670,12 +687,26 @@ impl Running {
 impl<F: FnOnce() -> Box<dyn App>> ApplicationHandler<UserEvent> for Runner<F> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.app.is_none()
-            && self.create.is_some()
-            && let Err(error) = self.open_window(event_loop)
+            && let Some(create) = self.create.take()
         {
-            self.error = Some(error);
-            event_loop.exit();
-            return;
+            // La aplicación primero: ella dice cuántas ventanas abrir (las de la última
+            // vez) y dónde.
+            let mut app = create();
+            let mut frames = app.new_windows();
+            self.app = Some(app);
+            if frames.is_empty() {
+                frames.push(None);
+            }
+            for frame in frames {
+                if let Err(error) = self.open_window(event_loop, frame) {
+                    eprintln!("{error}");
+                }
+            }
+            if self.windows.is_empty() {
+                self.error = Some("no se pudo abrir ninguna ventana".into());
+                event_loop.exit();
+                return;
+            }
         }
         self.after_event(event_loop);
     }

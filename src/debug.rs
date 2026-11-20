@@ -54,6 +54,8 @@ pub enum Step {
     /// Ventanas: `window new` abre una, `window close` cierra la del frente y
     /// `window <n>` trae al frente la n-ésima (por orden de apertura, desde 0).
     Window(String),
+    /// Elige la entrada de la barra de menús con ese título, como un clic.
+    Menu(String),
     Quit,
 }
 
@@ -104,6 +106,7 @@ impl Script {
                     "scroll" => Step::Scroll(arg.parse().ok()?),
                     "update" => Step::Update,
                     "window" => Step::Window(arg.to_string()),
+                    "menu" => Step::Menu(arg.to_string()),
                     "quit" => Step::Quit,
                     _ => return None,
                 })

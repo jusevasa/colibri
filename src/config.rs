@@ -75,6 +75,10 @@ pub struct Theme {
 pub struct Keys {
     pub new_tab: String,
     pub close_tab: String,
+    pub new_window: String,
+    pub close_window: String,
+    /// Reabre lo último que se cerró (pestaña o ventana).
+    pub reopen_closed: String,
     pub next_tab: String,
     pub prev_tab: String,
     /// Cambia la pestaña activa de posición.
@@ -165,6 +169,9 @@ impl Default for Keys {
         Self {
             new_tab: "cmd+t".into(),
             close_tab: "cmd+w".into(),
+            new_window: "cmd+n".into(),
+            close_window: "cmd+shift+w".into(),
+            reopen_closed: "cmd+shift+t".into(),
             next_tab: "cmd+alt+right".into(),
             prev_tab: "cmd+alt+left".into(),
             move_tab_left: "cmd+shift+left".into(),

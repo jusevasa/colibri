@@ -7,8 +7,41 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Default, PartialEq, Clone)]
 #[serde(default)]
 pub struct Saved {
+    /// Formato antiguo, de cuando había una sola ventana: se lee pero ya no se escribe.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub active: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<Tab>,
+    /// Las ventanas, de la que estaba al frente a la última.
+    pub windows: Vec<Window>,
+}
+
+#[derive(Serialize, Deserialize, Default, PartialEq, Clone)]
+#[serde(default)]
+pub struct Window {
     pub active: usize,
     pub tabs: Vec<Tab>,
+    /// Posición y tamaño en puntos: x e y de la esquina de la ventana, ancho y alto del
+    /// contenido. Vacío = donde la ponga el sistema.
+    pub frame: Option<[f32; 4]>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+impl Saved {
+    /// Las ventanas guardadas; un archivo del formato antiguo es una sola ventana.
+    pub fn windows(&self) -> Vec<Window> {
+        if self.windows.is_empty() && !self.tabs.is_empty() {
+            return vec![Window {
+                active: self.active,
+                tabs: self.tabs.clone(),
+                frame: None,
+            }];
+        }
+        self.windows.clone()
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, PartialEq, Clone)]
@@ -52,5 +85,44 @@ pub fn save(path: &PathBuf, saved: &Saved) {
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sesion_antigua_es_una_ventana() {
+        let old = "active = 1\n[[tabs]]\ncwd = \"/tmp\"\n[[tabs]]\ncwd = \"/\"\n";
+        let saved: Saved = toml::from_str(old).unwrap();
+        let windows = saved.windows();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].active, 1);
+        assert_eq!(windows[0].tabs.len(), 2);
+        assert_eq!(windows[0].frame, None);
+    }
+
+    #[test]
+    fn sesion_nueva_ida_y_vuelta() {
+        let saved = Saved {
+            windows: vec![
+                Window {
+                    active: 0,
+                    tabs: vec![Tab {
+                        cwd: "/tmp".into(),
+                        ..Default::default()
+                    }],
+                    frame: Some([10.0, 20.0, 800.0, 600.0]),
+                },
+                Window::default(),
+            ],
+            ..Default::default()
+        };
+        let text = toml::to_string(&saved).unwrap();
+        assert!(!text.contains("active = 0\n[[tabs]]"));
+        let back: Saved = toml::from_str(&text).unwrap();
+        assert!(back == saved);
+        assert_eq!(back.windows().len(), 2);
     }
 }

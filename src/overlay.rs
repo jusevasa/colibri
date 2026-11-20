@@ -927,6 +927,9 @@ impl App {
         let commands = [
             ("Nueva pestaña", Cmd::NewTab),
             ("Cerrar pestaña", Cmd::CloseTab),
+            ("Nueva ventana", Cmd::NewWindow),
+            ("Cerrar ventana", Cmd::CloseWindow),
+            ("Reabrir lo último cerrado", Cmd::ReopenClosed),
             ("Pestaña siguiente", Cmd::NextTab),
             ("Pestaña anterior", Cmd::PrevTab),
             ("Mover pestaña a la izquierda", Cmd::MoveTabLeft),

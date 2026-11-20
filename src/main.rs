@@ -87,6 +87,14 @@ fn main() -> Result<(), String> {
         .with_title_shown(false)
         .with_transparent(true);
     macos::install();
+    // Cada ventana es una ventana: sin esto, con «Preferir pestañas» en Ajustes, macOS
+    // juntaría las ventanas nuevas como pestañas suyas, encima de las nuestras.
+    unsafe {
+        let _: () = objc2::msg_send![
+            objc2::class!(NSWindow),
+            setAllowsAutomaticWindowTabbing: false
+        ];
+    }
     // ⌘C/⌘X/⌘V los traduce `clip::translate` (el lanzador apaga los atajos de egui).
     shell::run(viewport, || Box::new(App::new()))
 }
@@ -96,6 +104,9 @@ fn main() -> Result<(), String> {
 pub enum Cmd {
     NewTab,
     CloseTab,
+    NewWindow,
+    CloseWindow,
+    ReopenClosed,
     NextTab,
     PrevTab,
     MoveTabLeft,
@@ -132,6 +143,9 @@ impl Keys {
             (Cmd::Prefs, &k.preferences),
             (Cmd::NewTab, &k.new_tab),
             (Cmd::CloseTab, &k.close_tab),
+            (Cmd::NewWindow, &k.new_window),
+            (Cmd::CloseWindow, &k.close_window),
+            (Cmd::ReopenClosed, &k.reopen_closed),
             (Cmd::NextTab, &k.next_tab),
             (Cmd::PrevTab, &k.prev_tab),
             (Cmd::MoveTabLeft, &k.move_tab_left),
@@ -184,8 +198,16 @@ struct App {
     /// La última ventana que tuvo el foco: la que reciben lo que llega de fuera (Finder,
     /// atajo global, guion).
     front: Option<WindowId>,
-    /// Ventanas nuevas pedidas que el lanzador aún no ha abierto.
-    want_windows: usize,
+    /// Acciones elegidas en la barra de menús, para la siguiente `logic()`.
+    menu_cmds: Vec<Cmd>,
+    /// Ventanas nuevas pedidas que el lanzador aún no ha abierto, con su posición y tamaño.
+    want_windows: Vec<Option<[f32; 4]>>,
+    /// Qué va en cada una de esas ventanas, en el mismo orden.
+    opening: std::collections::VecDeque<Fill>,
+    /// Lo que se cerró hace poco, lo último al final (⌘⇧T lo reabre).
+    closed: Vec<Closed>,
+    /// Los atajos con que se construyó la barra de menús (`None` = aún no se ha puesto).
+    menu_keys: Option<config::Keys>,
     /// Las ventanas abiertas, por orden de apertura.
     order: Vec<WindowId>,
     next_id: u64,
@@ -259,7 +281,66 @@ pub struct Win {
     window_movable: Option<bool>,
     /// Zona de la terminal en el último cuadro (para que las listas usen todo su ancho).
     pub term_rect: Rect,
+    /// Posición y tamaño de la ventana (`[x, y, ancho, alto]` en puntos), para guardarla.
+    frame: Option<[f32; 4]>,
+    /// Título puesto a la ventana (el de su pestaña activa: lo enseña el menú Ventana).
+    title: String,
 }
+
+/// Lo que va en una ventana nueva.
+enum Fill {
+    /// Una pestaña en esa carpeta.
+    Fresh(Option<PathBuf>),
+    /// Las pestañas guardadas de la última vez.
+    Saved(state::Window),
+    /// Una ventana cerrada hace poco que se reabre.
+    Reopen(Vec<ClosedTab>, usize),
+}
+
+/// Una pestaña cerrada hace poco.
+struct ClosedTab {
+    saved: state::Tab,
+    /// La pestaña sigue viva durante `GRACE` (proceso, pantalla e historial) si en ella
+    /// corría un agente; si no, o pasado ese tiempo, solo queda lo guardado.
+    session: Option<Session>,
+    /// Llega `true` si algo de la pestaña escucha en un puerto: entonces se cierra ya, para
+    /// no dejar el puerto ocupado.
+    ports: Option<std::sync::mpsc::Receiver<bool>>,
+}
+
+/// Algo que se cerró hace poco: una pestaña (y de qué ventana y en qué puesto) o una ventana.
+struct Closed {
+    at: Instant,
+    what: ClosedWhat,
+}
+
+enum ClosedWhat {
+    Tab {
+        tab: ClosedTab,
+        win: WindowId,
+        index: usize,
+    },
+    Window {
+        tabs: Vec<ClosedTab>,
+        active: usize,
+        frame: Option<[f32; 4]>,
+    },
+}
+
+impl Closed {
+    fn tabs_mut(&mut self) -> impl Iterator<Item = &mut ClosedTab> {
+        let (one, many) = match &mut self.what {
+            ClosedWhat::Tab { tab, .. } => (Some(tab), None),
+            ClosedWhat::Window { tabs, .. } => (None, Some(tabs.iter_mut())),
+        };
+        one.into_iter().chain(many.into_iter().flatten())
+    }
+}
+
+/// Cuánto sigue viva una pestaña con agente después de cerrarla.
+const GRACE: Duration = Duration::from_secs(30);
+/// Cuántas cosas cerradas se recuerdan.
+const CLOSED_MAX: usize = 10;
 
 impl Win {
     fn new(ctx: &egui::Context) -> Self {
@@ -280,6 +361,8 @@ impl Win {
             preview: None,
             window_movable: None,
             term_rect: Rect::NOTHING,
+            frame: None,
+            title: String::new(),
         }
     }
 }
@@ -291,7 +374,7 @@ impl App {
         hotkey::set(hotkey::Global::Jump, &cfg.keys.global_jump);
         hotkey::set(hotkey::Global::Focus, &cfg.keys.global_focus);
         let script = debug::Script::from_env();
-        Self {
+        let mut app = Self {
             pal: Palette::new(&cfg.theme),
             keys: Keys::new(&cfg.keys),
             cfg_mtime: config::mtime(),
@@ -301,7 +384,10 @@ impl App {
             cur: None,
             parked: HashMap::new(),
             front: None,
-            want_windows: 0,
+            want_windows: Vec::new(),
+            opening: Default::default(),
+            closed: Vec::new(),
+            menu_keys: None,
             order: Vec::new(),
             next_id: 1,
             show_agents: cfg.show_agents,
@@ -331,8 +417,283 @@ impl App {
             script_drops: Vec::new(),
             badge: 0,
             secure: false,
+            menu_cmds: Vec::new(),
             cfg,
+        };
+        // Las ventanas de la última vez, cada una donde estaba. Si no hay ninguna, el
+        // lanzador abre una vacía.
+        if let Some(path) = app.state_path.clone().filter(|_| app.cfg.restore_tabs) {
+            let saved = state::load(&path);
+            for w in saved.windows() {
+                app.want_windows.push(w.frame);
+                app.opening.push_back(Fill::Saved(w));
+            }
+            app.saved = saved;
         }
+        app
+    }
+
+    fn win(&self, id: WindowId) -> Option<&Win> {
+        if self.cur == Some(id) {
+            Some(&self.w)
+        } else {
+            self.parked.get(&id)
+        }
+    }
+
+    /// Pide al lanzador una ventana nueva con una pestaña en esa carpeta.
+    fn new_window(&mut self, cwd: Option<PathBuf>) {
+        self.want_windows.push(None);
+        self.opening.push_back(Fill::Fresh(cwd));
+    }
+
+    /// Lo que queda de una pestaña al cerrarla: si en ella corría un agente sigue viva
+    /// `GRACE` (por si fue sin querer), salvo que algo suyo escuche en un puerto (eso se
+    /// mira en un hilo, porque `lsof` tarda).
+    fn bury(&self, s: Session) -> ClosedTab {
+        let saved = tab_record(&s);
+        if s.agent.is_none() {
+            return ClosedTab {
+                saved,
+                session: None,
+                ports: None,
+            };
+        }
+        s.set_shown(false);
+        let shell = s.shell_pid();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("colibri-closing".into())
+            .spawn(move || {
+                let busy = ports::listening_pids()
+                    .into_iter()
+                    .any(|pid| descends(pid, shell));
+                let _ = tx.send(busy);
+                shell::wake_all();
+            })
+            .ok();
+        ClosedTab {
+            saved,
+            session: Some(s),
+            ports: Some(rx),
+        }
+    }
+
+    fn remember(&mut self, what: ClosedWhat) {
+        self.closed.push(Closed {
+            at: Instant::now(),
+            what,
+        });
+        if self.closed.len() > CLOSED_MAX {
+            self.closed.remove(0);
+        }
+    }
+
+    /// Mantiene lo cerrado: las pestañas vivas se siguen atendiendo (un programa puede
+    /// esperar respuesta de la terminal) hasta que vence su plazo o resulta que tienen un
+    /// puerto abierto; entonces se cierran y solo queda lo guardado.
+    fn tend_closed(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let pal = &self.pal;
+        let mut next: Option<Duration> = None;
+        for closed in &mut self.closed {
+            let left = GRACE.saturating_sub(now - closed.at);
+            for tab in closed.tabs_mut() {
+                if let Some(rx) = &tab.ports {
+                    match rx.try_recv() {
+                        Ok(busy) => {
+                            tab.ports = None;
+                            if busy {
+                                tab.session = None;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => tab.ports = None,
+                    }
+                }
+                if left.is_zero() {
+                    tab.session = None;
+                }
+                if let Some(s) = &mut tab.session {
+                    s.drain(ctx, pal);
+                    next = Some(next.map_or(left, |n| n.min(left)));
+                }
+            }
+        }
+        if let Some(wait) = next {
+            ctx.request_repaint_after(wait);
+        }
+    }
+
+    /// Pone en la ventana en curso una pestaña cerrada: la misma si sigue viva, o una nueva
+    /// en su carpeta.
+    fn revive(&mut self, ctx: &egui::Context, tab: ClosedTab, at: Option<usize>) {
+        let i = at.unwrap_or(usize::MAX).min(self.w.sessions.len());
+        match tab.session {
+            Some(s) => {
+                s.set_context(ctx);
+                self.w.sessions.insert(i, s);
+            }
+            None => {
+                if !self.open_saved_tab(ctx, &tab.saved) {
+                    return;
+                }
+                let s = self.w.sessions.pop().expect("recién abierta");
+                self.w.sessions.insert(i, s);
+            }
+        }
+        self.w.active = i;
+        ctx.request_repaint();
+    }
+
+    /// ⌘⇧T: reabre lo último que se cerró. Una pestaña vuelve a su ventana y a su puesto
+    /// si la ventana sigue abierta; si no, a la del frente. Una ventana vuelve donde estaba.
+    fn reopen_closed(&mut self) {
+        let Some(closed) = self.closed.pop() else {
+            return;
+        };
+        match closed.what {
+            ClosedWhat::Tab { tab, win, index } => {
+                let back = self.cur;
+                let home = self.order.contains(&win);
+                if home {
+                    self.enter(win);
+                }
+                let ctx = self.w.ctx.clone();
+                self.revive(&ctx, tab, home.then_some(index));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+                if let Some(back) = back {
+                    self.enter(back);
+                }
+            }
+            ClosedWhat::Window {
+                tabs,
+                active,
+                frame,
+            } => {
+                self.want_windows.push(frame);
+                self.opening.push_back(Fill::Reopen(tabs, active));
+            }
+        }
+    }
+
+    /// La barra de menús. Las entradas de Colibrí llevan el atajo de la configuración.
+    fn menu_spec(&self) -> Vec<menu::Menu> {
+        use menu::{Action, Entry, Menu};
+        let sc = |cmd: Cmd| {
+            self.keys
+                .bindings
+                .iter()
+                .find(|(c, _, _)| *c == cmd)
+                .map(|(_, sc, _)| sc.clone())
+        };
+        let cmd = |title: &str, c: Cmd| Entry::item(title, Action::Cmd(c), sc(c));
+        let fixed = |text: &str| Shortcut::parse(text);
+        let system = |title: &str, sel: objc2::runtime::Sel, key: &str| {
+            Entry::item(title, Action::System(sel), fixed(key))
+        };
+        // Edición: la tecla vuelve a entrar como si se pulsara (portapapeles, zle…).
+        let key = |title: &str, k: egui::Key| {
+            Entry::item(
+                title,
+                Action::Key(
+                    k,
+                    egui::Modifiers {
+                        mac_cmd: true,
+                        command: true,
+                        ..Default::default()
+                    },
+                ),
+                Some(Shortcut {
+                    cmd: true,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                    key: k,
+                }),
+            )
+        };
+        use objc2::sel;
+        vec![
+            Menu {
+                title: "Colibrí".into(),
+                entries: vec![
+                    system("Acerca de Colibrí", sel!(orderFrontStandardAboutPanel:), ""),
+                    Entry::Separator,
+                    cmd("Preferencias…", Cmd::Prefs),
+                    cmd("Abrir config.toml", Cmd::OpenConfig),
+                    Entry::Separator,
+                    Entry::Services,
+                    Entry::Separator,
+                    system("Ocultar Colibrí", sel!(hide:), "cmd+h"),
+                    system("Ocultar otros", sel!(hideOtherApplications:), "cmd+alt+h"),
+                    system("Mostrar todo", sel!(unhideAllApplications:), ""),
+                    Entry::Separator,
+                    cmd("Reiniciar Colibrí", Cmd::Restart),
+                    system("Salir de Colibrí", sel!(terminate:), "cmd+q"),
+                ],
+            },
+            Menu {
+                title: "Archivo".into(),
+                entries: vec![
+                    cmd("Nueva ventana", Cmd::NewWindow),
+                    cmd("Nueva pestaña", Cmd::NewTab),
+                    Entry::Separator,
+                    cmd("Cerrar pestaña", Cmd::CloseTab),
+                    cmd("Cerrar ventana", Cmd::CloseWindow),
+                    cmd("Reabrir lo último cerrado", Cmd::ReopenClosed),
+                    Entry::Separator,
+                    cmd("Renombrar pestaña…", Cmd::RenameTab),
+                ],
+            },
+            Menu {
+                title: "Edición".into(),
+                entries: vec![
+                    key("Cortar", egui::Key::X),
+                    key("Copiar", egui::Key::C),
+                    key("Pegar", egui::Key::V),
+                    key("Seleccionar todo", egui::Key::A),
+                    Entry::Separator,
+                    cmd("Historial de comandos", Cmd::History),
+                    cmd("Limpiar pantalla e historial", Cmd::Clear),
+                ],
+            },
+            Menu {
+                title: "Visualización".into(),
+                entries: vec![
+                    cmd("Paleta de comandos", Cmd::Palette),
+                    Entry::Separator,
+                    cmd("Mostrar u ocultar paneles", Cmd::TogglePanel),
+                    cmd("Panel de agentes", Cmd::ToggleAgents),
+                    cmd("Panel de puertos", Cmd::TogglePorts),
+                    cmd("Panel de procesos", Cmd::ToggleProcs),
+                    Entry::Separator,
+                    cmd("Agrandar texto", Cmd::FontBigger),
+                    cmd("Reducir texto", Cmd::FontSmaller),
+                    cmd("Tamaño original", Cmd::FontReset),
+                    Entry::Separator,
+                    system("Pantalla completa", sel!(toggleFullScreen:), "cmd+ctrl+f"),
+                ],
+            },
+            Menu {
+                title: "Ventana".into(),
+                entries: vec![
+                    system("Minimizar", sel!(performMiniaturize:), "cmd+m"),
+                    system("Zoom", sel!(performZoom:), ""),
+                    Entry::Separator,
+                    cmd("Pestaña siguiente", Cmd::NextTab),
+                    cmd("Pestaña anterior", Cmd::PrevTab),
+                    cmd("Mover pestaña a la izquierda", Cmd::MoveTabLeft),
+                    cmd("Mover pestaña a la derecha", Cmd::MoveTabRight),
+                    Entry::Separator,
+                    cmd("Agente siguiente", Cmd::NextAgent),
+                    cmd("Agente anterior", Cmd::PrevAgent),
+                    cmd("Ir al agente que terminó", Cmd::JumpFinished),
+                    Entry::Separator,
+                    system("Traer todo al frente", sel!(arrangeInFront:), ""),
+                ],
+            },
+        ]
     }
 
     /// Hace de `win` la ventana en curso: aparta la que lo era y trae esa a `self.w`.
@@ -364,43 +725,45 @@ impl App {
         }
     }
 
-    /// Reabre las pestañas de la última vez, cada una en su carpeta. Donde corría Claude Code
-    /// deja `claude --continue` como sugerencia en gris (no lo escribe en el shell): Enter
-    /// retoma esa conversación, Tab o → lo deja escrito para editarlo.
-    fn restore_tabs(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.state_path.clone().filter(|_| self.cfg.restore_tabs) else {
-            return;
-        };
-        let saved = state::load(&path);
+    /// Abre en la ventana en curso una pestaña guardada, en su carpeta y con su nombre y su
+    /// color. Donde corría Claude Code deja `claude --continue` como sugerencia en gris (no
+    /// lo escribe en el shell): Enter retoma esa conversación, Tab o → lo deja escrito para
+    /// editarlo. Devuelve false si la carpeta ya no existe.
+    fn open_saved_tab(&mut self, ctx: &egui::Context, tab: &state::Tab) -> bool {
+        let dir = std::path::PathBuf::from(&tab.cwd);
+        if !dir.is_dir() {
+            return false;
+        }
+        let before = self.w.sessions.len();
+        self.new_tab(ctx, Some(dir));
+        if self.w.sessions.len() == before {
+            return false;
+        }
+        if let Some(s) = self.w.sessions.last_mut() {
+            s.name = tab.name.clone();
+            s.color = TAB_COLORS
+                .iter()
+                .position(|(name, _)| *name == tab.color)
+                .map(|k| k as u8);
+            if tab.agent == "claude" {
+                s.suggestion = Some("claude --continue".into());
+            }
+        }
+        true
+    }
+
+    /// Llena la ventana en curso con las pestañas guardadas de una ventana.
+    fn open_saved_window(&mut self, ctx: &egui::Context, saved: &state::Window) {
         for tab in &saved.tabs {
-            let dir = std::path::PathBuf::from(&tab.cwd);
-            if !dir.is_dir() {
-                continue;
-            }
-            let before = self.w.sessions.len();
-            self.new_tab(ctx, Some(dir));
-            if self.w.sessions.len() > before {
-                if let Some(s) = self.w.sessions.last_mut() {
-                    s.name = tab.name.clone();
-                    s.color = TAB_COLORS
-                        .iter()
-                        .position(|(name, _)| *name == tab.color)
-                        .map(|k| k as u8);
-                }
-            }
-            if tab.agent == "claude" && self.w.sessions.len() > before {
-                if let Some(s) = self.w.sessions.last_mut() {
-                    s.suggestion = Some("claude --continue".into());
-                }
-            }
+            self.open_saved_tab(ctx, tab);
         }
         if !self.w.sessions.is_empty() {
             self.w.active = saved.active.min(self.w.sessions.len() - 1);
         }
-        self.saved = saved;
     }
 
-    /// Guarda las pestañas cuando cambian (como mucho cada 2 s, y siempre al quedarse sin ninguna).
+    /// Guarda las ventanas y sus pestañas cuando cambian (como mucho cada 2 s, y siempre al
+    /// quedarse una ventana sin pestañas).
     fn save_tabs(&mut self) {
         let Some(path) = self.state_path.clone().filter(|_| self.cfg.restore_tabs) else {
             return;
@@ -409,27 +772,21 @@ impl App {
             return;
         }
         self.state_checked = Instant::now();
-        // Todas las ventanas en una sola lista, la de la ventana en curso primero.
-        // TODO(multiventana, paso 2): guardar cada ventana por separado.
+        // En el orden en que se abrieron, que es como se vuelven a abrir.
+        let windows = self
+            .order
+            .iter()
+            .filter_map(|win| self.win(*win))
+            .filter(|w| !w.sessions.is_empty())
+            .map(|w| state::Window {
+                active: w.active,
+                tabs: w.sessions.iter().map(tab_record).collect(),
+                frame: w.frame,
+            })
+            .collect();
         let now = state::Saved {
-            active: self.w.active,
-            tabs: self
-                .windows()
-                .flat_map(|w| w.sessions.iter())
-                .map(|s| state::Tab {
-                    cwd: s.cwd.display().to_string(),
-                    name: s.name.clone(),
-                    color: s
-                        .color
-                        .and_then(|k| TAB_COLORS.get(k as usize))
-                        .map(|(name, _)| name.to_string())
-                        .unwrap_or_default(),
-                    agent: match s.agent {
-                        Some(session::Agent::Claude) => "claude".into(),
-                        _ => String::new(),
-                    },
-                })
-                .collect(),
+            windows,
+            ..Default::default()
         };
         if now != self.saved {
             state::save(&path, &now);
@@ -722,7 +1079,11 @@ impl App {
         if i >= self.w.sessions.len() {
             return;
         }
-        self.w.sessions.remove(i);
+        let s = self.w.sessions.remove(i);
+        let tab = self.bury(s);
+        if let Some(win) = self.cur {
+            self.remember(ClosedWhat::Tab { tab, win, index: i });
+        }
         if self.w.active > i || self.w.active >= self.w.sessions.len() {
             self.w.active = self.w.active.saturating_sub(1);
         }
@@ -768,20 +1129,22 @@ impl App {
 
     /// Va al agente (o comando largo) que terminó más recientemente; primero los no vistos.
     fn jump_finished(&mut self) {
-        let best = |unseen_only: bool, sessions: &[Session], active: usize| {
-            sessions
-                .iter()
-                .enumerate()
-                .filter(|(i, s)| {
-                    *i != active && s.finished_at.is_some() && !s.busy && (!unseen_only || s.unseen)
+        let here = self.w.sessions.get(self.w.active).map(|s| s.id);
+        let best = |unseen_only: bool| {
+            self.windows()
+                .flat_map(|w| w.sessions.iter())
+                .filter(|s| {
+                    Some(s.id) != here
+                        && s.finished_at.is_some()
+                        && !s.busy
+                        && (!unseen_only || s.unseen)
                 })
-                .max_by_key(|(_, s)| s.finished_at)
-                .map(|(i, _)| i)
+                .max_by_key(|s| s.finished_at)
+                .map(|s| s.id)
         };
-        let target = best(true, &self.w.sessions, self.w.active)
-            .or_else(|| best(false, &self.w.sessions, self.w.active));
-        if let Some(i) = target {
-            self.select(i);
+        // En cualquier ventana: si está en otra, esa pasa al frente.
+        if let Some(id) = best(true).or_else(|| best(false)) {
+            self.focus_session(id);
         }
     }
 
@@ -873,6 +1236,17 @@ impl App {
                 self.new_tab(ctx, cwd);
             }
             Cmd::CloseTab => self.close_tab(self.w.active),
+            Cmd::NewWindow => {
+                let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
+                self.new_window(cwd);
+                // Para que el lanzador la abra ya (lo mira tras cada evento).
+                ctx.request_repaint();
+            }
+            Cmd::CloseWindow => ctx.send_viewport_cmd(ViewportCommand::Close),
+            Cmd::ReopenClosed => {
+                self.reopen_closed();
+                ctx.request_repaint();
+            }
             Cmd::NextTab if n > 0 => self.select((self.w.active + 1) % n),
             Cmd::PrevTab if n > 0 => self.select((self.w.active + n - 1) % n),
             Cmd::NextTab | Cmd::PrevTab => {}
@@ -1113,8 +1487,16 @@ impl App {
                 }
             }
             Some(debug::Step::Update) => self.force_update = !self.force_update,
+            Some(debug::Step::Menu(title)) => {
+                if !menu::perform(&title) {
+                    eprintln!("menú: no hay ninguna entrada «{title}»");
+                }
+            }
             Some(debug::Step::Window(what)) => match what.as_str() {
-                "new" => self.want_windows += 1,
+                "new" => {
+                    let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
+                    self.new_window(cwd);
+                }
                 "close" => ctx.send_viewport_cmd(ViewportCommand::Close),
                 n => {
                     if let Some(&win) = n.parse::<usize>().ok().and_then(|n| self.order.get(n)) {
@@ -2112,56 +2494,97 @@ impl shell::App for App {
         ctx.set_theme(egui::Theme::Dark);
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         install_fonts(ctx, &self.cfg);
-        let first = self.cur.is_none();
-        // La pestaña de la ventana nueva arranca en la carpeta de la que está al frente.
-        let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
+        // Sin nada pedido, una pestaña en la carpeta de la ventana del frente (o donde se
+        // arrancó Colibrí, la primera vez).
+        let here = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
+        let start_dir = here.clone().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .filter(|p| p.as_os_str() != "/")
+        });
+        let fill = self
+            .opening
+            .pop_front()
+            .unwrap_or_else(|| Fill::Fresh(start_dir.clone()));
         self.parked.insert(win, Win::new(ctx));
         self.order.push(win);
         self.enter(win);
         self.front = Some(win);
-        if first {
-            self.restore_tabs(ctx);
+        match fill {
+            Fill::Fresh(dir) => self.new_tab(ctx, dir),
+            Fill::Saved(saved) => self.open_saved_window(ctx, &saved),
+            Fill::Reopen(tabs, active) => {
+                for tab in tabs {
+                    self.revive(ctx, tab, None);
+                }
+                self.w.active = active.min(self.w.sessions.len().saturating_sub(1));
+            }
         }
         if self.w.sessions.is_empty() {
-            let start_dir = cwd.or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .filter(|p| p.as_os_str() != "/")
-            });
             self.new_tab(ctx, start_dir);
         }
     }
 
     fn window_closed(&mut self, win: WindowId) {
         self.order.retain(|w| *w != win);
-        // Soltar la `Win` cierra sus pestañas (PTY e hilos).
-        if self.cur == Some(win) {
+        // Saca la ventana y deja otra (si queda) como la ventana en curso.
+        let gone = if self.cur == Some(win) {
             let next = self.parked.keys().next().copied();
-            match next {
-                Some(next) => {
-                    self.enter(next);
-                    self.parked.remove(&win);
-                }
-                None => {
-                    self.w = Win::new(&egui::Context::default());
-                    self.cur = None;
-                }
+            let blank = Win::new(&egui::Context::default());
+            let gone = std::mem::replace(&mut self.w, blank);
+            self.cur = None;
+            if let Some(next) = next
+                && let Some(w) = self.parked.remove(&next)
+            {
+                self.w = w;
+                self.cur = Some(next);
             }
+            Some(gone)
         } else {
-            self.parked.remove(&win);
-        }
+            self.parked.remove(&win)
+        };
         if self.front == Some(win) {
             self.front = self.cur;
         }
+        // Sus pestañas quedan entre lo cerrado (⌘⇧T); las que siguen vivas piden sus
+        // cuadros a la ventana que queda. Si era la última, la aplicación sale y se sueltan.
+        if let Some(gone) = gone
+            && !gone.sessions.is_empty()
+            && self.cur.is_some()
+        {
+            let ctx = self.w.ctx.clone();
+            let tabs: Vec<ClosedTab> = gone
+                .sessions
+                .into_iter()
+                .map(|s| {
+                    s.set_context(&ctx);
+                    self.bury(s)
+                })
+                .collect();
+            self.remember(ClosedWhat::Window {
+                tabs,
+                active: gone.active,
+                frame: gone.frame,
+            });
+            ctx.request_repaint();
+        }
     }
 
-    fn new_windows(&mut self) -> usize {
+    fn new_windows(&mut self) -> Vec<Option<[f32; 4]>> {
         std::mem::take(&mut self.want_windows)
     }
 
     fn raw_input_hook(&mut self, win: WindowId, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        // Lo que simula el guion entra por la ventana del frente.
+        // Lo que simula el guion y lo elegido en la barra de menús entra por la ventana del
+        // frente.
         if self.front == Some(win) {
+            for action in menu::take() {
+                match action {
+                    menu::Action::Key(key, modifiers) => self.script_keys.push((key, modifiers)),
+                    menu::Action::Cmd(cmd) => self.menu_cmds.push(cmd),
+                    menu::Action::System(_) => {}
+                }
+            }
             raw.events.append(&mut self.script_pointer);
             for path in self.script_drops.drain(..) {
                 raw.dropped_files.push(std::sync::Arc::new(Dropped(path)));
@@ -2235,11 +2658,16 @@ impl shell::App for App {
             }
         }
 
-        // «Reiniciar Colibrí» en el menú de la aplicación.
-        menu::install();
-        if front && menu::take_restart() {
-            self.restart();
+        // La barra de menús, con los atajos de la configuración. Se reintenta hasta que
+        // macOS termina de arrancar, y se rehace si cambian los atajos.
+        if self.menu_keys.as_ref() != Some(&self.cfg.keys) && menu::build(&self.menu_spec()) {
+            self.menu_keys = Some(self.cfg.keys.clone());
         }
+        for cmd in std::mem::take(&mut self.menu_cmds) {
+            self.run(ctx, cmd);
+            ctx.request_repaint();
+        }
+        self.tend_closed(ctx);
 
         // Carpetas que llegan de Finder («Abrir con», el icono del Dock, el servicio): una
         // pestaña en cada una (en la carpeta del archivo, si es un archivo).
@@ -2300,6 +2728,23 @@ impl shell::App for App {
             self.secure = secure;
             macos::secure_input(secure);
         }
+        // Dónde está la ventana (para guardarla) y su título: el de la pestaña activa, que
+        // es lo que enseñan el menú Ventana y Mission Control.
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        if let (Some(outer), Some(inner)) = (outer, inner) {
+            self.w.frame = Some([outer.min.x, outer.min.y, inner.width(), inner.height()]);
+        }
+        let title = self
+            .w
+            .sessions
+            .get(self.w.active)
+            .map(|s| s.tab_label())
+            .unwrap_or_default();
+        if title != self.w.title {
+            ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
+            self.w.title = title;
+        }
+
         // Solo la pestaña activa de una ventana a la vista pide cuadros a 30 Hz; las demás
         // (y todas si la ventana está minimizada o tapada) se ponen al día cada 250 ms.
         let hidden = macos::hidden() || ctx.input(|i| i.viewport().visible() == Some(false));
@@ -2462,6 +2907,37 @@ impl shell::App for App {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
+}
+
+/// Lo que se guarda de una pestaña para volver a abrirla.
+fn tab_record(s: &Session) -> state::Tab {
+    state::Tab {
+        cwd: s.cwd.display().to_string(),
+        name: s.name.clone(),
+        color: s
+            .color
+            .and_then(|k| TAB_COLORS.get(k as usize))
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_default(),
+        agent: match s.agent {
+            Some(session::Agent::Claude) => "claude".into(),
+            _ => String::new(),
+        },
+    }
+}
+
+/// Si `pid` es `ancestor` o desciende de él.
+fn descends(mut pid: i32, ancestor: i32) -> bool {
+    for _ in 0..16 {
+        if pid == ancestor {
+            return true;
+        }
+        match proc::parent(pid) {
+            Some(p) if p > 1 => pid = p,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Una caja por dato (carpeta, rama de git, archivos con cambios) de una línea de cajas,
