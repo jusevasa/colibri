@@ -21,9 +21,12 @@ pub struct Watch {
     /// Carpeta consultada y lo que se encontró (None = no es un repo).
     result: Arc<Mutex<(PathBuf, Option<Info>)>>,
     running: Arc<AtomicBool>,
-    /// Carpeta y actividad de la pestaña en la última consulta lanzada.
-    asked: Option<(PathBuf, u64)>,
+    /// Carpeta, actividad y rama de la pestaña en la última consulta lanzada.
+    asked: Option<(PathBuf, u64, Option<String>)>,
     asked_at: Instant,
+    /// Rama leída de `.git/HEAD` para esa carpeta y actividad. Se lee aparte de `git status`
+    /// (es un archivo, no cuesta) para que un `git checkout` se vea al momento.
+    head: Option<(PathBuf, u64, Option<String>)>,
 }
 
 impl Watch {
@@ -33,21 +36,35 @@ impl Watch {
             running: Arc::new(AtomicBool::new(false)),
             asked: None,
             asked_at: Instant::now() - MIN_GAP,
+            head: None,
         }
     }
 
     /// Lo que se sabe de `cwd`. `activity` cambia cuando la pestaña recibe salida: es la
     /// señal de que puede haber cambiado algo (un commit, un checkout) y hay que mirar otra vez.
     pub fn info(&mut self, ctx: &egui::Context, cwd: &Path, activity: u64) -> Option<Info> {
+        // La rama se relee con cada actividad, sin esperar a `git status` ni a `MIN_GAP`.
+        if self
+            .head
+            .as_ref()
+            .is_none_or(|(dir, seen, _)| dir != cwd || *seen != activity)
+        {
+            self.head = Some((cwd.to_path_buf(), activity, branch(cwd)));
+        }
+        let head = self.head.as_ref().and_then(|(_, _, b)| b.clone());
         let stale = self
             .asked
             .as_ref()
-            .is_none_or(|(dir, seen)| dir != cwd || *seen != activity);
-        let new_dir = self.asked.as_ref().is_none_or(|(dir, _)| dir != cwd);
-        if stale && !self.running.load(Ordering::Relaxed) {
+            .is_none_or(|(dir, seen, _)| dir != cwd || *seen != activity);
+        // Carpeta nueva o rama nueva (un checkout cambia los archivos): consultar ya.
+        let urgent = self
+            .asked
+            .as_ref()
+            .is_none_or(|(dir, _, b)| dir != cwd || *b != head);
+        if (stale || urgent) && !self.running.load(Ordering::Relaxed) {
             let wait = MIN_GAP.saturating_sub(self.asked_at.elapsed());
-            if new_dir || wait.is_zero() {
-                self.asked = Some((cwd.to_path_buf(), activity));
+            if urgent || wait.is_zero() {
+                self.asked = Some((cwd.to_path_buf(), activity, head.clone()));
                 self.asked_at = Instant::now();
                 self.running.store(true, Ordering::Relaxed);
                 let (result, running, ctx, dir) = (
@@ -69,16 +86,15 @@ impl Watch {
                 ctx.request_repaint_after(wait);
             }
         }
+        // Si había un `git status` en curso con la rama anterior, su `request_repaint` al
+        // acabar trae de vuelta aquí y `urgent` lanza el nuevo.
         let result = self.result.lock().unwrap();
-        if result.0 == cwd {
-            result.1.clone()
-        } else {
-            // Carpeta recién cambiada: la rama es una lectura de archivo, se puede dar ya.
-            branch(cwd).map(|branch| Info {
-                branch,
-                changes: None,
-            })
-        }
+        // Los cambios del último `git status` de esta carpeta (aunque sea de la rama anterior,
+        // hasta que llegue el nuevo) y la rama recién leída.
+        let changes = (result.0 == cwd)
+            .then(|| result.1.as_ref().and_then(|i| i.changes))
+            .flatten();
+        head.map(|branch| Info { branch, changes })
     }
 }
 
