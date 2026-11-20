@@ -87,6 +87,17 @@ pub mod stats {
     }
 }
 
+/// Drawables de la capa (`maximumDrawableCount`). Por defecto 2: con 3, el tercero son
+/// ~14 MB más (ventana Retina de 1180×760 pt) para encolar un cuadro que no se nota.
+/// `COLIBRI_LAYER_DRAWABLES=3` vuelve al valor de Core Animation para comparar.
+fn drawable_count() -> usize {
+    std::env::var("COLIBRI_LAYER_DRAWABLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| (2..=3).contains(n))
+        .unwrap_or(2)
+}
+
 /// Cuántos drawables puede haber en vuelo antes de saltar cuadros. Por defecto uno menos
 /// que los de la capa; `COLIBRI_DRAWABLES=<n>` lo cambia para medir.
 fn drawable_limit(layer_max: usize) -> usize {
@@ -941,6 +952,33 @@ pub struct Painter {
     transaction: bool,
 }
 
+/// Capa de Metal de la ventana: transparente, en sRGB, sin esperar a ciegas un drawable.
+fn new_layer(device: &ProtocolObject<dyn MTLDevice>, scale: f64) -> Retained<CAMetalLayer> {
+    let layer = CAMetalLayer::new();
+    layer.setDevice(Some(device));
+    layer.setPixelFormat(TARGET_FORMAT);
+    layer.setFramebufferOnly(true);
+    // Ventana transparente: el contenido es alfa premultiplicado sobre lo que haya
+    // detrás (el desenfoque de `blur.rs` lo pone el servidor de ventanas).
+    layer.setOpaque(false);
+    // El mismo espacio de color que configura wgpu para este formato.
+    // SAFETY: constante de CoreGraphics.
+    let srgb = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }));
+    layer.setColorspace(srgb.as_deref());
+    layer.setDisplaySyncEnabled(true);
+    // Red de seguridad: si aun con la cuenta `nextDrawable` llegara a esperar,
+    // devuelve nil al cabo de un segundo en vez de colgarse.
+    layer.setAllowsNextDrawableTimeout(true);
+    // Doble búfer: cada drawable a tamaño de ventana son ~14 MB en una Retina normal y
+    // el tercero solo servía para encolar más cuadros de los que una terminal necesita.
+    layer.setMaximumDrawableCount(drawable_count());
+    layer.setContentsScale(scale);
+    layer.setAutoresizingMask(
+        CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
+    );
+    layer
+}
+
 impl Painter {
     /// Crea el dispositivo Metal y la capa de la ventana (transparente). Hilo principal.
     ///
@@ -969,26 +1007,8 @@ impl Painter {
         view.setWantsLayer(true);
         let root = view.layer().ok_or("la vista no tiene capa")?;
 
-        let layer = CAMetalLayer::new();
-        layer.setDevice(Some(&renderer.device));
-        layer.setPixelFormat(TARGET_FORMAT);
-        layer.setFramebufferOnly(true);
-        // Ventana transparente: el contenido es alfa premultiplicado sobre lo que haya
-        // detrás (el desenfoque de `blur.rs` lo pone el servidor de ventanas).
-        layer.setOpaque(false);
-        // El mismo espacio de color que configura wgpu para este formato.
-        // SAFETY: constante de CoreGraphics.
-        let srgb = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }));
-        layer.setColorspace(srgb.as_deref());
-        layer.setDisplaySyncEnabled(true);
-        // Red de seguridad: si aun con la cuenta `nextDrawable` llegara a esperar,
-        // devuelve nil al cabo de un segundo en vez de colgarse.
-        layer.setAllowsNextDrawableTimeout(true);
-        layer.setContentsScale(window.scale_factor());
+        let layer = new_layer(&renderer.device, window.scale_factor());
         layer.setFrame(root.bounds());
-        layer.setAutoresizingMask(
-            CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
-        );
         root.addSublayer(&layer);
 
         Ok(Self {
@@ -1027,6 +1047,29 @@ impl Painter {
             autoreleasepool(|_| self.frame(size_px, pixels_per_point, clear, primitives, capture));
         self.renderer.free_textures(textures);
         painted
+    }
+
+    /// Con la ventana oculta: cambia la capa por una vacía para soltar sus drawables a
+    /// tamaño de ventana (3 × ~14 MB en una Retina de 1180×760 pt). Presentar cuadros
+    /// pequeños no basta: con la ventana minimizada, el último cuadro grande sigue
+    /// retenido como contenido de la capa. La capa nueva no reserva nada hasta el
+    /// siguiente `paint`.
+    pub fn shrink(&mut self) {
+        let Some(root) = self.view.layer() else {
+            return;
+        };
+        let layer = new_layer(&self.renderer.device, self.layer.contentsScale());
+        layer.setFrame(root.bounds());
+        self.layer.removeFromSuperlayer();
+        root.addSublayer(&layer);
+        // Con la ventana oculta no hay vuelta de bucle que envíe la transacción al
+        // servidor de ventanas, y el contenido viejo seguiría allí (y a nuestra cuenta).
+        objc2_quartz_core::CATransaction::flush();
+        self.layer = layer;
+        // Los drawables de la capa vieja ya no cuentan contra la nueva.
+        self.flight.reset();
+        self.size = [0, 0];
+        self.transaction = false;
     }
 
     fn frame(

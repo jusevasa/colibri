@@ -304,11 +304,66 @@ pub const HACK: &str = "builtin:hack";
 pub const HACK_BOLD: &str = "builtin:hack-bold";
 
 /// Bytes de una fuente: las incluidas en el ejecutable o un archivo del disco.
-pub fn font_bytes(path: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
-    match path {
-        HACK => Some(include_bytes!("../assets/fonts/Hack-Regular.ttf")[..].into()),
-        HACK_BOLD => Some(include_bytes!("../assets/fonts/Hack-Bold.ttf")[..].into()),
-        _ => std::fs::read(path).ok().map(Into::into),
+pub fn font_bytes(path: &str) -> Option<egui::epaint::text::Blob> {
+    let blob: egui::epaint::text::Blob = match path {
+        HACK => std::sync::Arc::new(&include_bytes!("../assets/fonts/Hack-Regular.ttf")[..]),
+        HACK_BOLD => std::sync::Arc::new(&include_bytes!("../assets/fonts/Hack-Bold.ttf")[..]),
+        _ => std::sync::Arc::new(Mapped::open(path)?),
+    };
+    Some(blob)
+}
+
+/// Archivo de fuente mapeado en memoria, de solo lectura. Leído con `fs::read` contaba
+/// entero como memoria sucia del proceso (Menlo.ttc, 2 MB; Apple Symbols, 0,9 MB);
+/// mapeado son páginas del archivo que el sistema puede soltar y volver a leer, y no
+/// entran en la «Memoria» del Monitor de Actividad.
+struct Mapped {
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: el mapeo es de solo lectura y vive hasta el `Drop`; compartirlo es leerlo.
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
+
+impl Mapped {
+    fn open(path: &str) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).ok()?;
+        let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: descriptor válido, longitud no nula; el resultado se comprueba. El mapeo
+        // sigue válido después de cerrar el archivo.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        (ptr != libc::MAP_FAILED).then(|| Self {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+}
+
+impl AsRef<[u8]> for Mapped {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `ptr` apunta a `len` bytes mapeados hasta el `Drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        // SAFETY: el mismo mapeo que devolvió `mmap`, liberado una sola vez.
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
     }
 }
 

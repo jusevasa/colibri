@@ -47,6 +47,8 @@ pub enum Step {
     Drop(String),
     /// Minimiza la ventana (para medir cuánto se pinta sin verse).
     Minimize,
+    /// Sube (positivo) o baja (negativo) por el historial de la pestaña activa.
+    Scroll(i32),
     /// Muestra u oculta el botón «Actualizar» sin que haya una compilación nueva.
     Update,
     Quit,
@@ -96,6 +98,7 @@ impl Script {
                     "cmd" => Step::Cmd(arg != "up"),
                     "drop" => Step::Drop(arg.to_string()),
                     "minimize" => Step::Minimize,
+                    "scroll" => Step::Scroll(arg.parse().ok()?),
                     "update" => Step::Update,
                     "quit" => Step::Quit,
                     _ => return None,

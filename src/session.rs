@@ -625,6 +625,20 @@ impl Agent {
     }
 }
 
+/// Tras salida nueva (o moverse por el historial), cuánto se espera para comprimirlo.
+const COMPACT_EVERY: Duration = Duration::from_secs(2);
+
+/// Filas comprimidas por tanda (unos 2–4 µs cada una con el terminal bloqueado, sumando
+/// liberar la fila) y espera hasta la siguiente si quedó trabajo: ~2600 filas/s sin
+/// retener el terminal más de ~1–2 ms seguidos.
+const COMPACT_BUDGET: usize = 400;
+const COMPACT_SOON: Duration = Duration::from_millis(150);
+
+/// Líneas de historial justo encima de la pantalla que se dejan sin comprimir: las que
+/// se releen a menudo (`in_command` mira hasta 200 por encima del cursor, los enlaces
+/// siguen líneas partidas, la selección).
+const COMPACT_KEEP: usize = 256;
+
 pub struct Session {
     pub id: u64,
     pub term: Arc<FairMutex<Term<Listener>>>,
@@ -663,6 +677,10 @@ pub struct Session {
     pub unseen: bool,
     dirty: bool,
     last_poll: Instant,
+    /// Cuándo toca comprimir el historial (`compact_history`); `None` si no hay nada.
+    compact_at: Option<Instant>,
+    /// `activity` y desplazamiento por el historial vistos en la última compresión.
+    compact_seen: (u64, usize),
     pub scroll_acc: f32,
     /// Celda del cursor en pantalla en el último cuadro (para anclar el historial).
     pub cursor_px: Option<egui::Rect>,
@@ -810,6 +828,8 @@ impl Session {
             unseen: false,
             dirty: true,
             last_poll: old,
+            compact_at: None,
+            compact_seen: (0, 0),
             scroll_acc: 0.0,
             cursor_px: None,
             chips_px: Vec::new(),
@@ -1437,8 +1457,57 @@ impl Session {
 
     /// Actualiza proceso en primer plano y estado. Devuelve true si algo acaba de terminar
     /// sin que lo estuvieras viendo.
+    /// Comprime el historial lejos de la pantalla (ver `vendor/alacritty_terminal`, buscar
+    /// «Colibrí:»): cada línea se guardaba con todas sus columnas a 24 bytes por celda
+    /// (~4,5 KB con 190 columnas) y comprimida ocupa unos pocos bytes por letra. Solo
+    /// trabaja con lo que salió de la pantalla desde la última vez, así que en reposo es
+    /// recorrer el historial sin tocar nada.
+    fn compact_history(&mut self, ctx: &egui::Context, now: Instant) {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var_os("COLIBRI_NO_COMPACT").is_some()) {
+            return;
+        }
+        let offset = self.term.lock().grid().display_offset();
+        if (self.activity, offset) != self.compact_seen && self.compact_at.is_none() {
+            // Salida nueva, o se movió por el historial (lo leído queda descomprimido).
+            self.compact_at = Some(now + COMPACT_EVERY);
+        }
+        match self.compact_at {
+            None => return,
+            Some(at) if at > now => {
+                // Aún no toca: se vuelve a pedir la pasada (egui la descarta si ya hay una
+                // antes, y esta pasada pudo ser esa).
+                ctx.request_repaint_after(at - now);
+                return;
+            }
+            Some(_) => {}
+        }
+        self.compact_seen = (self.activity, offset);
+        let mut term = self.term.lock();
+        let started = Instant::now();
+        let packed = term.compact_history(COMPACT_KEEP, COMPACT_BUDGET);
+        let took = started.elapsed();
+        drop(term);
+        if std::env::var_os("COLIBRI_FPS").is_some() {
+            let (plain, packed_now, cached) = self.term.lock().grid().history_stats();
+            eprintln!(
+                "historial: {packed} filas comprimidas en {:.2} ms (normales {plain}, \
+                 comprimidas {packed_now}, en caché {cached})",
+                took.as_secs_f64() * 1000.0
+            );
+        }
+        self.compact_at = if packed >= COMPACT_BUDGET {
+            // Quedó trabajo: otra tanda en breve, sin retener el terminal de un tirón.
+            ctx.request_repaint_after(COMPACT_SOON);
+            Some(now + COMPACT_SOON)
+        } else {
+            None
+        };
+    }
+
     pub fn poll(&mut self, ctx: &egui::Context, watching: bool) -> bool {
         let now = Instant::now();
+        self.compact_history(ctx, now);
         let before = (self.fg_pid, self.busy);
         let mut moved = false;
         let interval = if self.dirty { 200 } else { 1000 };

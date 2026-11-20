@@ -50,6 +50,16 @@ const HIDDEN_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 /// `logic()` para que la aplicación no se quede parada (como hace eframe).
 const MISSED_REDRAW_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Oculta durante este tiempo, la ventana suelta sus drawables (`Painter::shrink`). La
+/// espera evita parpadeos y reservas inútiles al ir y volver rápido con ⌘Tab.
+const SHRINK_AFTER: Duration = Duration::from_secs(2);
+
+/// Lado máximo de textura que se le anuncia a egui. epaint crea el atlas de glifos con
+/// ese ancho y lo dobla en alto al llenarse: con 16384 (lo que admite Metal) cada fila
+/// costaba 64 KB y el atlas saltaba de 2 a 4 MB, en CPU y otra vez en GPU, por unas
+/// decenas de glifos. Con 2048 crece en pasos de 8 KB por fila.
+const ATLAS_SIDE: usize = 2048;
+
 /// Tope de la espera por un drawable libre: si `wake` no llega, se vuelve a intentar.
 const DRAWABLE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -148,6 +158,10 @@ struct Running {
     waiting: Option<Instant>,
     /// Hay un `UserEvent::Wake` en camino (para no encolar uno por cada aviso).
     wake_sent: Arc<AtomicBool>,
+    /// Desde cuándo la ventana no se ve (para soltar los drawables al cabo de un rato).
+    hidden_since: Option<Instant>,
+    /// Los drawables ya se soltaron: la capa está vacía hasta el siguiente cuadro.
+    shrunk: bool,
 
     window: Window,
 }
@@ -227,7 +241,7 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
             event_loop,
             Some(window.scale_factor() as f32),
             event_loop.system_theme(),
-            Some(painter.max_texture_side()),
+            Some(painter.max_texture_side().min(ATLAS_SIDE)),
         );
         // ⌘C/⌘X/⌘V llegan como teclas: los traduce la aplicación (`clip::translate`).
         state.set_clipboard_shortcuts(false);
@@ -255,6 +269,8 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
             skipped: false,
             waiting: None,
             wake_sent,
+            hidden_since: None,
+            shrunk: false,
             window,
         })
     }
@@ -332,6 +348,23 @@ impl Running {
         !self.first_frame && self.info.visible() == Some(false)
     }
 
+    /// Oculta más de `SHRINK_AFTER`: suelta los drawables. Si aún no toca, se programa
+    /// una pasada para entonces.
+    fn shrink_if_hidden_long(&mut self) {
+        if self.shrunk {
+            return;
+        }
+        let now = Instant::now();
+        let since = *self.hidden_since.get_or_insert(now);
+        let due = since + SHRINK_AFTER;
+        if now < due {
+            self.next_repaint = Some(self.next_repaint.map_or(due, |at| at.min(due)));
+            return;
+        }
+        self.painter.shrink();
+        self.shrunk = true;
+    }
+
     fn repaint_now(&mut self) {
         self.next_repaint = Some(Instant::now());
     }
@@ -362,6 +395,13 @@ impl Running {
         self.app.raw_input_hook(&self.ctx, &mut input);
 
         let close_requested = input.viewport().close_requested();
+
+        if visible {
+            self.hidden_since = None;
+            self.shrunk = false;
+        } else {
+            self.shrink_if_hidden_long();
+        }
 
         if mode == Mode::LogicOnly || !visible {
             // Sin pasada de egui: el estado de la interfaz queda como estaba para cuando

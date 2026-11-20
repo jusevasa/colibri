@@ -40,3 +40,8 @@ opt-level = 1
 inherits = "release"
 strip = false
 debug = true
+
+# Copia de alacritty_terminal 0.26.0 con dos constantes cambiadas para gastar menos
+# memoria (buscar «Colibrí:» en vendor/alacritty_terminal/src).
+[patch.crates-io]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }

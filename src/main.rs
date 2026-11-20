@@ -1013,6 +1013,13 @@ impl App {
             }
             Some(debug::Step::Drop(path)) => self.script_drops.push(PathBuf::from(path)),
             Some(debug::Step::Minimize) => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
+            Some(debug::Step::Scroll(lines)) => {
+                if let Some(s) = self.sessions.get(self.active) {
+                    s.term
+                        .lock()
+                        .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+                }
+            }
             Some(debug::Step::Update) => self.force_update = !self.force_update,
             Some(debug::Step::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
             Some(debug::Step::Wait(_)) | None => {}
@@ -1114,9 +1121,11 @@ impl App {
             let active = i == self.active;
             let hovered = resp.hovered() && (self.drag_tab.is_none() || dragging);
             // Encima de las demás mientras se mueve (arrastrada, o la activa deslizándose).
+            // `Middle` y no `Foreground`: los menús emergentes (clic derecho) van en
+            // `Foreground` y esta capa, creada después, los tapaba.
             let p = &if dragging || (active && shown_x != x) {
                 ui.painter().clone().with_layer_id(egui::LayerId::new(
-                    egui::Order::Foreground,
+                    egui::Order::Middle,
                     egui::Id::unique("tab-drag"),
                 ))
             } else {
@@ -2478,13 +2487,8 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
             }
             let blob = match blobs.get(*path) {
                 Some(b) => Some(b.clone()),
-                None => config::font_bytes(path).map(|bytes| {
-                    let b: egui::epaint::text::Blob = match bytes {
-                        std::borrow::Cow::Borrowed(b) => Arc::new(b),
-                        std::borrow::Cow::Owned(b) => Arc::new(b),
-                    };
+                None => config::font_bytes(path).inspect(|b| {
                     blobs.insert(path.to_string(), b.clone());
-                    b
                 }),
             };
             if let Some(blob) = blob {
