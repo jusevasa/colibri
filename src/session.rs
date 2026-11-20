@@ -17,7 +17,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Marcas (carácter de ancho cero en la primera celda de cada dato) de una línea de cajas.
@@ -478,15 +478,17 @@ const OUTPUT_FRAME: u64 = 33;
 const ECHO_WINDOW: u64 = 150;
 const BACKGROUND_FRAME: u64 = 250;
 
-static ACTIVE_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_INPUT: AtomicU64 = AtomicU64::new(0);
-static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
-static HIDDEN: AtomicBool = AtomicBool::new(false);
 
-/// La ventana no se ve (minimizada, tapada, en otro escritorio): la salida de la pestaña
-/// activa deja de pedir cuadros a 30 Hz y se pone al día como las de segundo plano.
-pub fn set_hidden(hidden: bool) {
-    HIDDEN.store(hidden, Ordering::Relaxed);
+/// Lo que el hilo de la pestaña necesita saber para decidir cuándo pedir un cuadro. Es de
+/// cada pestaña (no global) porque con varias ventanas puede haber varias a la vista.
+struct Pace {
+    /// La pestaña es la activa de una ventana que se ve (ni minimizada ni tapada).
+    shown: AtomicBool,
+    /// Cuándo se pintó por última vez la ventana que la muestra (`now_ms`).
+    last_frame: AtomicU64,
+    /// El contexto de la ventana donde está la pestaña, a quien se piden los cuadros.
+    ctx: Mutex<egui::Context>,
 }
 
 fn now_ms() -> u64 {
@@ -494,18 +496,10 @@ fn now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// La pestaña que se está viendo, y que se acaba de pintar un cuadro. Lo llama la
-/// interfaz en cada cuadro.
-pub fn frame_painted(active: Option<u64>) {
-    ACTIVE_ID.store(active.unwrap_or(u64::MAX), Ordering::Relaxed);
-    LAST_FRAME.store(now_ms(), Ordering::Relaxed);
-}
-
 #[derive(Clone)]
 pub struct Listener {
-    id: u64,
     tx: Sender<Event>,
-    ctx: egui::Context,
+    pace: Arc<Pace>,
 }
 
 impl EventListener for Listener {
@@ -521,24 +515,24 @@ impl EventListener for Listener {
                 | Event::CursorBlinkingChange
         );
         let _ = self.tx.send(event);
+        let pace = &self.pace;
+        let ctx = pace.ctx.lock().unwrap_or_else(|e| e.into_inner());
         if !visual {
-            return self.ctx.request_repaint();
+            return ctx.request_repaint();
         }
-        if ACTIVE_ID.load(Ordering::Relaxed) != self.id || HIDDEN.load(Ordering::Relaxed) {
-            return self
-                .ctx
-                .request_repaint_after(Duration::from_millis(BACKGROUND_FRAME));
+        if !pace.shown.load(Ordering::Relaxed) {
+            return ctx.request_repaint_after(Duration::from_millis(BACKGROUND_FRAME));
         }
         let now = now_ms();
-        let since_frame = now.saturating_sub(LAST_FRAME.load(Ordering::Relaxed));
+        let since_frame = now.saturating_sub(pace.last_frame.load(Ordering::Relaxed));
         let typing = now.saturating_sub(LAST_INPUT.load(Ordering::Relaxed)) < ECHO_WINDOW;
         if typing {
-            return self.ctx.request_repaint();
+            return ctx.request_repaint();
         }
         // Con espera (aunque sea de 1 ms) egui pinta un solo cuadro; `request_repaint()`
         // pinta dos seguidos, y eso doblaba los cuadros de cualquier salida continua.
         let wait = OUTPUT_FRAME.saturating_sub(since_frame).max(1);
-        self.ctx.request_repaint_after(Duration::from_millis(wait));
+        ctx.request_repaint_after(Duration::from_millis(wait));
     }
 }
 
@@ -642,6 +636,8 @@ const COMPACT_KEEP: usize = 256;
 pub struct Session {
     pub id: u64,
     pub term: Arc<FairMutex<Term<Listener>>>,
+    /// Lo que comparte con su `Listener` para el ritmo de repintado.
+    pace: Arc<Pace>,
     sender: EventLoopSender,
     rx: Receiver<Event>,
     master_fd: i32,
@@ -726,10 +722,14 @@ impl Session {
             lines: 24,
         };
         let (tx, rx) = channel();
+        let pace = Arc::new(Pace {
+            shown: AtomicBool::new(false),
+            last_frame: AtomicU64::new(0),
+            ctx: Mutex::new(ctx.clone()),
+        });
         let listener = Listener {
-            id,
             tx,
-            ctx: ctx.clone(),
+            pace: pace.clone(),
         };
 
         let shell = if !cfg.shell.is_empty() {
@@ -803,6 +803,7 @@ impl Session {
         Ok(Self {
             id,
             term,
+            pace,
             sender,
             rx,
             master_fd,
@@ -907,6 +908,24 @@ impl Session {
     }
 
     /// La sugerencia, si ahora mismo se puede mostrar: prompt del shell y nada escrito.
+    /// Si la pestaña está a la vista (la activa de una ventana que se ve). Lo pone la
+    /// interfaz en cada pasada; mientras no, su salida solo pide un cuadro cada
+    /// `BACKGROUND_FRAME`.
+    pub fn set_shown(&self, shown: bool) {
+        self.pace.shown.store(shown, Ordering::Relaxed);
+    }
+
+    /// Se acaba de pintar un cuadro de la ventana que muestra esta pestaña.
+    pub fn frame_painted(&self) {
+        self.pace.last_frame.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// La pestaña pasa a otra ventana: sus cuadros se piden a ese contexto.
+    #[allow(dead_code)] // para mover pestañas entre ventanas (siguiente paso)
+    pub fn set_context(&self, ctx: &egui::Context) {
+        *self.pace.ctx.lock().unwrap_or_else(|e| e.into_inner()) = ctx.clone();
+    }
+
     pub fn suggested(&self) -> Option<&str> {
         let text = self.suggestion.as_deref()?;
         (self.line.as_deref() == Some("") && self.at_prompt()).then_some(text)

@@ -1,8 +1,10 @@
 //! Lanzador de la aplicación: ventana de winit + egui, sin eframe.
 //!
-//! Hace lo que hacía `eframe::run_native` para una sola ventana: crea la ventana, reparte
+//! Hace lo que hacía `eframe::run_native`, con varias ventanas: crea cada ventana, reparte
 //! los eventos de winit a egui, corre `logic()` + `ui()` y entrega las mallas al pintor de
-//! Metal (`metal.rs`). El reparto de repintados está portado del lanzador nativo de eframe
+//! Metal (`metal.rs`). Cada ventana tiene su propio `egui::Context`, su `egui_winit::State`
+//! y su `Painter` (como cada `WindowContext` de Alacritty); la aplicación es una sola y
+//! recibe en cada llamada de qué ventana se trata. El reparto de repintados está portado del lanzador nativo de eframe
 //! 0.37 (MIT/Apache) para que `request_repaint()` siga dando dos cuadros y
 //! `request_repaint_after()` uno, y para que en reposo no se pinte nada.
 //!
@@ -11,8 +13,9 @@
 //! corren más cuadros (ver `Running::waiting`).
 
 use crate::debug;
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use egui::{ViewportCommand, ViewportEvent, ViewportId, ViewportInfo};
@@ -20,7 +23,8 @@ use egui_winit::ActionRequested;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowId};
+use winit::window::Window;
+pub use winit::window::WindowId;
 
 use crate::metal::{Outcome, Painter};
 
@@ -31,14 +35,40 @@ pub trait App {
         [0.0; 4]
     }
 
+    /// Se acaba de crear una ventana (aún oculta, antes de su primer cuadro).
+    fn window_opened(&mut self, win: WindowId, ctx: &egui::Context);
+
+    /// La ventana se cerró: la aplicación suelta lo suyo (pestañas, procesos).
+    fn window_closed(&mut self, win: WindowId);
+
+    /// Cuántas ventanas nuevas quiere abrir la aplicación (se mira tras cada evento).
+    fn new_windows(&mut self) -> usize {
+        0
+    }
+
     /// Permite tocar la entrada cruda antes de que egui la vea.
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, _raw: &mut egui::RawInput) {}
+    fn raw_input_hook(&mut self, _win: WindowId, _ctx: &egui::Context, _raw: &mut egui::RawInput) {}
 
     /// Trabajo que no pinta; corre en cada pasada, también con la ventana oculta.
-    fn logic(&mut self, ctx: &egui::Context);
+    fn logic(&mut self, win: WindowId, ctx: &egui::Context);
 
     /// La interfaz; solo corre si la ventana se ve.
-    fn ui(&mut self, ui: &mut egui::Ui);
+    fn ui(&mut self, win: WindowId, ui: &mut egui::Ui);
+}
+
+/// El bucle de eventos, para despertar ventanas desde cualquier hilo (`wake_all`).
+static PROXY: OnceLock<Mutex<EventLoopProxy<UserEvent>>> = OnceLock::new();
+
+/// Pide un repintado a todas las ventanas. Es lo que usan los hilos de fondo y los
+/// manejadores de macOS (atajo global, notificaciones, menú, Finder) que antes tenían
+/// guardado el único `egui::Context`. Desde cualquier hilo.
+pub fn wake_all() {
+    if let Some(proxy) = PROXY.get() {
+        let _ = proxy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send_event(UserEvent::RepaintAll);
+    }
 }
 
 /// Con la ventana oculta (minimizada o tapada) un repintado pedido «ya» espera esto: sin
@@ -68,12 +98,15 @@ const DRAWABLE_TIMEOUT: Duration = Duration::from_millis(100);
 enum UserEvent {
     /// egui pide un repintado (`Context::request_repaint*`).
     Repaint {
+        win: WindowId,
         when: Instant,
         /// Número de pasada en que se pidió, para descartar las peticiones ya servidas.
         cumulative_pass_nr: u64,
     },
-    /// El pintor vuelve a tener un drawable libre tras saltarse un cuadro.
-    Wake,
+    /// El pintor de esa ventana vuelve a tener un drawable libre tras saltarse un cuadro.
+    Wake(WindowId),
+    /// Un hilo de fondo pide repintar todas las ventanas (`wake_all`).
+    RepaintAll,
 }
 
 /// Qué corre una pasada.
@@ -85,12 +118,14 @@ enum Mode {
     LogicOnly,
 }
 
-/// Abre la ventana y corre la aplicación hasta que se cierre. Hilo principal.
+/// Abre la primera ventana y corre la aplicación hasta que se cierre la última. Hilo
+/// principal.
 ///
-/// `create` se llama una vez, con el contexto de egui ya listo y antes del primer cuadro.
+/// `create` se llama una vez, antes de abrir la primera ventana; `viewport` es la plantilla
+/// de todas las ventanas.
 pub fn run(
     viewport: egui::ViewportBuilder,
-    create: impl FnOnce(&egui::Context) -> Box<dyn App>,
+    create: impl FnOnce() -> Box<dyn App>,
 ) -> Result<(), String> {
     // Crear el bucle crea la NSApplication, pero no termina de lanzarla hasta `run_app`:
     // quien observe `NSApplicationWillFinishLaunching` antes de llamar aquí llega a tiempo.
@@ -99,11 +134,13 @@ pub fn run(
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|e| format!("no se pudo crear el bucle de eventos: {e}"))?;
+    let _ = PROXY.set(Mutex::new(event_loop.create_proxy()));
     let mut runner = Runner {
         viewport,
         create: Some(create),
+        app: None,
         proxy: event_loop.create_proxy(),
-        running: None,
+        windows: HashMap::new(),
         error: None,
     };
     event_loop
@@ -117,21 +154,21 @@ pub fn run(
     }
 }
 
-/// El manejador de winit: nada hasta `resumed`, luego la ventana en marcha.
+/// El manejador de winit: nada hasta `resumed`, luego la aplicación y sus ventanas.
 struct Runner<F> {
     viewport: egui::ViewportBuilder,
     create: Option<F>,
+    app: Option<Box<dyn App>>,
     proxy: EventLoopProxy<UserEvent>,
-    running: Option<Running>,
+    windows: HashMap<WindowId, Running>,
     error: Option<String>,
 }
 
-/// La ventana con todo lo que cuelga de ella.
+/// Una ventana con todo lo que cuelga de ella.
 ///
-/// El orden de los campos es el orden en que se sueltan: primero la aplicación (cierra
-/// PTY e hilos), luego el pintor y al final la ventana.
+/// El orden de los campos es el orden en que se sueltan: el pintor y al final la ventana.
+/// Lo de la aplicación (pestañas, PTY) se suelta antes, en `App::window_closed`.
 struct Running {
-    app: Box<dyn App>,
     painter: Painter,
     state: egui_winit::State,
     ctx: egui::Context,
@@ -166,9 +203,9 @@ struct Running {
     window: Window,
 }
 
-impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
-    /// Crea la ventana, el pintor, egui y la aplicación.
-    fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<Running, String> {
+impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
+    /// Crea una ventana con su pintor y su egui, y se la presenta a la aplicación.
+    fn open_window(&mut self, event_loop: &ActiveEventLoop) -> Result<WindowId, String> {
         let ctx = egui::Context::default();
         // Escritorio: las ventanas hijas no se incrustan (aquí no hay ninguna).
         ctx.set_embed_viewports(false);
@@ -187,11 +224,19 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
                 viewport = viewport.with_inner_size(size.min(largest));
             }
         }
+        // Las ventanas nuevas, en cascada desde la que está al frente (como Terminal).
+        if let Some(front) = self.front()
+            && let Ok(at) = front.window.outer_position()
+        {
+            let at = at.to_logical::<f32>(front.window.scale_factor());
+            viewport = viewport.with_position([at.x + 28.0, at.y + 28.0]);
+        }
         // Oculta hasta que haya un cuadro pintado, para que no se vea vacía al arrancar.
         let viewport = viewport.with_visible(false);
 
         let window = egui_winit::create_window(&ctx, event_loop, &viewport)
             .map_err(|e| format!("no se pudo crear la ventana: {e}"))?;
+        let id = window.id();
 
         let wake_sent = Arc::new(AtomicBool::new(false));
         let wake: Arc<dyn Fn() + Send + Sync> = {
@@ -199,7 +244,7 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
             let sent = wake_sent.clone();
             Arc::new(move || {
                 if !sent.swap(true, Ordering::AcqRel) {
-                    let _ = proxy.send_event(UserEvent::Wake);
+                    let _ = proxy.send_event(UserEvent::Wake(id));
                 }
             })
         };
@@ -229,6 +274,7 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
                     return;
                 }
                 let _ = proxy.send_event(UserEvent::Repaint {
+                    win: id,
                     when: Instant::now() + info.delay,
                     cumulative_pass_nr: info.current_cumulative_pass_nr,
                 });
@@ -246,96 +292,151 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> Runner<F> {
         // ⌘C/⌘X/⌘V llegan como teclas: los traduce la aplicación (`clip::translate`).
         state.set_clipboard_shortcuts(false);
 
-        let create = self
-            .create
-            .take()
-            .ok_or_else(|| "la aplicación ya se había creado".to_owned())?;
-        let app = create(&ctx);
+        if self.app.is_none() {
+            let create = self
+                .create
+                .take()
+                .ok_or_else(|| "la aplicación ya se había creado".to_owned())?;
+            self.app = Some(create());
+        }
+        if let Some(app) = &mut self.app {
+            app.window_opened(id, &ctx);
+        }
 
-        Ok(Running {
-            app,
-            painter,
-            state,
-            ctx,
-            info,
-            actions: Vec::new(),
-            pending_input: egui::RawInput::default(),
-            beginning: Instant::now(),
-            first_frame: true,
-            close: false,
-            // El primer cuadro, ya.
-            next_repaint: Some(Instant::now()),
-            redraw_deadline: None,
-            skipped: false,
-            waiting: None,
-            wake_sent,
-            hidden_since: None,
-            shrunk: false,
-            window,
-        })
+        self.windows.insert(
+            id,
+            Running {
+                painter,
+                state,
+                ctx,
+                info,
+                actions: Vec::new(),
+                pending_input: egui::RawInput::default(),
+                beginning: Instant::now(),
+                first_frame: true,
+                close: false,
+                // El primer cuadro, ya.
+                next_repaint: Some(Instant::now()),
+                redraw_deadline: None,
+                skipped: false,
+                waiting: None,
+                wake_sent,
+                hidden_since: None,
+                shrunk: false,
+                window,
+            },
+        );
+        Ok(id)
     }
 }
 
 impl<F> Runner<F> {
-    /// Suelta la aplicación y la ventana (dentro del bucle, para que se cierren bien).
-    fn destroy(&mut self) {
-        if let Some(running) = self.running.take() {
-            running.ctx.on_exit();
-            drop(running);
-        }
+    /// La ventana con el foco o, si ninguna lo tiene, cualquiera.
+    fn front(&self) -> Option<&Running> {
+        self.windows
+            .values()
+            .find(|run| run.info.focused == Some(true))
+            .or_else(|| self.windows.values().next())
     }
 
-    /// Tras cada evento: cierra si toca y, si no, decide qué repintar y hasta cuándo dormir.
-    fn after_event(&mut self, event_loop: &ActiveEventLoop) {
-        self.close_if_asked(event_loop);
+    /// Suelta la aplicación y las ventanas (dentro del bucle, para que se cierren bien).
+    fn destroy(&mut self) {
+        for run in self.windows.values() {
+            run.ctx.on_exit();
+        }
+        // Primero la aplicación (cierra PTY e hilos), luego pintores y ventanas.
+        self.app = None;
+        self.windows.clear();
+    }
 
-        let now = Instant::now();
-        let mut direct = None;
-        if let Some(run) = &mut self.running {
-            if run.waiting.is_some_and(|until| until <= now) {
-                run.waiting = None;
-            }
-            if run.waiting.is_none() && run.next_repaint.is_some_and(|at| at <= now) {
-                run.next_repaint = None;
-                if run.first_frame || run.window.is_minimized() == Some(true) {
-                    // Una ventana que no está en pantalla no necesita pasar por
-                    // `RedrawRequested`: la pasada se corre aquí mismo.
-                    direct = Some(Mode::Full);
-                } else {
-                    run.window.request_redraw();
-                    run.redraw_deadline
-                        .get_or_insert(now + MISSED_REDRAW_TIMEOUT);
-                }
-            }
-            if direct.is_none() && run.redraw_deadline.is_some_and(|at| at <= now) {
-                run.redraw_deadline = None;
-                direct = Some(Mode::LogicOnly);
-            }
-            if let Some(mode) = direct {
-                run.pass(event_loop, mode);
+    /// Tras cada evento: cierra lo que toque, abre lo que pida la aplicación y decide qué
+    /// repintar y hasta cuándo dormir.
+    fn after_event(&mut self, event_loop: &ActiveEventLoop)
+    where
+        F: FnOnce() -> Box<dyn App>,
+    {
+        self.close_if_asked(event_loop);
+        if self.windows.is_empty() {
+            return;
+        }
+
+        let wanted = self.app.as_mut().map_or(0, |app| app.new_windows());
+        for _ in 0..wanted {
+            if let Err(error) = self.open_window(event_loop) {
+                eprintln!("{error}");
             }
         }
-        if direct.is_some() {
+
+        let now = Instant::now();
+        let mut ran = false;
+        if let Some(app) = self.app.as_deref_mut() {
+            for run in self.windows.values_mut() {
+                let mut direct = None;
+                if run.waiting.is_some_and(|until| until <= now) {
+                    run.waiting = None;
+                }
+                if run.waiting.is_none() && run.next_repaint.is_some_and(|at| at <= now) {
+                    run.next_repaint = None;
+                    if run.first_frame || run.window.is_minimized() == Some(true) {
+                        // Una ventana que no está en pantalla no necesita pasar por
+                        // `RedrawRequested`: la pasada se corre aquí mismo.
+                        direct = Some(Mode::Full);
+                    } else {
+                        run.window.request_redraw();
+                        run.redraw_deadline
+                            .get_or_insert(now + MISSED_REDRAW_TIMEOUT);
+                    }
+                }
+                if direct.is_none() && run.redraw_deadline.is_some_and(|at| at <= now) {
+                    run.redraw_deadline = None;
+                    direct = Some(Mode::LogicOnly);
+                }
+                if let Some(mode) = direct {
+                    run.pass(app, event_loop, mode);
+                    ran = true;
+                }
+            }
+        }
+        if ran {
             self.close_if_asked(event_loop);
         }
 
         // Siempre un flujo que duerme (nunca `Poll`): en reposo no se pinta nada.
-        let wake_at = self.running.as_ref().and_then(|run| {
-            // Mientras se espera un drawable, lo pendiente no corre antes de `waiting`.
-            let repaint = match (run.next_repaint, run.waiting) {
-                (Some(at), Some(until)) => Some(at.max(until)),
-                (at, _) => at,
-            };
-            [repaint, run.redraw_deadline].into_iter().flatten().min()
-        });
+        let wake_at = self
+            .windows
+            .values()
+            .filter_map(|run| {
+                // Mientras se espera un drawable, lo pendiente no corre antes de `waiting`.
+                let repaint = match (run.next_repaint, run.waiting) {
+                    (Some(at), Some(until)) => Some(at.max(until)),
+                    (at, _) => at,
+                };
+                [repaint, run.redraw_deadline].into_iter().flatten().min()
+            })
+            .min();
         event_loop.set_control_flow(match wake_at {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         });
     }
 
+    /// Cierra las ventanas que lo pidieron; sin ninguna, la aplicación termina.
     fn close_if_asked(&mut self, event_loop: &ActiveEventLoop) {
-        if self.running.as_ref().is_some_and(|run| run.close) {
+        let closing: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, run)| run.close)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in closing {
+            if let Some(app) = &mut self.app {
+                app.window_closed(id);
+            }
+            if let Some(run) = self.windows.remove(&id) {
+                run.ctx.on_exit();
+            }
+        }
+        if self.windows.is_empty() && self.app.is_some() {
             self.destroy();
             event_loop.exit();
         }
@@ -370,13 +471,14 @@ impl Running {
     }
 
     /// Una pasada: `logic()` y, si la ventana se ve (y `mode` lo permite), `ui()` y pintar.
-    fn pass(&mut self, event_loop: &ActiveEventLoop, mode: Mode) {
+    fn pass(&mut self, app: &mut dyn App, event_loop: &ActiveEventLoop, mode: Mode) {
         let started = Instant::now();
-        self.pass_inner(event_loop, mode);
+        self.pass_inner(app, event_loop, mode);
         debug::timing::add(&debug::timing::PASS, started.elapsed());
     }
 
-    fn pass_inner(&mut self, event_loop: &ActiveEventLoop, mode: Mode) {
+    fn pass_inner(&mut self, app: &mut dyn App, event_loop: &ActiveEventLoop, mode: Mode) {
+        let win = self.window.id();
         egui_winit::update_viewport_info(&mut self.info, &self.ctx, &self.window, false);
         // `update_viewport_info` no refresca esto en macOS; sin ello, una ventana
         // minimizada con `ViewportCommand::Minimized` y devuelta desde el Dock seguiría
@@ -392,7 +494,7 @@ impl Running {
         let mut input = std::mem::take(&mut self.pending_input);
         input.append(new_input); // donde coinciden gana lo nuevo
         input.time = Some(self.beginning.elapsed().as_secs_f64());
-        self.app.raw_input_hook(&self.ctx, &mut input);
+        app.raw_input_hook(win, &self.ctx, &mut input);
 
         let close_requested = input.viewport().close_requested();
 
@@ -406,8 +508,7 @@ impl Running {
         if mode == Mode::LogicOnly || !visible {
             // Sin pasada de egui: el estado de la interfaz queda como estaba para cuando
             // la ventana vuelva a verse.
-            let app = &mut self.app;
-            let output = self.ctx.run_logic(&input, |ctx| app.logic(ctx));
+            let output = self.ctx.run_logic(&input, |ctx| app.logic(win, ctx));
             // Ninguna pasada consumió la entrada: se guarda para la siguiente.
             self.pending_input = input;
 
@@ -422,7 +523,6 @@ impl Running {
             return;
         }
 
-        let app = &mut self.app;
         let egui::FullOutput {
             platform_output,
             mut textures_delta,
@@ -431,10 +531,10 @@ impl Running {
             viewport_output,
         } = self.ctx.run_ui(input, |ui| {
             let t = Instant::now();
-            app.logic(ui.ctx());
+            app.logic(win, ui.ctx());
             debug::timing::add(&debug::timing::LOGIC, t.elapsed());
             let t = Instant::now();
-            app.ui(ui);
+            app.ui(win, ui);
             debug::timing::add(&debug::timing::UI, t.elapsed());
         });
 
@@ -491,7 +591,7 @@ impl Running {
         let painted = self.painter.paint(
             [size.width, size.height],
             pixels_per_point,
-            self.app.clear_color(),
+            app.clear_color(),
             &primitives,
             &textures_delta,
             !shots.is_empty(),
@@ -567,17 +667,15 @@ impl Running {
     }
 }
 
-impl<F: FnOnce(&egui::Context) -> Box<dyn App>> ApplicationHandler<UserEvent> for Runner<F> {
+impl<F: FnOnce() -> Box<dyn App>> ApplicationHandler<UserEvent> for Runner<F> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.running.is_none() && self.create.is_some() {
-            match self.init(event_loop) {
-                Ok(running) => self.running = Some(running),
-                Err(error) => {
-                    self.error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
-            }
+        if self.app.is_none()
+            && self.create.is_some()
+            && let Err(error) = self.open_window(event_loop)
+        {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
         }
         self.after_event(event_loop);
     }
@@ -588,12 +686,13 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> ApplicationHandler<UserEvent> fo
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
-        if let Some(run) = &mut self.running {
-            match event {
-                UserEvent::Repaint {
-                    when,
-                    cumulative_pass_nr,
-                } => {
+        match event {
+            UserEvent::Repaint {
+                win,
+                when,
+                cumulative_pass_nr,
+            } => {
+                if let Some(run) = self.windows.get_mut(&win) {
                     // Una petición anterior a la última pasada ya está servida.
                     let current = run.ctx.cumulative_pass_nr_for(ViewportId::ROOT);
                     if current == cumulative_pass_nr || current == cumulative_pass_nr + 1 {
@@ -605,7 +704,9 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> ApplicationHandler<UserEvent> fo
                         run.next_repaint = Some(run.next_repaint.map_or(when, |at| at.min(when)));
                     }
                 }
-                UserEvent::Wake => {
+            }
+            UserEvent::Wake(win) => {
+                if let Some(run) = self.windows.get_mut(&win) {
                     run.wake_sent.store(false, Ordering::Release);
                     if run.skipped {
                         // Vuelve a haber drawable: se pinta lo que se quedó sin ver.
@@ -615,20 +716,22 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> ApplicationHandler<UserEvent> fo
                     }
                 }
             }
+            UserEvent::RepaintAll => {
+                // Como el `ctx.request_repaint()` que hacían antes: dos pasadas, y las
+                // ventanas ocultas a su ritmo pausado.
+                for run in self.windows.values() {
+                    run.ctx.request_repaint();
+                }
+            }
         }
         self.after_event(event_loop);
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        if let Some(run) = &mut self.running {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, win: WindowId, event: WindowEvent) {
+        if let (Some(run), Some(app)) = (self.windows.get_mut(&win), self.app.as_deref_mut()) {
             if matches!(event, WindowEvent::RedrawRequested) {
                 run.redraw_deadline = None;
-                run.pass(event_loop, Mode::Full);
+                run.pass(app, event_loop, Mode::Full);
             } else {
                 run.on_window_event(&event);
             }
@@ -642,8 +745,12 @@ impl<F: FnOnce(&egui::Context) -> Box<dyn App>> ApplicationHandler<UserEvent> fo
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
+        // El movimiento crudo del ratón es para la ventana con el foco.
         if let DeviceEvent::MouseMotion { delta } = event
-            && let Some(run) = &mut self.running
+            && let Some(run) = self
+                .windows
+                .values_mut()
+                .find(|run| run.info.focused == Some(true))
             && run.state.on_mouse_motion(delta)
         {
             run.repaint_now();

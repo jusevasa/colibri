@@ -51,6 +51,9 @@ pub enum Step {
     Scroll(i32),
     /// Muestra u oculta el botón «Actualizar» sin que haya una compilación nueva.
     Update,
+    /// Ventanas: `window new` abre una, `window close` cierra la del frente y
+    /// `window <n>` trae al frente la n-ésima (por orden de apertura, desde 0).
+    Window(String),
     Quit,
 }
 
@@ -100,6 +103,7 @@ impl Script {
                     "minimize" => Step::Minimize,
                     "scroll" => Step::Scroll(arg.parse().ok()?),
                     "update" => Step::Update,
+                    "window" => Step::Window(arg.to_string()),
                     "quit" => Step::Quit,
                     _ => return None,
                 })

@@ -64,7 +64,8 @@ const HOTKEY_PRESSED: u32 = 5;
 const SIGNATURE: u32 = 0x636C_6272;
 
 static PRESSED: AtomicBool = AtomicBool::new(false);
-static CTX: OnceLock<egui::Context> = OnceLock::new();
+/// El manejador de Carbon ya está instalado (una vez para los dos atajos).
+static HANDLER: OnceLock<()> = OnceLock::new();
 /// Los hotkeys registrados (un `EventHotKeyRef` cada uno), o 0 donde no hay.
 static CURRENT: Mutex<[usize; 2]> = Mutex::new([0; 2]);
 
@@ -130,16 +131,14 @@ extern "C" fn on_hotkey(_next: *mut c_void, event: *mut c_void, _user: *mut c_vo
             }
         }
     }
-    if let Some(ctx) = CTX.get() {
-        ctx.request_repaint();
-    }
+    crate::shell::wake_all();
     0
 }
 
 /// Registra `text` ("ctrl+alt+cmd+j") como ese atajo global, sustituyendo al anterior.
 /// Vacío o no reconocido = sin atajo global. Devuelve false si no se pudo registrar.
 /// Debe llamarse desde el hilo principal.
-pub fn set(ctx: &egui::Context, which: Global, text: &str) -> bool {
+pub fn set(which: Global, text: &str) -> bool {
     let mut all = CURRENT.lock().unwrap();
     let current = &mut all[which as usize];
     unsafe {
@@ -150,7 +149,7 @@ pub fn set(ctx: &egui::Context, which: Global, text: &str) -> bool {
         let Some((code, modifiers)) = Shortcut::parse(text).and_then(|sc| carbon(&sc)) else {
             return text.trim().is_empty();
         };
-        if CTX.set(ctx.clone()).is_ok() {
+        if HANDLER.set(()).is_ok() {
             let spec = EventTypeSpec {
                 class: CLASS_KEYBOARD,
                 kind: HOTKEY_PRESSED,

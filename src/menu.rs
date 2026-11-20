@@ -1,7 +1,6 @@
 //! Entrada «Reiniciar Colibrí» en el menú de la aplicación (el que lleva su nombre en la
 //! barra de menús de macOS), junto a «Quit».
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use objc2::rc::Retained;
@@ -11,7 +10,6 @@ use objc2_foundation::NSString;
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 static RESTART: AtomicBool = AtomicBool::new(false);
-static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 define_class!(
     // SAFETY: NSObject no impone requisitos de subclase y Target no implementa Drop.
@@ -25,9 +23,7 @@ define_class!(
         #[unsafe(method(restart:))]
         fn restart(&self, _sender: *mut AnyObject) {
             RESTART.store(true, Ordering::Relaxed);
-            if let Some(ctx) = CTX.get() {
-                ctx.request_repaint();
-            }
+            crate::shell::wake_all();
         }
     }
 );
@@ -35,7 +31,7 @@ define_class!(
 /// Añade la entrada si aún no está. El menú lo crea el sistema de ventanas al arrancar, así
 /// que puede no existir todavía: se llama en cada cuadro hasta que lo consigue (después no
 /// cuesta nada). Debe llamarse desde el hilo principal.
-pub fn install(ctx: &egui::Context) {
+pub fn install() {
     if INSTALLED.load(Ordering::Relaxed) {
         return;
     }
@@ -57,7 +53,6 @@ pub fn install(ctx: &egui::Context) {
         if menu.is_null() {
             return;
         }
-        let _ = CTX.set(ctx.clone());
         let target: Retained<Target> = msg_send![Target::alloc(), init];
         let title = NSString::from_str("Reiniciar Colibrí");
         let key = NSString::from_str("");

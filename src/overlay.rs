@@ -218,14 +218,14 @@ fn clicked_outside(ctx: &egui::Context, rect: Rect) -> bool {
 
 impl App {
     pub fn overlay_ui(&mut self, ctx: &egui::Context) {
-        if self.overlay == Overlay::None {
+        if self.w.overlay == Overlay::None {
             return;
         }
         if pressed(ctx, Key::Escape) {
             self.cancel_overlay();
             return;
         }
-        match self.overlay.clone() {
+        match self.w.overlay.clone() {
             Overlay::None => {}
             Overlay::Palette { query, sel } => self.palette_ui(ctx, query, sel),
             Overlay::Prefs { sel } => self.prefs_ui(ctx, sel),
@@ -250,6 +250,7 @@ impl App {
         // Espacio, en la lista de carpetas y archivos, es la vista previa de Finder (y no
         // un carácter de la búsqueda).
         let files = self
+            .w
             .picks
             .iter()
             .any(|p| matches!(p.kind, PickKind::Dir | PickKind::File));
@@ -266,11 +267,13 @@ impl App {
         }
         let q = query.trim().to_lowercase();
         let branches = self
+            .w
             .picks
             .iter()
             .any(|p| matches!(p.kind, PickKind::Branch | PickKind::CurrentBranch));
         // Los ocultos (.git, .env…) solo salen si se buscan con el punto por delante.
         let items: Vec<&Pick> = self
+            .w
             .picks
             .iter()
             .filter(|p| match p.kind {
@@ -295,13 +298,13 @@ impl App {
             .filter(|_| !items.is_empty());
         if preview {
             let path = items.get(sel).and_then(|p| {
-                let cwd = &self.sessions.get(self.active)?.cwd;
+                let cwd = &self.w.sessions.get(self.w.active)?.cwd;
                 Some(match p.kind {
                     PickKind::Parent => cwd.parent()?.to_path_buf(),
                     _ => cwd.join(&p.name),
                 })
             });
-            quick_look(&mut self.preview, path);
+            quick_look(&mut self.w.preview, path);
         }
 
         const VISIBLE: usize = 10;
@@ -315,8 +318,8 @@ impl App {
         let max_x = (screen.right() - width - 8.0).max(screen.left() + 8.0);
         let max_y = (screen.bottom() - height - 8.0).max(screen.top() + 8.0);
         let pos = Pos2::new(
-            self.pick_anchor.x.clamp(screen.left() + 8.0, max_x),
-            (self.pick_anchor.y + 4.0).min(max_y),
+            self.w.pick_anchor.x.clamp(screen.left() + 8.0, max_x),
+            (self.w.pick_anchor.y + 4.0).min(max_y),
         );
         let first = sel.saturating_sub(VISIBLE - 1);
 
@@ -449,8 +452,8 @@ impl App {
 
         if let Some(i) = pick {
             let (kind, name) = (items[i].kind, items[i].name.clone());
-            self.overlay = Overlay::None;
-            if let Some(s) = self.sessions.get_mut(self.active) {
+            self.w.overlay = Overlay::None;
+            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 let run = match kind {
                     PickKind::CurrentBranch => None,
                     PickKind::Branch => Some(format!("git checkout {}", shell_arg(&name))),
@@ -467,17 +470,17 @@ impl App {
                 }
             }
         } else if clicked_outside(ctx, out.response.rect) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::Picker { query, sel };
+            self.w.overlay = Overlay::Picker { query, sel };
         }
     }
 
     /// Cierra el overlay deshaciendo lo que hubiera dejado a medias en el prompt: el
     /// historial devuelve lo que estaba escrito y las sugerencias, la palabra original.
     pub fn cancel_overlay(&mut self) {
-        let overlay = std::mem::replace(&mut self.overlay, Overlay::None);
-        let Some(s) = self.sessions.get_mut(self.active) else {
+        let overlay = std::mem::replace(&mut self.w.overlay, Overlay::None);
+        let Some(s) = self.w.sessions.get_mut(self.w.active) else {
             return;
         };
         match overlay {
@@ -500,9 +503,9 @@ impl App {
     /// elegido está siempre escrito en el prompt, así que Enter lo ejecuta y cualquier otra
     /// tecla cierra la lista y lo edita. El más reciente va abajo; ↑ va hacia los antiguos.
     fn history_ui(&mut self, ctx: &egui::Context, mut sel: usize, original: String) {
-        let n = self.history.len();
+        let n = self.w.history.len();
         if n == 0 {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
             return;
         }
         let before = sel;
@@ -540,16 +543,17 @@ impl App {
         let small = FontId::proportional(11.0);
         let screen = ctx.content_rect();
         // Todo el ancho de la terminal: los comandos largos se ven enteros.
-        let area = if self.term_rect.is_positive() {
-            self.term_rect
+        let area = if self.w.term_rect.is_positive() {
+            self.w.term_rect
         } else {
             screen
         };
         let width = (area.width() - 16.0).max(200.0);
         let height = n.min(VISIBLE) as f32 * ROW + FOOT + 8.0;
         let cursor = self
+            .w
             .sessions
-            .get(self.active)
+            .get(self.w.active)
             .and_then(|s| s.cursor_px)
             .unwrap_or_else(|| {
                 Rect::from_min_size(
@@ -602,7 +606,7 @@ impl App {
                                     pal.fg.gamma_multiply(0.04),
                                 );
                             }
-                            let entry = &self.history[i];
+                            let entry = &self.w.history[i];
                             let when = entry.at.map(ago).unwrap_or_default();
                             let when_w = if when.is_empty() { 0.0 } else { 86.0 };
                             let label = entry.cmd.replace('\n', " ↵ ");
@@ -657,19 +661,19 @@ impl App {
             sel = i;
         }
         if sel != before
-            && let Some(s) = self.sessions.get_mut(self.active)
+            && let Some(s) = self.w.sessions.get_mut(self.w.active)
         {
-            s.insert_command(&self.history[sel].cmd);
+            s.insert_command(&self.w.history[sel].cmd);
         }
         if run {
-            self.overlay = Overlay::None;
-            if let Some(s) = self.sessions.get_mut(self.active) {
+            self.w.overlay = Overlay::None;
+            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 s.input(b"\r".to_vec());
             }
         } else if keep || other || pick.is_some() || clicked_outside(ctx, out.response.rect) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::History { sel, original };
+            self.w.overlay = Overlay::History { sel, original };
         }
     }
 
@@ -687,8 +691,8 @@ impl App {
         x: f32,
     ) {
         use crate::complete;
-        let Some(s) = self.sessions.get(self.active) else {
-            self.overlay = Overlay::None;
+        let Some(s) = self.w.sessions.get(self.w.active) else {
+            self.w.overlay = Overlay::None;
             return;
         };
         if s.prompt_line() != Some(line.as_str()) {
@@ -698,7 +702,7 @@ impl App {
                 .map(|(l, t)| (complete::candidates(&s.cwd, &t), l, t))
                 .filter(|(found, ..)| !found.is_empty());
             let Some((found, l, t)) = fresh else {
-                self.overlay = Overlay::None;
+                self.w.overlay = Overlay::None;
                 return;
             };
             (items, line, target, sel) = (found, l, t, None);
@@ -890,7 +894,7 @@ impl App {
         // Lo elegido se escribe en el prompt en lugar de lo que hubiera (la palabra
         // original o la opción anterior).
         if next != sel
-            && let (Some(i), Some(s)) = (next, self.sessions.get_mut(self.active))
+            && let (Some(i), Some(s)) = (next, self.w.sessions.get_mut(self.w.active))
         {
             let written = match sel {
                 Some(j) => complete::replacement(&target, &items[j]),
@@ -907,9 +911,9 @@ impl App {
             sel = next;
         }
         if accept || clicked_outside(ctx, out.response.rect) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::Complete {
+            self.w.overlay = Overlay::Complete {
                 target,
                 items,
                 sel,
@@ -948,7 +952,7 @@ impl App {
             .iter()
             .map(|(label, cmd)| (label.to_string(), self.keys.label(*cmd), *cmd))
             .collect();
-        for (i, s) in self.sessions.iter().enumerate() {
+        for (i, s) in self.w.sessions.iter().enumerate() {
             let key = if i < 9 {
                 format!("⌘{}", i + 1)
             } else {
@@ -1077,12 +1081,12 @@ impl App {
         });
 
         if let Some((_, _, cmd)) = run.and_then(|i| items.get(i)) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
             self.run(ctx, *cmd);
         } else if clicked_outside(ctx, rect) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::Palette { query, sel };
+            self.w.overlay = Overlay::Palette { query, sel };
         }
     }
 
@@ -1213,7 +1217,7 @@ impl App {
             _ => {}
         }
         if self.cfg != old {
-            self.commit_cfg(ctx, &old);
+            self.commit_cfg(&old);
         }
     }
 
@@ -1406,10 +1410,10 @@ impl App {
         });
 
         if clicked_outside(ctx, rect) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
             return;
         }
-        self.overlay = Overlay::Prefs { sel };
+        self.w.overlay = Overlay::Prefs { sel };
         if let Some((i, dir)) = change {
             self.pref_change(ctx, PREF_ROWS[i].0, dir);
         }
@@ -1474,14 +1478,14 @@ impl App {
             );
         });
         if pressed(ctx, Key::Enter) {
-            if let Some(s) = self.sessions.get_mut(self.active) {
+            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 s.name = text.trim().to_string();
             }
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
         } else if clicked_outside(ctx, rect) {
-            self.overlay = Overlay::None;
+            self.w.overlay = Overlay::None;
         } else {
-            self.overlay = Overlay::Rename { text };
+            self.w.overlay = Overlay::Rename { text };
         }
     }
 }

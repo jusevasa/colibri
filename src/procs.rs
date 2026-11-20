@@ -30,7 +30,7 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    pub fn start(ctx: egui::Context) -> Self {
+    pub fn start() -> Self {
         let data = Arc::new(Mutex::new(Snapshot::default()));
         let enabled = Arc::new(AtomicBool::new(false));
         let (d, e) = (data.clone(), enabled.clone());
@@ -56,7 +56,7 @@ impl Monitor {
                         if *guard != snap {
                             *guard = snap;
                             drop(guard);
-                            ctx.request_repaint();
+                            crate::shell::wake_all();
                         }
                         std::thread::sleep(Duration::from_secs(2));
                     } else {

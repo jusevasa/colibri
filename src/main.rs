@@ -29,6 +29,8 @@ use egui::{
     Sense, Stroke, StrokeKind, Vec2, ViewportCommand,
 };
 use session::Session;
+use shell::WindowId;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -86,7 +88,7 @@ fn main() -> Result<(), String> {
         .with_transparent(true);
     macos::install();
     // ⌘C/⌘X/⌘V los traduce `clip::translate` (el lanzador apaga los atajos de egui).
-    shell::run(viewport, |ctx| Box::new(App::new(ctx)))
+    shell::run(viewport, || Box::new(App::new()))
 }
 
 /// Todo lo que se puede hacer desde un atajo o desde la paleta de comandos.
@@ -172,8 +174,20 @@ struct App {
     keys: Keys,
     cfg_mtime: Option<SystemTime>,
     cfg_checked: Instant,
-    sessions: Vec<Session>,
-    active: usize,
+    /// La ventana en curso: aquella cuya pasada se está corriendo. Casi todo el código
+    /// trabaja con `self.w` sin saber que hay más ventanas (ver `enter`).
+    w: Win,
+    /// De qué ventana es `w` (`None` antes de abrir la primera).
+    cur: Option<WindowId>,
+    /// Las demás ventanas, apartadas mientras no les toca.
+    parked: HashMap<WindowId, Win>,
+    /// La última ventana que tuvo el foco: la que reciben lo que llega de fuera (Finder,
+    /// atajo global, guion).
+    front: Option<WindowId>,
+    /// Ventanas nuevas pedidas que el lanzador aún no ha abierto.
+    want_windows: usize,
+    /// Las ventanas abiertas, por orden de apertura.
+    order: Vec<WindowId>,
     next_id: u64,
     show_agents: bool,
     show_ports: bool,
@@ -189,18 +203,13 @@ struct App {
     stubborn: std::collections::HashSet<i32>,
     /// Solo para pruebas: dibuja los botones de fila sin puntero encima.
     force_hover: bool,
-    /// Radio de desenfoque aplicado a la ventana, si ya se aplicó alguno.
-    blur_applied: Option<i64>,
-    search_focus: bool,
     zoom: f32,
     ports: ports::Ports,
     show_other_ports: bool,
-    focused: bool,
     script: Option<debug::Script>,
     state_path: Option<std::path::PathBuf>,
     saved: state::Saved,
     state_checked: Instant,
-    overlay: overlay::Overlay,
     font_choices: Vec<(String, String, String)>,
     /// Fecha del ejecutable al arrancar: si cambia, hay una compilación nueva.
     exe_started: Option<SystemTime>,
@@ -208,6 +217,29 @@ struct App {
     update_ready: bool,
     /// Solo para pruebas: muestra el botón «Actualizar» aunque no haya nada nuevo.
     force_update: bool,
+    /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
+    script_keys: Vec<(egui::Key, egui::Modifiers)>,
+    /// Solo para pruebas: eventos de puntero del guion (`press`, `moveto`, `release`).
+    script_pointer: Vec<egui::Event>,
+    /// Archivos que el guion suelta sobre la ventana (`drop`).
+    script_drops: Vec<PathBuf>,
+    /// Número que lleva ahora el icono del Dock: pestañas que terminaron sin verse.
+    badge: usize,
+    /// La entrada segura de teclado está puesta.
+    secure: bool,
+}
+
+/// Lo que es de cada ventana: sus pestañas y el estado de su interfaz.
+pub struct Win {
+    /// El contexto de egui de la ventana (para pedirle cuadros o comandos desde otra).
+    ctx: egui::Context,
+    sessions: Vec<Session>,
+    active: usize,
+    focused: bool,
+    /// Radio de desenfoque aplicado a la ventana, si ya se aplicó alguno.
+    blur_applied: Option<i64>,
+    search_focus: bool,
+    overlay: overlay::Overlay,
     /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
     drag_tab: Option<(u64, f32)>,
     /// Ancho y origen de las pestañas en el cuadro anterior: si cambian (se redimensiona la
@@ -221,16 +253,6 @@ struct App {
     pick_anchor: Pos2,
     /// Rama y cambios de la carpeta de la pestaña activa (barra de estado).
     git: git::Watch,
-    /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
-    script_keys: Vec<(egui::Key, egui::Modifiers)>,
-    /// Solo para pruebas: eventos de puntero del guion (`press`, `moveto`, `release`).
-    script_pointer: Vec<egui::Event>,
-    /// Archivos que el guion suelta sobre la ventana (`drop`).
-    script_drops: Vec<PathBuf>,
-    /// Número que lleva ahora el icono del Dock: pestañas que terminaron sin verse.
-    badge: usize,
-    /// La entrada segura de teclado está puesta.
-    secure: bool,
     /// Vista previa (Quick Look) abierta desde el desplegable de carpetas.
     preview: Option<std::process::Child>,
     /// Si macOS puede mover la ventana ahora mismo (se apaga con el puntero sobre las pestañas).
@@ -239,75 +261,107 @@ struct App {
     pub term_rect: Rect,
 }
 
-impl App {
+impl Win {
     fn new(ctx: &egui::Context) -> Self {
-        macos::set_context(ctx);
-        let cfg = config::load();
-        ctx.set_theme(egui::Theme::Dark);
-        ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        install_fonts(ctx, &cfg);
-        notify::init(ctx);
-        hotkey::set(ctx, hotkey::Global::Jump, &cfg.keys.global_jump);
-        hotkey::set(ctx, hotkey::Global::Focus, &cfg.keys.global_focus);
-        let mut app = Self {
-            pal: Palette::new(&cfg.theme),
-            keys: Keys::new(&cfg.keys),
-            cfg_mtime: config::mtime(),
-            cfg_checked: Instant::now(),
+        Self {
+            ctx: ctx.clone(),
             sessions: Vec::new(),
             active: 0,
-            next_id: 1,
-            show_agents: cfg.show_agents,
-            show_ports: cfg.show_ports,
-            show_procs: cfg.show_processes,
-            monitor: procs::Monitor::start(ctx.clone()),
-            proc_search: String::new(),
-            proc_sort_mem: false,
-            confirm_stop: None,
-            stopping: Default::default(),
-            stubborn: Default::default(),
-            force_hover: false,
+            focused: true,
             blur_applied: None,
             search_focus: false,
-            zoom: 0.0,
-            ports: ports::Ports::start(ctx.clone()),
-            show_other_ports: false,
-            focused: true,
-            script: debug::Script::from_env(),
-            state_path: None,
-            saved: state::Saved::default(),
-            state_checked: Instant::now(),
             overlay: overlay::Overlay::None,
-            font_choices: Vec::new(),
-            exe_started: exe_mtime(),
-            exe_checked: Instant::now(),
-            update_ready: false,
-            force_update: false,
             drag_tab: None,
             tab_layout: (0.0, 0.0),
             history: Vec::new(),
             picks: Vec::new(),
             pick_anchor: Pos2::ZERO,
             git: git::Watch::new(),
+            preview: None,
+            window_movable: None,
+            term_rect: Rect::NOTHING,
+        }
+    }
+}
+
+impl App {
+    fn new() -> Self {
+        let cfg = config::load();
+        notify::init();
+        hotkey::set(hotkey::Global::Jump, &cfg.keys.global_jump);
+        hotkey::set(hotkey::Global::Focus, &cfg.keys.global_focus);
+        let script = debug::Script::from_env();
+        Self {
+            pal: Palette::new(&cfg.theme),
+            keys: Keys::new(&cfg.keys),
+            cfg_mtime: config::mtime(),
+            cfg_checked: Instant::now(),
+            // Hasta que se abra la primera ventana, una de relleno sin pestañas.
+            w: Win::new(&egui::Context::default()),
+            cur: None,
+            parked: HashMap::new(),
+            front: None,
+            want_windows: 0,
+            order: Vec::new(),
+            next_id: 1,
+            show_agents: cfg.show_agents,
+            show_ports: cfg.show_ports,
+            show_procs: cfg.show_processes,
+            monitor: procs::Monitor::start(),
+            proc_search: String::new(),
+            proc_sort_mem: false,
+            confirm_stop: None,
+            stopping: Default::default(),
+            stubborn: Default::default(),
+            force_hover: false,
+            zoom: 0.0,
+            ports: ports::Ports::start(),
+            show_other_ports: false,
+            state_path: state::path(script.is_some()),
+            script,
+            saved: state::Saved::default(),
+            state_checked: Instant::now(),
+            font_choices: Vec::new(),
+            exe_started: exe_mtime(),
+            exe_checked: Instant::now(),
+            update_ready: false,
+            force_update: false,
             script_keys: Vec::new(),
             script_pointer: Vec::new(),
             script_drops: Vec::new(),
             badge: 0,
             secure: false,
-            preview: None,
-            window_movable: None,
-            term_rect: Rect::NOTHING,
             cfg,
-        };
-        app.state_path = state::path(app.script.is_some());
-        app.restore_tabs(ctx);
-        if app.sessions.is_empty() {
-            let start_dir = std::env::current_dir()
-                .ok()
-                .filter(|p| p.as_os_str() != "/");
-            app.new_tab(ctx, start_dir);
         }
-        app
+    }
+
+    /// Hace de `win` la ventana en curso: aparta la que lo era y trae esa a `self.w`.
+    fn enter(&mut self, win: WindowId) {
+        if self.cur == Some(win) {
+            return;
+        }
+        let Some(next) = self.parked.remove(&win) else {
+            return;
+        };
+        let prev = std::mem::replace(&mut self.w, next);
+        if let Some(prev_id) = self.cur {
+            self.parked.insert(prev_id, prev);
+        }
+        self.cur = Some(win);
+    }
+
+    /// Todas las ventanas, empezando por la que está en curso.
+    fn windows(&self) -> impl Iterator<Item = &Win> {
+        std::iter::once(&self.w)
+            .filter(|_| self.cur.is_some())
+            .chain(self.parked.values())
+    }
+
+    /// Instala las fuentes en el contexto de cada ventana (cada una tiene su atlas).
+    fn install_fonts_everywhere(&self, cfg: &Config) {
+        for w in self.windows() {
+            install_fonts(&w.ctx, cfg);
+        }
     }
 
     /// Reabre las pestañas de la última vez, cada una en su carpeta. Donde corría Claude Code
@@ -323,10 +377,10 @@ impl App {
             if !dir.is_dir() {
                 continue;
             }
-            let before = self.sessions.len();
+            let before = self.w.sessions.len();
             self.new_tab(ctx, Some(dir));
-            if self.sessions.len() > before {
-                if let Some(s) = self.sessions.last_mut() {
+            if self.w.sessions.len() > before {
+                if let Some(s) = self.w.sessions.last_mut() {
                     s.name = tab.name.clone();
                     s.color = TAB_COLORS
                         .iter()
@@ -334,14 +388,14 @@ impl App {
                         .map(|k| k as u8);
                 }
             }
-            if tab.agent == "claude" && self.sessions.len() > before {
-                if let Some(s) = self.sessions.last_mut() {
+            if tab.agent == "claude" && self.w.sessions.len() > before {
+                if let Some(s) = self.w.sessions.last_mut() {
                     s.suggestion = Some("claude --continue".into());
                 }
             }
         }
-        if !self.sessions.is_empty() {
-            self.active = saved.active.min(self.sessions.len() - 1);
+        if !self.w.sessions.is_empty() {
+            self.w.active = saved.active.min(self.w.sessions.len() - 1);
         }
         self.saved = saved;
     }
@@ -351,15 +405,17 @@ impl App {
         let Some(path) = self.state_path.clone().filter(|_| self.cfg.restore_tabs) else {
             return;
         };
-        if !self.sessions.is_empty() && self.state_checked.elapsed() < Duration::from_secs(2) {
+        if !self.w.sessions.is_empty() && self.state_checked.elapsed() < Duration::from_secs(2) {
             return;
         }
         self.state_checked = Instant::now();
+        // Todas las ventanas en una sola lista, la de la ventana en curso primero.
+        // TODO(multiventana, paso 2): guardar cada ventana por separado.
         let now = state::Saved {
-            active: self.active,
+            active: self.w.active,
             tabs: self
-                .sessions
-                .iter()
+                .windows()
+                .flat_map(|w| w.sessions.iter())
                 .map(|s| state::Tab {
                     cwd: s.cwd.display().to_string(),
                     name: s.name.clone(),
@@ -385,7 +441,7 @@ impl App {
     /// (caja de la rama) o lo que hay en la carpeta (caja de la carpeta).
     fn open_picker(&mut self, ctx: &egui::Context, chip: char, at: Pos2) {
         use overlay::{Pick, PickKind};
-        let Some(cwd) = self.sessions.get(self.active).map(|s| s.cwd.clone()) else {
+        let Some(cwd) = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone()) else {
             return;
         };
         let mut picks: Vec<Pick> = Vec::new();
@@ -427,9 +483,9 @@ impl App {
         if picks.is_empty() {
             return;
         }
-        self.picks = picks;
-        self.pick_anchor = at;
-        self.overlay = overlay::Overlay::Picker {
+        self.w.picks = picks;
+        self.w.pick_anchor = at;
+        self.w.overlay = overlay::Overlay::Picker {
             query: String::new(),
             sel: 0,
         };
@@ -444,15 +500,15 @@ impl App {
             self.cfg.shell.clone()
         };
         let mut typed: Vec<String> = Vec::new();
-        for (i, s) in self.sessions.iter().enumerate() {
-            if i != self.active {
+        for (i, s) in self.w.sessions.iter().enumerate() {
+            if i != self.w.active {
                 typed.extend(s.typed.iter().cloned());
             }
         }
-        if let Some(s) = self.sessions.get(self.active) {
+        if let Some(s) = self.w.sessions.get(self.w.active) {
             typed.extend(s.typed.iter().cloned());
         }
-        self.history = history::load(&shell, &typed);
+        self.w.history = history::load(&shell, &typed);
     }
 
     /// Abre el historial sobre el prompt, filtrado por lo que ya hay escrito (como prefijo),
@@ -460,8 +516,9 @@ impl App {
     /// ofrecer o no se está en el prompt.
     fn open_history(&mut self, ctx: &egui::Context) -> bool {
         let Some(original) = self
+            .w
             .sessions
-            .get(self.active)
+            .get(self.w.active)
             .filter(|s| s.at_prompt())
             .map(|s| s.prompt_line().unwrap_or("").to_string())
         else {
@@ -469,14 +526,17 @@ impl App {
         };
         self.load_history();
         let prefix = original.to_lowercase();
-        self.history
+        self.w
+            .history
             .retain(|e| e.cmd != original && e.cmd.to_lowercase().starts_with(&prefix));
-        let (Some(first), Some(s)) = (self.history.first(), self.sessions.get_mut(self.active))
-        else {
+        let (Some(first), Some(s)) = (
+            self.w.history.first(),
+            self.w.sessions.get_mut(self.w.active),
+        ) else {
             return false;
         };
         s.insert_command(&first.cmd);
-        self.overlay = overlay::Overlay::History { sel: 0, original };
+        self.w.overlay = overlay::Overlay::History { sel: 0, original };
         ctx.request_repaint();
         true
     }
@@ -485,8 +545,9 @@ impl App {
     fn history_key(&mut self, ctx: &egui::Context) {
         if !self.cfg.history_popup
             || !self
+                .w
                 .sessions
-                .get(self.active)
+                .get(self.w.active)
                 .is_some_and(|s| s.at_prompt())
         {
             return;
@@ -503,7 +564,7 @@ impl App {
         }
         if !self.open_history(ctx) {
             // Sin historial que mostrar, el shell recibe su flecha de siempre.
-            if let Some(s) = self.sessions.get_mut(self.active) {
+            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 let app = s
                     .term
                     .lock()
@@ -522,7 +583,7 @@ impl App {
     /// sabe qué hay escrito, o nada coincide, el Tab le llega al shell como siempre.
     /// Con una sugerencia en gris en el prompt: Enter la ejecuta, Tab o → la dejan escrita.
     fn suggest_key(&mut self, ctx: &egui::Context) {
-        let Some(s) = self.sessions.get_mut(self.active) else {
+        let Some(s) = self.w.sessions.get_mut(self.w.active) else {
             return;
         };
         if s.suggested().is_none() {
@@ -548,7 +609,12 @@ impl App {
         if !self.cfg.complete_popup {
             return;
         }
-        let Some(s) = self.sessions.get_mut(self.active).filter(|s| s.at_prompt()) else {
+        let Some(s) = self
+            .w
+            .sessions
+            .get_mut(self.w.active)
+            .filter(|s| s.at_prompt())
+        else {
             return;
         };
         let tab_down = ctx.input(|i| {
@@ -574,7 +640,7 @@ impl App {
             return;
         }
         let items = complete::candidates(&s.cwd, &target);
-        let Some(s) = self.sessions.get_mut(self.active) else {
+        let Some(s) = self.w.sessions.get_mut(self.w.active) else {
             return;
         };
         match items.as_slice() {
@@ -588,7 +654,7 @@ impl App {
                 let x = s.cursor_px.map_or(0.0, |c| {
                     c.left() - target.token.chars().count() as f32 * c.width()
                 });
-                self.overlay = overlay::Overlay::Complete {
+                self.w.overlay = overlay::Overlay::Complete {
                     line: s.prompt_line().unwrap_or("").to_string(),
                     target,
                     items,
@@ -645,56 +711,56 @@ impl App {
         match Session::new(self.next_id, &self.cfg, cwd, ctx) {
             Ok(s) => {
                 self.next_id += 1;
-                self.sessions.push(s);
-                self.active = self.sessions.len() - 1;
+                self.w.sessions.push(s);
+                self.w.active = self.w.sessions.len() - 1;
             }
             Err(e) => eprintln!("colibri: no se pudo abrir la terminal: {e}"),
         }
     }
 
     fn close_tab(&mut self, i: usize) {
-        if i >= self.sessions.len() {
+        if i >= self.w.sessions.len() {
             return;
         }
-        self.sessions.remove(i);
-        if self.active > i || self.active >= self.sessions.len() {
-            self.active = self.active.saturating_sub(1);
+        self.w.sessions.remove(i);
+        if self.w.active > i || self.w.active >= self.w.sessions.len() {
+            self.w.active = self.w.active.saturating_sub(1);
         }
     }
 
     /// Cambia una pestaña de posición; la activa sigue siendo la misma.
     fn move_tab(&mut self, from: usize, to: usize) {
-        let n = self.sessions.len();
+        let n = self.w.sessions.len();
         if from >= n || to >= n || from == to {
             return;
         }
-        let active_id = self.sessions.get(self.active).map(|s| s.id);
-        let tab = self.sessions.remove(from);
-        self.sessions.insert(to, tab);
-        if let Some(i) = active_id.and_then(|id| self.sessions.iter().position(|s| s.id == id)) {
-            self.active = i;
+        let active_id = self.w.sessions.get(self.w.active).map(|s| s.id);
+        let tab = self.w.sessions.remove(from);
+        self.w.sessions.insert(to, tab);
+        if let Some(i) = active_id.and_then(|id| self.w.sessions.iter().position(|s| s.id == id)) {
+            self.w.active = i;
         }
     }
 
     fn select(&mut self, i: usize) {
-        if i < self.sessions.len() {
-            self.active = i;
-            self.sessions[i].unseen = false;
+        if i < self.w.sessions.len() {
+            self.w.active = i;
+            self.w.sessions[i].unseen = false;
         }
     }
 
     /// Recorre solo las pestañas con agente, en el orden del panel «Agentes», dando la vuelta.
     fn step_agent(&mut self, forward: bool) {
-        let n = self.sessions.len();
+        let n = self.w.sessions.len();
         let target = (1..=n)
             .map(|d| {
                 if forward {
-                    (self.active + d) % n
+                    (self.w.active + d) % n
                 } else {
-                    (self.active + n - d) % n
+                    (self.w.active + n - d) % n
                 }
             })
-            .find(|&i| self.sessions[i].agent.is_some());
+            .find(|&i| self.w.sessions[i].agent.is_some());
         if let Some(i) = target {
             self.select(i);
         }
@@ -712,25 +778,48 @@ impl App {
                 .max_by_key(|(_, s)| s.finished_at)
                 .map(|(i, _)| i)
         };
-        let target = best(true, &self.sessions, self.active)
-            .or_else(|| best(false, &self.sessions, self.active));
+        let target = best(true, &self.w.sessions, self.w.active)
+            .or_else(|| best(false, &self.w.sessions, self.w.active));
         if let Some(i) = target {
             self.select(i);
         }
     }
 
-    fn reload_config(&mut self, ctx: &egui::Context) {
+    /// Trae al frente la ventana de esa pestaña y la elige (clic en una notificación).
+    fn focus_session(&mut self, id: u64) {
+        let win = self
+            .parked
+            .iter()
+            .find(|(_, w)| w.sessions.iter().any(|s| s.id == id))
+            .map(|(win, _)| *win)
+            .or(self.cur);
+        // Se vuelve a la ventana en curso al acabar: esto corre dentro de su pasada.
+        let back = self.cur;
+        if let Some(win) = win {
+            self.enter(win);
+        }
+        if let Some(i) = self.w.sessions.iter().position(|s| s.id == id) {
+            self.select(i);
+        }
+        // `send_viewport_cmd` pide además un cuadro a esa ventana.
+        self.w.ctx.send_viewport_cmd(ViewportCommand::Focus);
+        if let Some(back) = back {
+            self.enter(back);
+        }
+    }
+
+    fn reload_config(&mut self) {
         let new = config::load();
         if new.font_path != self.cfg.font_path || new.font_bold_path != self.cfg.font_bold_path {
-            install_fonts(ctx, &new);
+            self.install_fonts_everywhere(&new);
         }
         self.pal = Palette::new(&new.theme);
         self.keys = Keys::new(&new.keys);
         if new.keys.global_jump != self.cfg.keys.global_jump {
-            hotkey::set(ctx, hotkey::Global::Jump, &new.keys.global_jump);
+            hotkey::set(hotkey::Global::Jump, &new.keys.global_jump);
         }
         if new.keys.global_focus != self.cfg.keys.global_focus {
-            hotkey::set(ctx, hotkey::Global::Focus, &new.keys.global_focus);
+            hotkey::set(hotkey::Global::Focus, &new.keys.global_focus);
         }
         self.cfg = new;
     }
@@ -767,7 +856,7 @@ impl App {
             };
             if take_shortcut(ctx, &sc) {
                 // Como en los navegadores: cmd+9 va a la última.
-                let n = self.sessions.len();
+                let n = self.w.sessions.len();
                 self.run(
                     ctx,
                     Cmd::GoTab(if i == 8 { n.saturating_sub(1) } else { i }),
@@ -777,18 +866,20 @@ impl App {
     }
 
     pub fn run(&mut self, ctx: &egui::Context, cmd: Cmd) {
-        let n = self.sessions.len();
+        let n = self.w.sessions.len();
         match cmd {
             Cmd::NewTab => {
-                let cwd = self.sessions.get(self.active).map(|s| s.cwd.clone());
+                let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
                 self.new_tab(ctx, cwd);
             }
-            Cmd::CloseTab => self.close_tab(self.active),
-            Cmd::NextTab if n > 0 => self.select((self.active + 1) % n),
-            Cmd::PrevTab if n > 0 => self.select((self.active + n - 1) % n),
+            Cmd::CloseTab => self.close_tab(self.w.active),
+            Cmd::NextTab if n > 0 => self.select((self.w.active + 1) % n),
+            Cmd::PrevTab if n > 0 => self.select((self.w.active + n - 1) % n),
             Cmd::NextTab | Cmd::PrevTab => {}
-            Cmd::MoveTabLeft if self.active > 0 => self.move_tab(self.active, self.active - 1),
-            Cmd::MoveTabRight => self.move_tab(self.active, self.active + 1),
+            Cmd::MoveTabLeft if self.w.active > 0 => {
+                self.move_tab(self.w.active, self.w.active - 1)
+            }
+            Cmd::MoveTabRight => self.move_tab(self.w.active, self.w.active + 1),
             Cmd::MoveTabLeft => {}
             Cmd::GoTab(i) => self.select(i),
             Cmd::NextAgent => self.step_agent(true),
@@ -807,7 +898,7 @@ impl App {
             Cmd::FontSmaller => self.zoom = (self.zoom - 1.0).max(6.0 - self.cfg.font_size),
             Cmd::FontReset => self.zoom = 0.0,
             Cmd::Palette => {
-                self.overlay = match self.overlay {
+                self.w.overlay = match self.w.overlay {
                     overlay::Overlay::Palette { .. } => overlay::Overlay::None,
                     _ => overlay::Overlay::Palette {
                         query: String::new(),
@@ -816,7 +907,7 @@ impl App {
                 };
             }
             Cmd::Prefs => {
-                self.overlay = match self.overlay {
+                self.w.overlay = match self.w.overlay {
                     overlay::Overlay::Prefs { .. } => overlay::Overlay::None,
                     _ => {
                         self.font_choices = config::fonts();
@@ -825,8 +916,8 @@ impl App {
                 };
             }
             Cmd::RenameTab => {
-                if let Some(s) = self.sessions.get(self.active) {
-                    self.overlay = overlay::Overlay::Rename {
+                if let Some(s) = self.w.sessions.get(self.w.active) {
+                    self.w.overlay = overlay::Overlay::Rename {
                         text: s.name.clone(),
                     };
                 }
@@ -840,14 +931,14 @@ impl App {
             }
             Cmd::Restart => self.restart(),
             Cmd::History => {
-                if matches!(self.overlay, overlay::Overlay::History { .. }) {
+                if matches!(self.w.overlay, overlay::Overlay::History { .. }) {
                     self.cancel_overlay();
                 } else {
                     self.open_history(ctx);
                 }
             }
             Cmd::Clear => {
-                if let Some(s) = self.sessions.get_mut(self.active) {
+                if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                     s.term.lock().grid_mut().clear_history();
                     s.input(vec![0x0c]);
                 }
@@ -856,9 +947,9 @@ impl App {
     }
 
     /// Aplica y guarda un cambio hecho desde Preferencias.
-    pub fn commit_cfg(&mut self, ctx: &egui::Context, old: &Config) {
+    pub fn commit_cfg(&mut self, old: &Config) {
         if old.font_path != self.cfg.font_path || old.font_bold_path != self.cfg.font_bold_path {
-            install_fonts(ctx, &self.cfg);
+            self.install_fonts_everywhere(&self.cfg);
         }
         if old.font_size != self.cfg.font_size {
             self.zoom = 0.0;
@@ -886,12 +977,12 @@ impl App {
         }
         match step {
             Some(debug::Step::Type(text)) => {
-                if let Some(s) = self.sessions.get_mut(self.active) {
+                if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                     s.input(text.into_bytes());
                 }
             }
             Some(debug::Step::Tab) => {
-                let cwd = self.sessions.get(self.active).map(|s| s.cwd.clone());
+                let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
                 self.new_tab(ctx, cwd);
             }
             Some(debug::Step::Select(i)) => self.select(i),
@@ -922,8 +1013,9 @@ impl App {
                         "history" => Cmd::History,
                         "branches" | "dirs" => {
                             let at = self
+                                .w
                                 .sessions
-                                .get(self.active)
+                                .get(self.w.active)
                                 .and_then(|s| s.chips_px.last().map(|(r, _)| r.left_bottom()))
                                 .unwrap_or(Pos2::new(40.0, 80.0));
                             let kind = if what == "dirs" {
@@ -947,7 +1039,7 @@ impl App {
                     }));
             }
             Some(debug::Step::Name(name)) => {
-                if let Some(s) = self.sessions.get_mut(self.active) {
+                if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                     s.name = name;
                 }
             }
@@ -1014,14 +1106,34 @@ impl App {
             Some(debug::Step::Drop(path)) => self.script_drops.push(PathBuf::from(path)),
             Some(debug::Step::Minimize) => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
             Some(debug::Step::Scroll(lines)) => {
-                if let Some(s) = self.sessions.get(self.active) {
+                if let Some(s) = self.w.sessions.get(self.w.active) {
                     s.term
                         .lock()
                         .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
                 }
             }
             Some(debug::Step::Update) => self.force_update = !self.force_update,
-            Some(debug::Step::Quit) => ctx.send_viewport_cmd(ViewportCommand::Close),
+            Some(debug::Step::Window(what)) => match what.as_str() {
+                "new" => self.want_windows += 1,
+                "close" => ctx.send_viewport_cmd(ViewportCommand::Close),
+                n => {
+                    if let Some(&win) = n.parse::<usize>().ok().and_then(|n| self.order.get(n)) {
+                        // El guion pasa a esa ventana aunque macOS no le dé el foco.
+                        self.front = Some(win);
+                        let w = if self.cur == Some(win) {
+                            &self.w
+                        } else {
+                            &self.parked[&win]
+                        };
+                        w.ctx.send_viewport_cmd(ViewportCommand::Focus);
+                    }
+                }
+            },
+            Some(debug::Step::Quit) => {
+                for w in self.windows() {
+                    w.ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
             Some(debug::Step::Wait(_)) | None => {}
         }
     }
@@ -1053,7 +1165,7 @@ impl App {
         let ctx = ui.ctx().clone();
         let pal = self.pal.clone();
         let full = ui.max_rect();
-        let n = self.sessions.len().max(1);
+        let n = self.w.sessions.len().max(1);
         let show_update = self.update_ready || self.force_update;
         let right_reserved = if show_update { 252.0 } else { 158.0 };
         let avail = full.width() - TRAFFIC_LIGHTS_W - right_reserved - 34.0;
@@ -1069,19 +1181,19 @@ impl App {
         let tabs_left = full.left() + TRAFFIC_LIGHTS_W;
         let pointer_x = ui.input(|i| i.pointer.latest_pos().map(|p| p.x));
         if !ui.input(|i| i.pointer.primary_down()) {
-            self.drag_tab = None;
+            self.w.drag_tab = None;
         }
         // Al cambiar de hueco la pestaña se desliza en vez de saltar.
-        let slide = if self.tab_layout == (tab_w, tabs_left) {
+        let slide = if self.w.tab_layout == (tab_w, tabs_left) {
             TAB_SLIDE
         } else {
             0.0
         };
-        self.tab_layout = (tab_w, tabs_left);
+        self.w.tab_layout = (tab_w, tabs_left);
         let mut x = tabs_left;
-        for (i, s) in self.sessions.iter().enumerate() {
+        for (i, s) in self.w.sessions.iter().enumerate() {
             let slide_id = egui::Id::unique(("tab-x", s.id));
-            let held = self.drag_tab.is_some_and(|(id, _)| id == s.id) && pointer_x.is_some();
+            let held = self.w.drag_tab.is_some_and(|(id, _)| id == s.id) && pointer_x.is_some();
             let shown_x = if held {
                 x
             } else {
@@ -1093,9 +1205,9 @@ impl App {
             );
             x += tab_w;
             // La pestaña arrastrada sigue al puntero; al cruzar a otro hueco cambia de sitio.
-            let dragging = match (self.drag_tab, pointer_x) {
+            let dragging = match (self.w.drag_tab, pointer_x) {
                 (Some((id, grab)), Some(px)) if id == s.id => {
-                    let last = tabs_left + (self.sessions.len() - 1) as f32 * tab_w;
+                    let last = tabs_left + (self.w.sessions.len() - 1) as f32 * tab_w;
                     let left = (px - grab).clamp(tabs_left, last);
                     rect = rect.translate(Vec2::new(left - rect.left(), 0.0));
                     // Al soltarla se desliza desde donde quedó hasta su hueco.
@@ -1118,8 +1230,8 @@ impl App {
                     grabbed = Some((i, s.id, px - rect.left()));
                 }
             }
-            let active = i == self.active;
-            let hovered = resp.hovered() && (self.drag_tab.is_none() || dragging);
+            let active = i == self.w.active;
+            let hovered = resp.hovered() && (self.w.drag_tab.is_none() || dragging);
             // Encima de las demás mientras se mueve (arrastrada, o la activa deslizándose).
             // `Middle` y no `Foreground`: los menús emergentes (clic derecho) van en
             // `Foreground` y esta capa, creada después, los tapaba.
@@ -1283,7 +1395,7 @@ impl App {
                     ui.close();
                 }
             });
-            if self.drag_tab.is_none() && !resp.context_menu_opened() {
+            if self.w.drag_tab.is_none() && !resp.context_menu_opened() {
                 resp.on_hover_ui(|ui| tab_tooltip(ui, s, &pal));
             }
         }
@@ -1298,9 +1410,9 @@ impl App {
                 .latest_pos()
                 .is_some_and(|p| tabs_zone.contains(p))
         });
-        let movable = !(over_tabs || self.drag_tab.is_some() || grabbed.is_some());
-        if self.window_movable != Some(movable) && blur::set_movable(movable) {
-            self.window_movable = Some(movable);
+        let movable = !(over_tabs || self.w.drag_tab.is_some() || grabbed.is_some());
+        if self.w.window_movable != Some(movable) && blur::set_movable(movable) {
+            self.w.window_movable = Some(movable);
         }
 
         // Botón de nueva pestaña.
@@ -1321,7 +1433,7 @@ impl App {
         plus_resp.on_hover_text("Nueva pestaña  ⌘T");
 
         // Un botón por apartado; el de agentes lleva el contador de los que terminaron sin verlos.
-        let unseen = self.sessions.iter().filter(|s| s.unseen).count();
+        let unseen = self.w.sessions.iter().filter(|s| s.unseen).count();
         let cy = full.center().y;
         let ports_btn =
             Rect::from_center_size(Pos2::new(full.right() - 26.0, cy), Vec2::new(30.0, 24.0));
@@ -1444,13 +1556,13 @@ impl App {
         }
         if let Some((i, id, grab)) = grabbed {
             self.select(i);
-            self.drag_tab = Some((id, grab));
+            self.w.drag_tab = Some((id, grab));
         }
         if let Some((from, to)) = moved {
             self.move_tab(from, to);
         }
         if let Some((i, color)) = recolor
-            && let Some(s) = self.sessions.get_mut(i)
+            && let Some(s) = self.w.sessions.get_mut(i)
         {
             s.color = color;
         }
@@ -1462,7 +1574,7 @@ impl App {
             self.run(&ctx, Cmd::RenameTab);
         }
         if plus_clicked {
-            let cwd = self.sessions.get(self.active).map(|s| s.cwd.clone());
+            let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
             self.new_tab(&ctx, cwd);
         }
         if restart {
@@ -1487,8 +1599,8 @@ impl App {
             ) {
                 self.show_agents = false;
             }
-            let agents: Vec<usize> = (0..self.sessions.len())
-                .filter(|&i| self.sessions[i].agent.is_some())
+            let agents: Vec<usize> = (0..self.w.sessions.len())
+                .filter(|&i| self.w.sessions[i].agent.is_some())
                 .collect();
             if agents.is_empty() {
                 hint(
@@ -1498,12 +1610,12 @@ impl App {
                 );
             }
             for i in agents {
-                let s = &self.sessions[i];
+                let s = &self.w.sessions[i];
                 let agent = s.agent.unwrap();
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), Sense::click());
                 let p = ui.painter();
-                if i == self.active {
+                if i == self.w.active {
                     p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.7));
                 } else if resp.hovered() {
                     p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.4));
@@ -1666,7 +1778,7 @@ impl App {
         );
         if section_header(ui, pal, Section::Processes, "Procesos", &detail, 0.0) {
             self.show_procs = false;
-            self.search_focus = false;
+            self.w.search_focus = false;
             return;
         }
 
@@ -1687,12 +1799,12 @@ impl App {
                 .font(small.clone())
                 .desired_width(field.width()),
         );
-        self.search_focus = edit.has_focus();
-        if self.search_focus
+        self.w.search_focus = edit.has_focus();
+        if self.w.search_focus
             && ui.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter))
         {
             edit.surrender_focus();
-            self.search_focus = false;
+            self.w.search_focus = false;
         }
         for (label, x, by_mem) in [("CPU", cpu_x, false), ("Memoria", mem_x, true)] {
             let active = self.proc_sort_mem == by_mem;
@@ -1847,7 +1959,12 @@ impl App {
     fn owner_tab(&self, pid: i32) -> Option<usize> {
         let mut current = pid;
         for _ in 0..16 {
-            if let Some(i) = self.sessions.iter().position(|s| s.shell_pid() == current) {
+            if let Some(i) = self
+                .w
+                .sessions
+                .iter()
+                .position(|s| s.shell_pid() == current)
+            {
                 return Some(i);
             }
             current = proc::parent(current)?;
@@ -1991,44 +2108,108 @@ impl shell::App for App {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        raw.events.append(&mut self.script_pointer);
-        for path in self.script_drops.drain(..) {
-            raw.dropped_files.push(std::sync::Arc::new(Dropped(path)));
+    fn window_opened(&mut self, win: WindowId, ctx: &egui::Context) {
+        ctx.set_theme(egui::Theme::Dark);
+        ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        install_fonts(ctx, &self.cfg);
+        let first = self.cur.is_none();
+        // La pestaña de la ventana nueva arranca en la carpeta de la que está al frente.
+        let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
+        self.parked.insert(win, Win::new(ctx));
+        self.order.push(win);
+        self.enter(win);
+        self.front = Some(win);
+        if first {
+            self.restore_tabs(ctx);
         }
-        for (key, modifiers) in self.script_keys.drain(..) {
-            for pressed in [true, false] {
-                raw.events.push(egui::Event::Key {
-                    key,
-                    physical_key: None,
-                    pressed,
-                    repeat: false,
-                    modifiers,
-                });
+        if self.w.sessions.is_empty() {
+            let start_dir = cwd.or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .filter(|p| p.as_os_str() != "/")
+            });
+            self.new_tab(ctx, start_dir);
+        }
+    }
+
+    fn window_closed(&mut self, win: WindowId) {
+        self.order.retain(|w| *w != win);
+        // Soltar la `Win` cierra sus pestañas (PTY e hilos).
+        if self.cur == Some(win) {
+            let next = self.parked.keys().next().copied();
+            match next {
+                Some(next) => {
+                    self.enter(next);
+                    self.parked.remove(&win);
+                }
+                None => {
+                    self.w = Win::new(&egui::Context::default());
+                    self.cur = None;
+                }
+            }
+        } else {
+            self.parked.remove(&win);
+        }
+        if self.front == Some(win) {
+            self.front = self.cur;
+        }
+    }
+
+    fn new_windows(&mut self) -> usize {
+        std::mem::take(&mut self.want_windows)
+    }
+
+    fn raw_input_hook(&mut self, win: WindowId, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        // Lo que simula el guion entra por la ventana del frente.
+        if self.front == Some(win) {
+            raw.events.append(&mut self.script_pointer);
+            for path in self.script_drops.drain(..) {
+                raw.dropped_files.push(std::sync::Arc::new(Dropped(path)));
+            }
+            for (key, modifiers) in self.script_keys.drain(..) {
+                for pressed in [true, false] {
+                    raw.events.push(egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers,
+                    });
+                }
             }
         }
+        // Después de lo simulado, para que `key paste` del guion pase por aquí como ⌘V.
         clip::translate(ctx, &mut raw.events);
     }
 
-    fn logic(&mut self, ctx: &egui::Context) {
-        self.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+    fn logic(&mut self, win: WindowId, ctx: &egui::Context) {
+        self.enter(win);
+        self.w.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if self.w.focused {
+            self.front = Some(win);
+        }
+        // Lo que no es de una ventana (Finder, atajo global, notificaciones, menú, guion)
+        // lo atiende la del frente.
+        let front = self.front == Some(win);
 
         if self.cfg_checked.elapsed() > Duration::from_secs(1) {
             self.cfg_checked = Instant::now();
             let m = config::mtime();
             if m != self.cfg_mtime {
                 self.cfg_mtime = m;
-                self.reload_config(ctx);
+                self.reload_config();
             }
         }
 
-        self.run_script(ctx);
+        if front {
+            self.run_script(ctx);
+        }
         self.check_update(ctx);
 
         let mut notes = Vec::new();
-        for (i, s) in self.sessions.iter_mut().enumerate() {
+        for (i, s) in self.w.sessions.iter_mut().enumerate() {
             s.drain(ctx, &self.pal);
-            let watching = self.focused && i == self.active;
+            let watching = self.w.focused && i == self.w.active;
             if s.poll(ctx, watching) {
                 let what = s
                     .agent
@@ -2042,7 +2223,7 @@ impl shell::App for App {
             }
         }
         if !notes.is_empty() {
-            if !self.focused {
+            if !self.w.focused {
                 ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
                     egui::UserAttentionType::Informational,
                 ));
@@ -2055,14 +2236,14 @@ impl shell::App for App {
         }
 
         // «Reiniciar Colibrí» en el menú de la aplicación.
-        menu::install(ctx);
-        if menu::take_restart() {
+        menu::install();
+        if front && menu::take_restart() {
             self.restart();
         }
 
         // Carpetas que llegan de Finder («Abrir con», el icono del Dock, el servicio): una
         // pestaña en cada una (en la carpeta del archivo, si es un archivo).
-        for path in macos::take_opened() {
+        for path in front.then(macos::take_opened).unwrap_or_default() {
             let dir = if path.is_dir() {
                 Some(path)
             } else {
@@ -2073,52 +2254,58 @@ impl shell::App for App {
         }
 
         // Atajo global: la app ya viene al frente; ir al agente que terminó.
-        if hotkey::take_pressed() {
+        if front && hotkey::take_pressed() {
             self.jump_finished();
             ctx.send_viewport_cmd(ViewportCommand::Focus);
         }
 
         // Clic en una notificación: traer la ventana al frente e ir a esa pestaña.
-        for id in notify::take_clicked() {
-            if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
-                self.select(i);
-            }
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        for id in front.then(notify::take_clicked).unwrap_or_default() {
+            self.focus_session(id);
         }
 
-        let before = self.sessions.len();
-        let active_id = self.sessions.get(self.active).map(|s| s.id);
-        self.sessions.retain(|s| !s.exited);
-        if self.sessions.len() != before {
-            self.active = active_id
-                .and_then(|id| self.sessions.iter().position(|s| s.id == id))
-                .unwrap_or_else(|| self.active.min(self.sessions.len().saturating_sub(1)));
+        let before = self.w.sessions.len();
+        let active_id = self.w.sessions.get(self.w.active).map(|s| s.id);
+        self.w.sessions.retain(|s| !s.exited);
+        if self.w.sessions.len() != before {
+            self.w.active = active_id
+                .and_then(|id| self.w.sessions.iter().position(|s| s.id == id))
+                .unwrap_or_else(|| self.w.active.min(self.w.sessions.len().saturating_sub(1)));
         }
         self.save_tabs();
-        if self.sessions.is_empty() {
+        if self.w.sessions.is_empty() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
-        if self.focused {
-            if let Some(s) = self.sessions.get_mut(self.active) {
+        if self.w.focused {
+            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 s.unseen = false;
             }
         }
 
         // El icono del Dock lleva cuántas pestañas terminaron sin que las hayas visto.
-        let unseen = self.sessions.iter().filter(|s| s.unseen).count();
+        let unseen = self
+            .windows()
+            .flat_map(|w| w.sessions.iter())
+            .filter(|s| s.unseen)
+            .count();
         if unseen != self.badge {
             self.badge = unseen;
             macos::set_badge(unseen);
         }
         // La entrada segura es de todo el sistema: solo con Colibrí al frente.
-        let secure = self.cfg.secure_input && self.focused;
+        let any_focused = self.windows().any(|w| w.focused);
+        let secure = self.cfg.secure_input && any_focused;
         if secure != self.secure {
             self.secure = secure;
             macos::secure_input(secure);
         }
-        // Sin ventana a la vista, la salida no necesita cuadros a 30 Hz.
-        session::set_hidden(macos::hidden());
+        // Solo la pestaña activa de una ventana a la vista pide cuadros a 30 Hz; las demás
+        // (y todas si la ventana está minimizada o tapada) se ponen al día cada 250 ms.
+        let hidden = macos::hidden() || ctx.input(|i| i.viewport().visible() == Some(false));
+        for (i, s) in self.w.sessions.iter().enumerate() {
+            s.set_shown(!hidden && i == self.w.active);
+        }
 
         self.ports
             .enabled
@@ -2127,18 +2314,21 @@ impl shell::App for App {
             .enabled
             .store(self.show_procs, Ordering::Relaxed);
         // Solo hay trabajo periódico mientras algo corre; en reposo no se repinta nada.
-        if self.sessions.iter().any(|s| s.wants_ticks()) {
+        if self.w.sessions.iter().any(|s| s.wants_ticks()) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui) {
+    fn ui(&mut self, win: WindowId, ui: &mut egui::Ui) {
+        self.enter(win);
         debug::count_frame();
-        session::frame_painted(self.sessions.get(self.active).map(|s| s.id));
+        if let Some(s) = self.w.sessions.get(self.w.active) {
+            s.frame_painted();
+        }
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         self.overlay_ui(&ctx);
-        if self.sessions.is_empty() {
+        if self.w.sessions.is_empty() {
             return;
         }
         // Archivos soltados desde Finder (o una captura arrastrada): se pegan sus rutas,
@@ -2151,7 +2341,7 @@ impl shell::App for App {
                 .collect()
         });
         if !dropped.is_empty() {
-            if let Some(s) = self.sessions.get_mut(self.active) {
+            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 s.paste(&format!("{} ", dropped.join(" ")));
             }
             ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -2165,8 +2355,8 @@ impl shell::App for App {
         } else {
             0
         };
-        if self.blur_applied != Some(radius) && blur::set(radius) {
-            self.blur_applied = Some(radius);
+        if self.w.blur_applied != Some(radius) && blur::set(radius) {
+            self.w.blur_applied = Some(radius);
         }
         egui::Panel::top("tabs")
             .exact_size(TAB_BAR_H)
@@ -2175,7 +2365,7 @@ impl shell::App for App {
             .show(ui, |ui| self.tab_bar(ui));
 
         if !self.show_procs {
-            self.search_focus = false;
+            self.w.search_focus = false;
         }
         if self.show_agents || self.show_ports || self.show_procs {
             egui::Panel::right("side")
@@ -2194,34 +2384,35 @@ impl shell::App for App {
         }
 
         let metrics = self.metrics(&ctx);
-        let focused = self.focused;
-        if !self.search_focus && self.overlay == overlay::Overlay::None {
+        let focused = self.w.focused;
+        if !self.w.search_focus && self.w.overlay == overlay::Overlay::None {
             self.suggest_key(&ctx);
             self.history_key(&ctx);
             self.complete_key(&ctx);
         }
         // Con las sugerencias abiertas se sigue escribiendo en el shell: la lista se filtra.
-        let keyboard = !self.search_focus
+        let keyboard = !self.w.search_focus
             && matches!(
-                self.overlay,
+                self.w.overlay,
                 overlay::Overlay::None | overlay::Overlay::Complete { .. }
             );
         // Carpeta y rama en cajas, en la propia línea del prompt.
         let chips = self
+            .w
             .sessions
-            .get(self.active)
+            .get(self.w.active)
             .filter(|_| self.cfg.status_bar)
             .map(|s| (s.cwd.clone(), s.activity))
             .map(|(cwd, activity)| {
-                let info = self.git.info(&ctx, &cwd, activity);
+                let info = self.w.git.info(&ctx, &cwd, activity);
                 (cwd, info)
             });
         let mut chip_clicked = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fade(pal.bg, opacity)))
             .show(ui, |ui| {
-                self.term_rect = ui.max_rect();
-                if let Some(s) = self.sessions.get_mut(self.active) {
+                self.w.term_rect = ui.max_rect();
+                if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                     if let Some((_, info)) = &chips {
                         s.stamp_prompt(
                             info.as_ref().map(|i| i.branch.as_str()),
@@ -2267,7 +2458,7 @@ impl shell::App for App {
 
         // El indicador de «trabajando» no se anima; basta un refresco pausado para notar
         // cuándo termina la tarea.
-        if self.sessions.iter().any(|s| s.busy) {
+        if self.w.sessions.iter().any(|s| s.busy) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
     }

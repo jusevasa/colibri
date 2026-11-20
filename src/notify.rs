@@ -14,13 +14,12 @@ use objc2_user_notifications::{
     UNNotificationPresentationOptions, UNNotificationRequest, UNNotificationResponse,
     UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 static BUNDLED: AtomicBool = AtomicBool::new(false);
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static CLICKED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 const DEFAULT_ACTION: &str = "com.apple.UNNotificationDefaultActionIdentifier";
 
@@ -59,9 +58,7 @@ define_class!(
                 // Identificador: "tab-<sesión>-<n>".
                 if let Some(session) = id.split('-').nth(1).and_then(|s| s.parse::<u64>().ok()) {
                     CLICKED.lock().unwrap().push(session);
-                    if let Some(ctx) = CTX.get() {
-                        ctx.request_repaint();
-                    }
+                    crate::shell::wake_all();
                 }
             }
             handler.call(());
@@ -69,8 +66,7 @@ define_class!(
     }
 );
 
-pub fn init(ctx: &egui::Context) {
-    let _ = CTX.set(ctx.clone());
+pub fn init() {
     // Sin bundle, UNUserNotificationCenter lanza una excepción: no tocarlo.
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
         return;

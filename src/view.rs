@@ -30,10 +30,10 @@ pub struct Metrics {
     pub editor: String,
 }
 
-thread_local! {
-    /// Glifos ya maquetados para la rejilla con instancias (solo el hilo de la interfaz).
-    static GLYPHS: std::cell::RefCell<crate::grid::GlyphCache> = Default::default();
-}
+/// Glifos ya maquetados para la rejilla con instancias. Uno por `egui::Context` (por
+/// ventana), guardado en el propio contexto: cada ventana tiene su atlas y su sonda, y una
+/// caché compartida se tiraría entera cada vez que se pinta otra ventana.
+type Glyphs = std::sync::Arc<std::sync::Mutex<crate::grid::GlyphCache>>;
 
 struct TextRun {
     row: i32,
@@ -389,13 +389,18 @@ fn show_grid(
             let r = egui::emath::GuiRounding::round_to_pixels(Rect::from_min_max(min, max), ppp);
             instances.push(crate::grid::Instance::solid(r.min, r.max, b.color));
         }
-        GLYPHS.with_borrow_mut(|cache| {
+        let glyphs: Glyphs = ctx.data_mut(|d| {
+            d.get_temp_mut_or_default::<Glyphs>(egui::Id::unique("colibri-glyphs"))
+                .clone()
+        });
+        {
+            let mut cache = glyphs.lock().unwrap_or_else(|e| e.into_inner());
             cache.begin(&ctx, &m.font, &m.bold);
             for t in &texts {
                 let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
                 cache.push_text(&ctx, &mut instances, pos, &t.text, t.ascii, t.bold, t.fg);
             }
-        });
+        }
         crate::debug::timing::INSTANCES
             .fetch_add(instances.len() as u64, std::sync::atomic::Ordering::Relaxed);
         if !instances.is_empty() {

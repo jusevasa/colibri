@@ -3,7 +3,7 @@
 //! el número del icono del Dock, la entrada segura de teclado y saber si la ventana se ve.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
@@ -11,7 +11,6 @@ use objc2::{AllocAnyThread, class, define_class, msg_send, sel};
 use objc2_foundation::NSString;
 
 static OPENED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-static CTX: OnceLock<egui::Context> = OnceLock::new();
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
@@ -32,9 +31,7 @@ fn push(paths: Vec<PathBuf>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .extend(paths);
-    if let Some(ctx) = CTX.get() {
-        ctx.request_repaint();
-    }
+    crate::shell::wake_all();
 }
 
 /// Ruta de un `NSString *` (o nada si es nulo).
@@ -142,11 +139,6 @@ pub fn install() {
         // Nadie más lo retiene (observador y proveedor son referencias débiles).
         std::mem::forget(opener);
     }
-}
-
-/// A quién avisar cuando llegue una carpeta con la app ya abierta.
-pub fn set_context(ctx: &egui::Context) {
-    let _ = CTX.set(ctx.clone());
 }
 
 /// Lo que Finder pidió abrir desde la última vez.

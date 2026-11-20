@@ -27,7 +27,7 @@ pub struct Ports {
 }
 
 impl Ports {
-    pub fn start(ctx: egui::Context) -> Self {
+    pub fn start() -> Self {
         let list = Arc::new(Mutex::new(Vec::new()));
         let enabled = Arc::new(AtomicBool::new(true));
         let refresh = Arc::new(AtomicBool::new(false));
@@ -43,7 +43,7 @@ impl Ports {
                         if *guard != found {
                             *guard = found;
                             drop(guard);
-                            ctx.request_repaint();
+                            crate::shell::wake_all();
                         }
                     }
                     // Espera 3 s, pero despierta enseguida si piden refrescar.
