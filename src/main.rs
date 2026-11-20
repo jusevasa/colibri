@@ -548,9 +548,18 @@ impl App {
         if !self.cfg.complete_popup {
             return;
         }
-        let Some(s) = self.sessions.get(self.active).filter(|s| s.at_prompt()) else {
+        let Some(s) = self.sessions.get_mut(self.active).filter(|s| s.at_prompt()) else {
             return;
         };
+        let tab_down = ctx.input(|i| {
+            i.events.iter().any(|e| {
+                matches!(e, egui::Event::Key { key: egui::Key::Tab, pressed: true, modifiers, .. }
+                    if modifiers.is_none())
+            })
+        });
+        if tab_down {
+            s.resync_line();
+        }
         let Some(target) = s.prompt_line().and_then(complete::target) else {
             return;
         };

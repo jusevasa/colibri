@@ -782,7 +782,19 @@ impl App {
                             }
                             let icon = Pos2::new(r.left() + 20.0, r.center().y);
                             let icon_color = if chosen { pal.fg } else { pal.muted };
-                            crate::file_icon(p, icon, item.is_dir, icon_color);
+                            if item.command {
+                                // «>_» de terminal.
+                                let st = Stroke::new(1.2, icon_color);
+                                let c = icon + Vec2::new(-3.0, 0.0);
+                                p.line_segment([c + Vec2::new(-2.5, -3.5), c], st);
+                                p.line_segment([c, c + Vec2::new(-2.5, 3.5)], st);
+                                p.line_segment(
+                                    [c + Vec2::new(2.0, 4.0), c + Vec2::new(7.0, 4.0)],
+                                    st,
+                                );
+                            } else {
+                                crate::file_icon(p, icon, item.is_dir, icon_color);
+                            }
                             // El trozo que coincide con lo tecleado va resaltado.
                             let name = if item.is_dir {
                                 format!("{}/", item.name)
@@ -819,7 +831,13 @@ impl App {
                                 }
                                 None => add(&name, dim),
                             }
-                            let kind = if item.is_dir { "Carpeta" } else { "Archivo" };
+                            let kind = if item.command {
+                                "Comando"
+                            } else if item.is_dir {
+                                "Carpeta"
+                            } else {
+                                "Archivo"
+                            };
                             let kind_w = 64.0;
                             job.wrap = egui::text::TextWrapping::truncate_at_width(
                                 r.width() - 40.0 - kind_w - 12.0,

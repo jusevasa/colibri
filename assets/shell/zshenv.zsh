@@ -76,6 +76,13 @@ if [[ -o interactive ]]; then
       typeset -g _colibri_ready=1
       _colibri_sel_setup
     fi
+    # Comandos, alias y órdenes internas que conoce el shell, para que Colibrí los sugiera
+    # con Tab en la primera palabra. Solo se reescribe si cambia el PATH.
+    if [[ $PATH != ${_colibri_path-} ]]; then
+      typeset -g _colibri_path=$PATH
+      { print -rl -- ${(k)commands} ${(k)aliases} ${(k)builtins} \
+          >| $HOME/Library/Caches/colibri/zsh/commands } 2>/dev/null
+    fi
     # Solo si de verdad se ejecutó algo (un Enter vacío o un ^C no cuentan).
     typeset -g _colibri_result=
     if (( ${+_colibri_t0} )); then

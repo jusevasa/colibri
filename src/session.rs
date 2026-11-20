@@ -907,6 +907,31 @@ impl Session {
         self.line.as_deref()
     }
 
+    /// Si se perdió la pista de lo tecleado (un Tab que completó zsh, flechas, el
+    /// historial de ^R…), la recupera leyendo de la rejilla lo que hay entre el prompt
+    /// marcado y el cursor. Solo con la integración del shell.
+    pub fn resync_line(&mut self) {
+        if self.line.is_some() {
+            return;
+        }
+        let Some((cells, cursor)) = self.input_cells() else {
+            return;
+        };
+        let term = self.term.lock();
+        let grid = term.grid();
+        let mut text = String::new();
+        for p in cells.iter().take_while(|p| **p < cursor) {
+            let cell = &grid[p.line][p.column];
+            if chip_kind(cell).is_some() {
+                return;
+            }
+            text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            text.extend(cell.zerowidth().into_iter().flatten());
+        }
+        drop(term);
+        self.line = Some(text);
+    }
+
     /// Cambia la última palabra del prompt (`chars` caracteres) por `text`, como si se
     /// borrara y se tecleara: así `track` sigue cuadrando con lo que ve el shell.
     pub fn replace_word(&mut self, chars: usize, text: &str) {
