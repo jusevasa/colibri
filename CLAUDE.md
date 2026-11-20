@@ -18,6 +18,7 @@ cargo test sgr_press_release   # una sola prueba, por nombre
 cargo fmt && cargo clippy
 scripts/bundle.sh              # release + target/Colibri.app firmada
 scripts/rebundle.sh            # lo mismo, pero solo si el código cambió desde el último bundle
+scripts/zip.sh                 # bundle + target/Colibri-<versión>-<arq>.zip para compartir (sin notarizar)
 python3 scripts/icon.py assets # regenera assets/colibri.svg y colibri-1024.png
 cargo build --profile profiling  # release con símbolos (target/profiling/colibri), para `sample <pid> 5`
 ```
