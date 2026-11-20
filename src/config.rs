@@ -118,7 +118,7 @@ impl Default for Config {
             blur: false,
             cursor: "block".into(),
             cursor_blink: false,
-            scrollback: 10_000,
+            scrollback: 5_000,
             shell: String::new(),
             notify: true,
             restore_tabs: true,

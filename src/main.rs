@@ -2457,18 +2457,29 @@ fn install_fonts(ctx: &egui::Context, cfg: &Config) {
         .get(&FontFamily::Monospace)
         .cloned()
         .unwrap_or_default();
+    // Cada archivo se lee una sola vez y sus bytes se comparten: Menlo.ttc trae la normal
+    // y la negrita y, sin esto, se cargaba dos (o tres) veces en memoria (~2 MB cada una).
+    let mut blobs: std::collections::HashMap<String, egui::epaint::text::Blob> =
+        std::collections::HashMap::new();
     // `weight` solo actúa en fuentes variables (un archivo con todos los pesos).
     let mut load = |name: &str, candidates: &[(&str, u32, Option<f32>)]| -> bool {
         for (path, index, weight) in candidates {
             if path.is_empty() {
                 continue;
             }
-            if let Some(bytes) = config::font_bytes(path) {
-                let mut data = match bytes {
-                    std::borrow::Cow::Borrowed(b) => FontData::from_static(b),
-                    std::borrow::Cow::Owned(b) => FontData::from_owned(b),
-                };
-                data.index = *index;
+            let blob = match blobs.get(*path) {
+                Some(b) => Some(b.clone()),
+                None => config::font_bytes(path).map(|bytes| {
+                    let b: egui::epaint::text::Blob = match bytes {
+                        std::borrow::Cow::Borrowed(b) => Arc::new(b),
+                        std::borrow::Cow::Owned(b) => Arc::new(b),
+                    };
+                    blobs.insert(path.to_string(), b.clone());
+                    b
+                }),
+            };
+            if let Some(blob) = blob {
+                let mut data = FontData::from_blob(blob, *index);
                 if let Some(w) = weight {
                     if data
                         .variation_axes()
