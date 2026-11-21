@@ -31,7 +31,11 @@ Requiere macOS 12 o posterior.
 
 ### Homebrew
 
-Próximamente, con la primera versión firmada y notarizada.
+```sh
+brew install --cask jusevasa/colibri/colibri
+```
+
+La app va firmada y notarizada por Apple, para Apple silicon e Intel. Para actualizar, `brew upgrade --cask colibri`: Colibrí lo nota y enseña el botón **Actualizar**, que la reinicia con la versión nueva y reabre las pestañas.
 
 ### Desde el código
 
