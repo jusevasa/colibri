@@ -989,7 +989,6 @@ impl Session {
     }
 
     /// La pestaña pasa a otra ventana: sus cuadros se piden a ese contexto.
-    #[allow(dead_code)] // para mover pestañas entre ventanas (siguiente paso)
     pub fn set_context(&self, ctx: &egui::Context) {
         *self.pace.ctx.lock().unwrap_or_else(|e| e.into_inner()) = ctx.clone();
     }

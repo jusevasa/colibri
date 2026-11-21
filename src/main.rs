@@ -314,6 +314,8 @@ enum Fill {
     Saved(state::Window),
     /// Una ventana cerrada hace poco que se reabre.
     Reopen(Vec<state::Tab>, usize),
+    /// Una pestaña que llega viva de otra ventana (despegada arrastrándola).
+    Move(Box<Session>),
 }
 
 /// Algo que se cerró hace poco, para reabrirlo con ⌘⇧T: una pestaña (y de qué ventana y en
@@ -1036,6 +1038,62 @@ impl App {
         }
     }
 
+    /// Saca la pestaña i de la ventana en curso sin soltarla (su proceso sigue vivo) para
+    /// llevarla a otra: cierra el overlay, que puede apuntar a ella, y vacía su caché de
+    /// rejilla, que es de la caché de glifos de esta ventana. No se apunta para ⌘⇧T.
+    fn take_tab(&mut self, i: usize) -> Option<Session> {
+        if i >= self.w.sessions.len() {
+            return None;
+        }
+        if !matches!(self.w.overlay, overlay::Overlay::None) {
+            self.cancel_overlay();
+        }
+        let mut s = self.w.sessions.remove(i);
+        if self.w.active > i || self.w.active >= self.w.sessions.len() {
+            self.w.active = self.w.active.saturating_sub(1);
+        }
+        s.grid = view::GridCache::default();
+        Some(s)
+    }
+
+    /// Pasa la pestaña i, viva, a otra ventana: al hueco `slot` (o al final), activa allí y
+    /// con esa ventana al frente. Si la de origen se queda vacía la cierra `logic()`, y
+    /// `window_closed` no la apunta para ⌘⇧T porque no le quedan pestañas.
+    fn move_to_window(&mut self, i: usize, win: WindowId, slot: Option<usize>) {
+        if self.cur == Some(win) || !self.parked.contains_key(&win) {
+            return;
+        }
+        let Some(mut s) = self.take_tab(i) else {
+            return;
+        };
+        let dest = self.parked.get_mut(&win).expect("comprobada arriba");
+        s.set_context(&dest.ctx);
+        s.unseen = false;
+        let at = slot.unwrap_or(usize::MAX).min(dest.sessions.len());
+        dest.sessions.insert(at, s);
+        dest.active = at;
+        // `send_viewport_cmd` pide además un cuadro a esa ventana.
+        dest.ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.front = Some(win);
+        self.w.ctx.request_repaint();
+    }
+
+    /// Lleva la pestaña i, viva, a una ventana nueva con la esquina en `at` (puntos de
+    /// pantalla) y el tamaño de esta. Con una sola pestaña no hace nada: saldría una ventana
+    /// igual a la que ya hay.
+    fn detach_to_new_window(&mut self, i: usize, at: Pos2) {
+        if self.w.sessions.len() <= 1 {
+            return;
+        }
+        let Some(s) = self.take_tab(i) else {
+            return;
+        };
+        let frame = self.w.frame.map(|[_, _, w, h]| [at.x, at.y, w, h]);
+        self.want_windows.push(frame);
+        self.opening.push_back(Fill::Move(Box::new(s)));
+        self.w.ctx.request_repaint();
+    }
+
     fn select(&mut self, i: usize) {
         if i < self.w.sessions.len() {
             self.w.active = i;
@@ -1442,6 +1500,19 @@ impl App {
             Some(debug::Step::Menu(title)) => {
                 if !menu::perform(&title) {
                     eprintln!("menú: no hay ninguna entrada «{title}»");
+                }
+            }
+            Some(debug::Step::Detach(tab, to)) => {
+                if to == "new" {
+                    let at = self
+                        .w
+                        .frame
+                        .map(|[x, y, ..]| Pos2::new(x + 40.0, y + 40.0))
+                        .unwrap_or(Pos2::new(80.0, 80.0));
+                    self.detach_to_new_window(tab, at);
+                } else if let Some(&win) = to.parse::<usize>().ok().and_then(|m| self.order.get(m))
+                {
+                    self.move_to_window(tab, win, None);
                 }
             }
             Some(debug::Step::Window(what)) => match what.as_str() {
@@ -2423,6 +2494,11 @@ impl shell::App for App {
         match fill {
             Fill::Fresh(dir) => self.new_tab(ctx, dir),
             Fill::Saved(saved) => self.open_saved_window(ctx, &saved),
+            Fill::Move(s) => {
+                s.set_context(ctx);
+                self.w.sessions.push(*s);
+                self.w.active = 0;
+            }
             Fill::Reopen(tabs, active) => {
                 for tab in &tabs {
                     self.revive(ctx, tab, None);

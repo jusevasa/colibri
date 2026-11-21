@@ -58,6 +58,10 @@ pub enum Step {
     /// Ventanas: `window new` abre una, `window close` cierra la del frente y
     /// `window <n>` trae al frente la n-ésima (por orden de apertura, desde 0).
     Window(String),
+    /// Pasa la pestaña n (desde 0) de la ventana del frente a una ventana nueva
+    /// (`detach <n> new`) o a la m-ésima por orden de apertura (`detach <n> <m>`), con su
+    /// proceso vivo: lo mismo que soltarla despegada fuera o sobre otra ventana.
+    Detach(usize, String),
     /// Elige la entrada de la barra de menús con ese título, como un clic.
     Menu(String),
     Quit,
@@ -98,6 +102,10 @@ impl Script {
                     "move" => {
                         let (from, to) = arg.split_once(' ')?;
                         Step::Move(from.parse().ok()?, to.parse().ok()?)
+                    }
+                    "detach" => {
+                        let (tab, to) = arg.split_once(' ')?;
+                        Step::Detach(tab.parse().ok()?, to.to_string())
                     }
                     "key" => Step::Key(arg.to_string()),
                     "agent" => Step::Agent(arg != "prev"),
