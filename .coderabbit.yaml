@@ -1,0 +1,32 @@
+# Revisión automática de cada PR con CodeRabbit.
+#
+# Las reglas del proyecto salen de AGENTS.md, que CodeRabbit detecta solo y usa como
+# criterio. No lo pongas en path_instructions: haría que lo revisara como código cambiado
+# en vez de usarlo como guía.
+language: "es-ES"
+reviews:
+  # Como en el modo silencioso: solo lo importante va en línea, el resto agrupado.
+  profile: "quiet"
+  high_level_summary: false
+  sequence_diagrams: false
+  review_status: false
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!target/**"
+    - "!vendor/*/target/**"
+    - "!Cargo.lock"
+    - "!assets/fonts/**"
+    - "!assets/*.png"
+    - "!assets/*.icns"
+  path_instructions:
+    - path: "vendor/alacritty_terminal/**"
+      instructions: >-
+        Copia parcheada de alacritty_terminal. Todo cambio respecto al original debe ir
+        marcado con un comentario «Colibrí:»; señala cualquier cambio sin esa marca.
+    - path: "src/i18n/**"
+      instructions: >-
+        Cada texto debe existir en ES y en EN con el mismo sentido; señala los que falten
+        o no se correspondan.

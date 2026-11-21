@@ -1,0 +1,56 @@
+# Formato, clippy y pruebas en cada PR y en cada push a main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  comprobar:
+    name: Formato, clippy y pruebas
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            vendor/alacritty_terminal
+
+      - name: Formato
+        run: cargo fmt --check
+
+      # Aún hay avisos antiguos: se enseñan sin hacer fallar el CI. Cuando se limpien,
+      # pasar a `cargo clippy --all-targets -- -D warnings`.
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: Pruebas
+        run: cargo test -- --skip metal_
+
+      # Las pruebas de metal.rs pintan en la GPU real; si el runner no tiene Metal, se avisa
+      # en vez de fallar.
+      - name: Pruebas de Metal
+        run: |
+          if system_profiler SPDisplaysDataType | grep -qi metal; then
+            cargo test metal_
+          else
+            echo "::warning::El runner no tiene GPU con Metal: se saltan las pruebas metal_*"
+          fi
+
+      - name: Pruebas de alacritty_terminal (vendor)
+        working-directory: vendor/alacritty_terminal
+        run: cargo test --lib
