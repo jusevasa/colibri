@@ -3,7 +3,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Result};
-use std::mem::MaybeUninit;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
@@ -13,7 +13,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
-use std::{env, ptr};
+use std::time::{Duration, Instant};
+use std::{env, ptr, thread};
 
 use libc::{F_GETFL, F_SETFL, O_NONBLOCK, TIOCSCTTY, c_int, fcntl};
 use log::error;
@@ -101,7 +102,8 @@ fn get_pw_entry(buf: &mut [i8; 1024]) -> Result<Passwd<'_>> {
 
 pub struct Pty {
     child: Child,
-    file: File,
+    // Colibrí: `ManuallyDrop` para cerrar el maestro en `drop` antes de esperar al shell.
+    file: ManuallyDrop<File>,
     signals: UnixStream,
     sig_id: SigId,
 }
@@ -293,7 +295,7 @@ pub fn from_fd(config: &Options, window_id: u64, master: OwnedFd, slave: OwnedFd
                 set_nonblocking(master_fd);
             }
 
-            Ok(Pty { child, file: File::from(master), signals, sig_id })
+            Ok(Pty { child, file: ManuallyDrop::new(File::from(master)), signals, sig_id })
         },
         Err(err) => Err(Error::new(
             err.kind(),
@@ -316,9 +318,30 @@ impl Drop for Pty {
         // Clear signal-hook handler.
         unregister_signal(self.sig_id);
 
+        // Colibrí: cerrar el maestro antes de esperar al shell. Con él abierto y sin nadie que
+        // lo lea, un programa en primer plano que no muere con SIGHUP (Claude Code) se quedaba
+        // bloqueado escribiendo, y el shell, al salir, esperando a que se vaciara la salida de
+        // la terminal: ninguno terminaba y este hilo se quedaba en `wait` para siempre, con la
+        // pantalla y el historial de la pestaña. Cerrado, la terminal descarta lo pendiente y
+        // escribir en ella da error. `file` no se vuelve a usar.
+        unsafe { ManuallyDrop::drop(&mut self.file) };
+
+        // Colibrí: y esperar con plazo. Un shell que siga vivo (ignora SIGHUP y espera a algo
+        // que no toca la terminal) se mata.
+        let fin = Instant::now() + SHELL_EXIT_WAIT;
+        while Instant::now() < fin {
+            match self.child.try_wait() {
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+                _ => return,
+            }
+        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
+
+/// Colibrí: cuánto espera `Pty::drop` a que el shell salga antes de matarlo.
+const SHELL_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 impl EventedReadWrite for Pty {
     type Reader = File;
@@ -333,7 +356,7 @@ impl EventedReadWrite for Pty {
     ) -> Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
         unsafe {
-            poll.add_with_mode(&self.file, interest, poll_opts)?;
+            poll.add_with_mode(&*self.file, interest, poll_opts)?;
         }
 
         unsafe {
@@ -353,7 +376,7 @@ impl EventedReadWrite for Pty {
         poll_opts: PollMode,
     ) -> Result<()> {
         interest.key = PTY_READ_WRITE_TOKEN;
-        poll.modify_with_mode(&self.file, interest, poll_opts)?;
+        poll.modify_with_mode(&*self.file, interest, poll_opts)?;
 
         poll.modify_with_mode(
             &self.signals,
@@ -364,7 +387,7 @@ impl EventedReadWrite for Pty {
 
     #[inline]
     fn deregister(&mut self, poll: &Arc<Poller>) -> Result<()> {
-        poll.delete(&self.file)?;
+        poll.delete(&*self.file)?;
         poll.delete(&self.signals)
     }
 
@@ -445,4 +468,106 @@ unsafe fn set_nonblocking(fd: c_int) {
 fn test_get_pw_entry() {
     let mut buf: [i8; 1024] = [0; 1024];
     let _pw = get_pw_entry(&mut buf).unwrap();
+}
+
+// Colibrí: al cerrar una pestaña se suelta su `Pty` en el hilo del PTY, que ya no lee el
+// maestro. Estas pruebas abren una terminal de verdad, dejan de leerla como en ese momento y
+// comprueban que soltarla termina y no deja procesos colgados.
+#[cfg(test)]
+mod colibri_tests {
+    use std::collections::HashMap;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::{Pty, new};
+    use crate::event::WindowSize;
+    use crate::tty::{Options, Shell};
+
+    fn abrir(programa: &str, args: &[&str]) -> Pty {
+        let options = Options {
+            shell: Some(Shell::new(programa.into(), args.iter().map(|a| a.to_string()).collect())),
+            working_directory: None,
+            drain_on_exit: false,
+            env: HashMap::new(),
+        };
+        let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+        new(&options, size, 0).expect("abrir la terminal")
+    }
+
+    /// Suelta `pty` en otro hilo; `None` si no terminó dentro de `plazo`.
+    fn soltar(pty: Pty, plazo: Duration) -> Option<Duration> {
+        let (tx, rx) = mpsc::channel();
+        let inicio = Instant::now();
+        thread::spawn(move || {
+            drop(pty);
+            let _ = tx.send(inicio.elapsed());
+        });
+        rx.recv_timeout(plazo).ok()
+    }
+
+    /// `pid` negativo: el grupo de procesos `-pid`.
+    fn vivo(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn esperar(plazo: Duration, mut listo: impl FnMut() -> bool) -> bool {
+        let fin = Instant::now() + plazo;
+        loop {
+            if listo() {
+                return true;
+            }
+            if Instant::now() >= fin {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Lo que pasaba al cerrar una pestaña con Claude Code: el shell espera a un programa en
+    /// primer plano, en su propio grupo, que no muere con SIGHUP y se queda bloqueado
+    /// escribiendo porque nadie lee la terminal. El shell, al salir, espera a que se vacíe la
+    /// salida de la terminal, cosa que con el maestro abierto no pasaba nunca.
+    #[test]
+    fn colibri_soltar_no_espera_a_un_programa_bloqueado_escribiendo() {
+        let pty = abrir("/bin/zsh", &["-f", "-i", "-c", "sh -c 'trap \"\" HUP; exec yes'; :"]);
+        let shell = pty.child().id() as i32;
+        let maestro = pty.file().as_raw_fd();
+        let mut grupo = 0;
+        let en_primer_plano = esperar(Duration::from_secs(5), || {
+            grupo = unsafe { libc::tcgetpgrp(maestro) };
+            grupo > 0 && grupo != shell
+        });
+        assert!(en_primer_plano, "el programa no llegó a primer plano en su propio grupo");
+        // Que `yes` llene la salida de la terminal y se quede bloqueado escribiendo.
+        thread::sleep(Duration::from_millis(300));
+
+        let tardo = soltar(pty, Duration::from_secs(5));
+        let sigue_vivo = !esperar(Duration::from_secs(2), || !vivo(-grupo));
+        if sigue_vivo {
+            unsafe { libc::killpg(grupo, libc::SIGKILL) };
+        }
+
+        assert!(tardo.is_some(), "soltar la terminal se quedó esperando al shell");
+        assert!(!sigue_vivo, "el programa en primer plano siguió vivo");
+    }
+
+    /// Un shell que no sale ni con SIGHUP ni al cerrarse la terminal (aquí ignora SIGHUP y
+    /// espera a un programa que no la toca) no debe retener sin plazo el hilo que lo suelta.
+    #[test]
+    fn colibri_soltar_mata_al_shell_que_no_sale() {
+        let pty = abrir("/bin/sh", &["-c", "trap '' HUP; sleep 30; :"]);
+        let shell = pty.child().id() as i32;
+        // Que el shell ya esté esperando a `sleep`.
+        thread::sleep(Duration::from_millis(300));
+
+        let tardo = soltar(pty, Duration::from_secs(5));
+        let shell_vivo = vivo(shell);
+        // `sleep` va en el grupo del shell e ignora SIGHUP: no debe quedar de esta prueba.
+        unsafe { libc::killpg(shell, libc::SIGKILL) };
+
+        assert!(tardo.is_some(), "soltar la terminal esperó al shell sin plazo");
+        assert!(!shell_vivo, "el shell siguió vivo");
+    }
 }

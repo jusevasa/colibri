@@ -5,7 +5,7 @@
 # También sirve a mano: scripts/rebundle.sh
 cd "$(dirname "$0")/.." || exit 0
 BIN=target/Colibri.app/Contents/MacOS/colibri
-if [ -f "$BIN" ] && [ -z "$(find src assets Cargo.toml Cargo.lock scripts/bundle.sh -type f -newer "$BIN" 2>/dev/null | head -1)" ]; then
+if [ -f "$BIN" ] && [ -z "$(find src assets vendor/alacritty_terminal/src vendor/alacritty_terminal/Cargo.toml Cargo.toml Cargo.lock scripts/bundle.sh -type f -newer "$BIN" 2>/dev/null | head -1)" ]; then
   exit 0
 fi
 # La salida es JSON para Claude Code: `systemMessage` es lo que ve la persona.
