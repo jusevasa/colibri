@@ -1,7 +1,8 @@
 #!/bin/sh
 # Arma target/Colibri.app con bundle.sh y la comprime en target/Colibri-<versión>-<arq>.zip
 # para pasársela a otras personas. No va notarizada: la primera vez macOS pide confirmar
-# en Ajustes del Sistema → Privacidad y seguridad → «Abrir igualmente».
+# en Ajustes del Sistema → Privacidad y seguridad → «Abrir igualmente». La notarizada, para
+# publicar, la arma scripts/release.sh.
 set -e
 cd "$(dirname "$0")/.."
 scripts/bundle.sh
