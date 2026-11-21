@@ -108,7 +108,8 @@ else
   if [ -z "$SIGN_ID" ] || ! codesign --force --options runtime --timestamp=none \
     --entitlements "$ENTITLEMENTS" --sign "$SIGN_ID" "$APP" 2>/dev/null; then
     echo "Aviso: sin certificado de firma; uso firma ad-hoc (los permisos no persistirán)."
-    codesign --force --sign - "$APP"
+    codesign --force --options runtime --timestamp=none \
+      --entitlements "$ENTITLEMENTS" --sign - "$APP"
   fi
 fi
 echo "Lista: $APP  (ábrela con: open $APP)"

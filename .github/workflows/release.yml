@@ -22,6 +22,9 @@ jobs:
     name: Publicar
     runs-on: macos-latest
     environment: release
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      sha256: ${{ steps.build.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -77,11 +80,26 @@ jobs:
           gh release create "$GITHUB_REF_NAME" "$ZIP" --verify-tag --generate-notes \
             --title "Colibrí $VERSION" $PRERELEASE
 
-      - name: Actualizar el cask en jusevasa/homebrew-colibri
+      - name: Borrar el llavero temporal
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/firma.keychain-db" || true
+
+  # Va en un job aparte para poder repetirlo solo («Re-run failed jobs») si falla después de
+  # publicar el Release: reutiliza la versión y el sha256 del zip ya publicado, sin volver a
+  # compilar (otro zip tendría otra huella) ni chocar con el Release que ya existe.
+  tap:
+    name: Actualizar el cask
+    needs: publicar
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Escribir Casks/colibri.rb en jusevasa/homebrew-colibri
         env:
           TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
-          VERSION: ${{ steps.build.outputs.version }}
-          SHA256: ${{ steps.build.outputs.sha256 }}
+          VERSION: ${{ needs.publicar.outputs.version }}
+          SHA256: ${{ needs.publicar.outputs.sha256 }}
         run: |
           KEY="$RUNNER_TEMP/tap_key"
           (umask 077; printf '%s\n' "$TAP_DEPLOY_KEY" > "$KEY")
@@ -93,10 +111,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Casks/colibri.rb
-          git commit -m "colibri $VERSION"
-          git push
+          if git diff --cached --quiet; then
+            echo "El cask ya estaba en $VERSION."
+          else
+            git commit -m "colibri $VERSION"
+            git push
+          fi
           rm "$KEY"
-
-      - name: Borrar el llavero temporal
-        if: always()
-        run: security delete-keychain "$RUNNER_TEMP/firma.keychain-db" || true
