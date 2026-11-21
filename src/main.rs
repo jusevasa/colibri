@@ -276,7 +276,7 @@ pub struct Win {
     overlay: overlay::Overlay,
     /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
     drag_tab: Option<(u64, f32)>,
-    /// Esa pestaña está despegada: el puntero se fue de la barra (`drag::detaching`). Se
+    /// Esa pestaña está despegada: el puntero se alejó de la barra (`drag::detaching`). Se
     /// queda atenuada en su hueco y, al soltarla, pasa a otra ventana o a una nueva.
     detached: bool,
     /// Ancho y origen de las pestañas en el cuadro anterior: si cambian (se redimensiona la
@@ -1069,6 +1069,21 @@ impl App {
         let Some(mut s) = self.take_tab(i) else {
             return;
         };
+        // Un overlay abierto allí (historial, renombrar, desplegable) actúa sobre la pestaña
+        // activa: se cierra antes, mientras esa sigue siendo la que era, para que no acabe
+        // escribiendo en la que llega.
+        if self
+            .parked
+            .get(&win)
+            .is_some_and(|w| !matches!(w.overlay, overlay::Overlay::None))
+        {
+            let back = self.cur;
+            self.enter(win);
+            self.cancel_overlay();
+            if let Some(back) = back {
+                self.enter(back);
+            }
+        }
         let dest = self.parked.get_mut(&win).expect("comprobada arriba");
         s.set_context(&dest.ctx);
         s.unseen = false;
@@ -1635,14 +1650,22 @@ impl App {
         let tabs_left = full.left() + left_reserved;
         let pointer = ui.input(|i| i.pointer.latest_pos());
         let mut dropped = None;
-        if !ui.input(|i| i.pointer.primary_down()) {
+        // Red por si no llega el soltar (soltar fuera de la ventana sin mover más el ratón):
+        // se pregunta al sistema y, mientras se arrastra, se mira cada 50 ms aunque no haya
+        // eventos. El guion no: su puntero simulado no pulsa el ratón de verdad.
+        let mut released = !ui.input(|i| i.pointer.primary_down());
+        if self.w.drag_tab.is_some() && self.script.is_none() {
+            released |= !macos::primary_button_down();
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if released {
             if self.w.detached {
                 dropped = self.w.drag_tab.map(|(id, _)| id);
             }
             self.w.drag_tab = None;
         }
-        self.w.detached =
-            self.w.drag_tab.is_some() && drag::detaching(pointer, full, ctx.content_rect());
+        self.w.detached = self.w.drag_tab.is_some()
+            && drag::detaching(pointer, full, ctx.content_rect(), self.w.detached);
         // Despegada, la pestaña no sigue al puntero: vuelve a su hueco y no reordena.
         let pointer_x = pointer.map(|p| p.x).filter(|_| !self.w.detached);
         // Al cambiar de hueco la pestaña se desliza en vez de saltar.

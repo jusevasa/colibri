@@ -4,14 +4,22 @@
 
 use egui::{Pos2, Rect};
 
-/// La pestaña arrastrada se despega: el puntero salió de la ventana (o egui lo da por
-/// perdido, que es lo mismo) o bajó de la barra más de media altura de ella. Dentro de ese
-/// margen sigue siendo un arrastre para reordenar.
-pub fn detaching(pointer: Option<Pos2>, bar: Rect, window: Rect) -> bool {
-    match pointer {
-        None => true,
-        Some(p) => !window.contains(p) || p.y > bar.bottom() + bar.height() / 2.0,
-    }
+/// La pestaña arrastrada se despega si el puntero se aleja de la barra más de media altura
+/// de ella, por abajo o por arriba (la barra está pegada al borde de la ventana: sin margen
+/// por arriba, rozar ese borde al reordenar la despegaba), o si sale por un lado más de una
+/// altura de barra (hacia una ventana de al lado; pasarse un poco al llevarla al primer o
+/// último hueco no cuenta). Sin puntero conserva lo que era (`was`): egui lo da por perdido
+/// un solo evento al cruzar el borde de la ventana durante el arrastre.
+pub fn detaching(pointer: Option<Pos2>, bar: Rect, window: Rect, was: bool) -> bool {
+    let Some(p) = pointer else {
+        return was;
+    };
+    let margin = bar.height() / 2.0;
+    let side = bar.height();
+    p.y < bar.top() - margin
+        || p.y > bar.bottom() + margin
+        || p.x < window.left() - side
+        || p.x > window.right() + side
 }
 
 /// Hueco en que entra una pestaña soltada en `x` sobre una barra de `n` pestañas de ancho
@@ -44,25 +52,38 @@ mod tests {
     }
 
     #[test]
-    fn detaching_sin_puntero() {
-        assert!(detaching(None, bar(), window()));
+    fn detaching_sin_puntero_conserva_el_estado() {
+        // egui da el puntero por perdido un solo evento al cruzar el borde de la ventana.
+        assert!(detaching(None, bar(), window(), true));
+        assert!(!detaching(None, bar(), window(), false));
     }
 
     #[test]
     fn detaching_dentro_del_margen() {
-        assert!(!detaching(Some(pos2(100.0, 20.0)), bar(), window()));
-        assert!(!detaching(Some(pos2(100.0, 57.0)), bar(), window())); // 38 + 19
+        assert!(!detaching(Some(pos2(100.0, 20.0)), bar(), window(), false));
+        assert!(!detaching(Some(pos2(100.0, 57.0)), bar(), window(), false)); // 38 + 19
+        // Por arriba, aunque ya esté fuera de la ventana, el mismo margen.
+        assert!(!detaching(Some(pos2(100.0, -19.0)), bar(), window(), false));
     }
 
     #[test]
     fn detaching_bajo_el_margen() {
-        assert!(detaching(Some(pos2(100.0, 57.5)), bar(), window()));
+        assert!(detaching(Some(pos2(100.0, 57.5)), bar(), window(), false));
     }
 
     #[test]
-    fn detaching_fuera_de_la_ventana() {
-        assert!(detaching(Some(pos2(-5.0, 20.0)), bar(), window()));
-        assert!(detaching(Some(pos2(100.0, -3.0)), bar(), window()));
+    fn detaching_sobre_el_margen() {
+        assert!(detaching(Some(pos2(100.0, -19.5)), bar(), window(), false));
+    }
+
+    #[test]
+    fn detaching_por_los_lados() {
+        // Pasarse un poco al llevarla al primer o al último hueco no la despega.
+        assert!(!detaching(Some(pos2(-38.0, 20.0)), bar(), window(), false));
+        assert!(!detaching(Some(pos2(838.0, 20.0)), bar(), window(), false));
+        // Salir de verdad por un lado (hacia una ventana de al lado), sí.
+        assert!(detaching(Some(pos2(-38.5, 20.0)), bar(), window(), false));
+        assert!(detaching(Some(pos2(838.5, 20.0)), bar(), window(), false));
     }
 
     #[test]

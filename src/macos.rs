@@ -230,3 +230,11 @@ pub fn window_number_at(p: egui::Pos2) -> Option<isize> {
     };
     (number > 0).then_some(number)
 }
+
+/// Si el botón principal del ratón está pulsado ahora mismo, según el sistema y no según
+/// los eventos recibidos: al soltar fuera de la ventana sin mover más el ratón, egui-winit
+/// no entrega el soltar y egui seguiría creyendo que está pulsado.
+pub fn primary_button_down() -> bool {
+    let buttons: usize = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
+    buttons & 1 != 0
+}

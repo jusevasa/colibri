@@ -348,12 +348,6 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
         let window = egui_winit::create_window(&ctx, event_loop, &viewport)
             .map_err(|e| format!("no se pudo crear la ventana: {e}"))?;
         let id = window.id();
-        if let Some(ns) = ns_window_of(&window) {
-            NS_WINDOWS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((id, ns));
-        }
 
         let wake_sent = Arc::new(AtomicBool::new(false));
         let wake: Arc<dyn Fn() + Send + Sync> = {
@@ -408,6 +402,15 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
         );
         // ⌘C/⌘X/⌘V llegan como teclas: los traduce la aplicación (`clip::translate`).
         state.set_clipboard_shortcuts(false);
+
+        // Ya no hay vuelta atrás (lo que podía fallar, el pintor, ya está): si se apuntara
+        // antes y fallase, quedaría la dirección de un `NSWindow` ya liberado.
+        if let Some(ns) = ns_window_of(&window) {
+            NS_WINDOWS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((id, ns));
+        }
 
         if let Some(app) = &mut self.app {
             app.window_opened(id, &ctx);
