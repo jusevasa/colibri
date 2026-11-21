@@ -183,7 +183,7 @@ pub fn count_frame() {
     }
     let second = START.get_or_init(Instant::now).elapsed().as_secs();
     if SECOND.swap(second, Ordering::Relaxed) != second {
-        let (shown, skipped, wait) = crate::metal::stats::take();
+        let (shown, skipped, deferred, same, wait) = crate::metal::stats::take();
         let frames = FRAMES.swap(0, Ordering::Relaxed);
         let per = |slot| timing::take(slot) as f64 / 1000.0 / frames.max(1) as f64;
         let (ui, grid, tess, paint) = (
@@ -196,7 +196,7 @@ pub fn count_frame() {
         let insts = timing::take(&timing::INSTANCES) / frames.max(1);
         let (pass, logic) = (per(&timing::PASS), per(&timing::LOGIC));
         eprintln!(
-            "cuadros/s: {frames} (presentados {shown}, saltados {skipped}, espera máx. {:.1} ms) \
+            "cuadros/s: {frames} (presentados {shown}, saltados {skipped}, aplazados {deferred}, sin cambios {same}, espera máx. {:.1} ms) \
              ms/cuadro: pasada {pass:.2} lógica {logic:.2} interfaz {ui:.2} (rejilla {grid:.2}) teselado {tess:.2} pintor {paint:.2} \
              vértices {verts} instancias {insts}",
             wait as f64 / 1000.0

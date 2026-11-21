@@ -10,7 +10,9 @@
 //!
 //! Diferencia de fondo con eframe: el pintor nunca espera un drawable. Si no hay ninguno
 //! libre devuelve `Outcome::Skipped` y avisa después con `wake`; mientras tanto aquí no se
-//! corren más cuadros (ver `Running::waiting`).
+//! corren más cuadros (ver `Running::waiting`). Y se mira antes de empezar
+//! (`Painter::ready`): sin drawable, o con el de pantalla aún por liberarse, la pasada solo
+//! corre `logic()`.
 
 use crate::debug;
 use std::collections::HashMap;
@@ -26,7 +28,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::Window;
 pub use winit::window::WindowId;
 
-use crate::metal::{Outcome, Painter};
+use crate::metal::{Outcome, Painter, Ready};
 
 /// Lo que la aplicación le da al lanzador (el equivalente de `eframe::App`).
 pub trait App {
@@ -94,6 +96,19 @@ const ATLAS_SIDE: usize = 2048;
 
 /// Tope de la espera por un drawable libre: si `wake` no llega, se vuelve a intentar.
 const DRAWABLE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Con la ventana a la vista y sin cuadros nuevos durante este tiempo, el pintor suelta el
+/// drawable de reserva (`Painter::release_reserve`): ~14 MB en una Retina de 1180×760 pt.
+/// La espera evita soltarlo y volver a crearlo entre tecla y tecla.
+const RESERVE_IDLE: Duration = Duration::from_secs(5);
+
+/// Cuándo toca soltar el drawable de reserva: `RESERVE_IDLE` después del último cuadro
+/// presentado, una vez por tanda (`released`) y nunca antes del primer cuadro.
+fn reserve_due(presented_at: Option<Instant>, released: bool) -> Option<Instant> {
+    presented_at
+        .filter(|_| !released)
+        .map(|at| at + RESERVE_IDLE)
+}
 
 /// Eventos propios que llegan al bucle desde cualquier hilo.
 #[derive(Debug)]
@@ -201,6 +216,10 @@ struct Running {
     hidden_since: Option<Instant>,
     /// Los drawables ya se soltaron: la capa está vacía hasta el siguiente cuadro.
     shrunk: bool,
+    /// Cuándo se presentó el último cuadro (para soltar el drawable de reserva en reposo).
+    presented_at: Option<Instant>,
+    /// El drawable de reserva ya se soltó (o se intentó) en esta tanda de reposo.
+    reserve_released: bool,
 
     window: Window,
 }
@@ -340,6 +359,8 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
                 wake_sent,
                 hidden_since: None,
                 shrunk: false,
+                presented_at: None,
+                reserve_released: false,
                 window,
             },
         );
@@ -385,6 +406,16 @@ impl<F> Runner<F> {
         }
 
         let now = Instant::now();
+        for run in self.windows.values_mut() {
+            // A la vista pero quieta: fuera el drawable de reserva. Se apunta aunque el pintor
+            // no lo suelte (un cuadro en vuelo), para no despertar en bucle.
+            if run.reserve_due().is_some_and(|at| at <= now) {
+                run.reserve_released = true;
+                if run.painter.release_reserve() && std::env::var_os("COLIBRI_FPS").is_some() {
+                    eprintln!("drawable de reserva soltado");
+                }
+            }
+        }
         let mut ran = false;
         if let Some(app) = self.app.as_deref_mut() {
             for run in self.windows.values_mut() {
@@ -428,7 +459,10 @@ impl<F> Runner<F> {
                     (Some(at), Some(until)) => Some(at.max(until)),
                     (at, _) => at,
                 };
-                [repaint, run.redraw_deadline].into_iter().flatten().min()
+                [repaint, run.redraw_deadline, run.reserve_due()]
+                    .into_iter()
+                    .flatten()
+                    .min()
             })
             .min();
         event_loop.set_control_flow(match wake_at {
@@ -487,6 +521,15 @@ impl Running {
         self.next_repaint = Some(Instant::now());
     }
 
+    /// Cuándo soltar el drawable de reserva. Una ventana oculta no: ya suelta todos
+    /// (`shrink_if_hidden_long`).
+    fn reserve_due(&self) -> Option<Instant> {
+        if self.shrunk || self.hidden() {
+            return None;
+        }
+        reserve_due(self.presented_at, self.reserve_released)
+    }
+
     /// Una pasada: `logic()` y, si la ventana se ve (y `mode` lo permite), `ui()` y pintar.
     fn pass(&mut self, app: &mut dyn App, event_loop: &ActiveEventLoop, mode: Mode) {
         let started = Instant::now();
@@ -522,7 +565,33 @@ impl Running {
             self.shrink_if_hidden_long();
         }
 
-        if mode == Mode::LogicOnly || !visible {
+        // Sin drawable libre, la pasada de egui (interfaz y teselado) se tiraría entera, y con
+        // el drawable a punto de liberarse `nextDrawable` pararía el hilo principal: solo
+        // `logic()`, como con la ventana oculta, y el cuadro se pinta cuando el pintor avise
+        // (`wake`) o al refresco siguiente. Las teclas esperan a esa pasada (unos
+        // milisegundos). Una captura pendiente sí pinta: sale de una textura aparte.
+        let ready = if mode == Mode::Full && visible && !wants_paint && !self.first_frame {
+            self.painter.ready()
+        } else {
+            Ready::Now
+        };
+        let deferred = match ready {
+            Ready::Now => false,
+            Ready::Wake => {
+                self.skipped = true;
+                self.waiting = Some(Instant::now() + DRAWABLE_TIMEOUT);
+                true
+            }
+            Ready::After(left) => {
+                // Aquí no llega ningún aviso: la pasada se programa para entonces.
+                let at = Instant::now() + left;
+                self.waiting = Some(at);
+                self.next_repaint = Some(self.next_repaint.map_or(at, |n| n.min(at)));
+                true
+            }
+        };
+
+        if mode == Mode::LogicOnly || !visible || deferred {
             // Sin pasada de egui: el estado de la interfaz queda como estaba para cuando
             // la ventana vuelva a verse.
             let output = self.ctx.run_logic(&input, |ctx| app.logic(win, ctx));
@@ -625,6 +694,13 @@ impl Running {
         }
         match painted.outcome {
             Outcome::Presented => {
+                self.skipped = false;
+                self.waiting = None;
+                self.presented_at = Some(Instant::now());
+                self.reserve_released = false;
+            }
+            // Lo que se ve ya es este cuadro; no cuenta como cuadro nuevo para soltar la reserva.
+            Outcome::Unchanged => {
                 self.skipped = false;
                 self.waiting = None;
             }
@@ -792,5 +868,27 @@ impl<F: FnOnce() -> Box<dyn App>> ApplicationHandler<UserEvent> for Runner<F> {
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // También se llega aquí con ⌘Q, y entonces `run_app` no vuelve.
         self.destroy();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RESERVE_IDLE, reserve_due};
+    use std::time::Instant;
+
+    #[test]
+    fn reserva_se_suelta_tras_un_rato_sin_pintar_y_una_vez() {
+        let t = Instant::now();
+        assert_eq!(
+            reserve_due(None, false),
+            None,
+            "sin cuadros todavía no hay nada que soltar"
+        );
+        assert_eq!(reserve_due(Some(t), false), Some(t + RESERVE_IDLE));
+        assert_eq!(
+            reserve_due(Some(t), true),
+            None,
+            "ya se soltó en esta tanda"
+        );
     }
 }

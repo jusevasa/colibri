@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,9 @@ use objc2_metal::{
     MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
     MTLVertexDescriptor, MTLVertexFormat,
 };
-use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer, CATransaction};
+use objc2_quartz_core::{
+    CAAutoresizingMask, CACurrentMediaTime, CAMetalDrawable, CAMetalLayer, CATransaction,
+};
 
 type Device = ProtocolObject<dyn MTLDevice>;
 type Queue = ProtocolObject<dyn MTLCommandQueue>;
@@ -75,13 +77,20 @@ pub mod stats {
 
     pub static PRESENTED: AtomicU64 = AtomicU64::new(0);
     pub static SKIPPED: AtomicU64 = AtomicU64::new(0);
+    /// Cuadros aplazados hasta que se libere el drawable que estaba en pantalla.
+    pub static DEFERRED: AtomicU64 = AtomicU64::new(0);
+    /// Cuadros idénticos al último presentado, que no se presentaron.
+    pub static UNCHANGED: AtomicU64 = AtomicU64::new(0);
     pub static MAX_WAIT_US: AtomicU64 = AtomicU64::new(0);
 
-    /// Lo acumulado desde la última llamada: (presentados, saltados, espera máxima en µs).
-    pub fn take() -> (u64, u64, u64) {
+    /// Lo acumulado desde la última llamada: (presentados, saltados, aplazados, sin cambios,
+    /// espera máxima en µs).
+    pub fn take() -> (u64, u64, u64, u64, u64) {
         (
             PRESENTED.swap(0, Ordering::Relaxed),
             SKIPPED.swap(0, Ordering::Relaxed),
+            DEFERRED.swap(0, Ordering::Relaxed),
+            UNCHANGED.swap(0, Ordering::Relaxed),
             MAX_WAIT_US.swap(0, Ordering::Relaxed),
         )
     }
@@ -219,6 +228,19 @@ pub enum Outcome {
     /// No había un drawable libre (o la capa no tiene tamaño): no se pintó nada en la
     /// ventana y **no se esperó**. Cuando vuelva a haber uno libre se llama a `wake`.
     Skipped,
+    /// Idéntico al último cuadro presentado (`signature`): no se pintó nada porque lo que se
+    /// ve ya es eso.
+    Unchanged,
+}
+
+/// Si se puede pintar ya (`Painter::ready`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ready {
+    Now,
+    /// Sin drawable libre: `wake` avisará cuando se libere uno.
+    Wake,
+    /// El drawable que estaba en pantalla se libera en el próximo refresco: dentro de esto.
+    After(Duration),
 }
 
 /// Resultado de `Painter::paint`.
@@ -241,6 +263,9 @@ struct Flight {
     epoch: AtomicUsize,
     /// Algún cuadro se saltó por falta de drawable y nadie ha avisado todavía.
     skipped: AtomicBool,
+    /// Cuándo salió en pantalla el último cuadro (`presentedTime`, en segundos de
+    /// `CACurrentMediaTime`, como bits de `f64`; 0 = ninguno todavía).
+    shown_at: AtomicU64,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -250,6 +275,7 @@ impl Flight {
             in_flight: AtomicUsize::new(0),
             epoch: AtomicUsize::new(0),
             skipped: AtomicBool::new(false),
+            shown_at: AtomicU64::new(0),
             wake,
         })
     }
@@ -270,6 +296,31 @@ impl Flight {
         false
     }
 
+    /// `free` con el plazo `STALE` y el refresco: lo que decide `acquire` y, antes de la
+    /// pasada de egui, `Painter::ready`. `now` en segundos de `CACurrentMediaTime`; `refresh`
+    /// es el periodo de la pantalla, o cero si la capa tiene un drawable de sobra.
+    fn gate(&self, limit: usize, since_last_try: Duration, now: f64, refresh: Duration) -> Gate {
+        if !self.free(limit) {
+            return if since_last_try < STALE {
+                Gate::Busy
+            } else {
+                Gate::Stale
+            };
+        }
+        let shown = f64::from_bits(self.shown_at.load(Ordering::SeqCst));
+        let left = shown + refresh.as_secs_f64() - now;
+        if shown > 0.0 && left > 0.0 {
+            Gate::Soon(Duration::from_secs_f64(left).min(refresh))
+        } else {
+            Gate::Free
+        }
+    }
+
+    /// Apunta cuándo salió en pantalla un cuadro (desde el manejador de «presentado»).
+    fn shown(&self, at: f64) {
+        self.shown_at.store(at.to_bits(), Ordering::SeqCst);
+    }
+
     /// Apunta un drawable recién tomado. Se descuenta al soltar el billete.
     fn ticket(self: &Arc<Self>) -> Arc<Ticket> {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
@@ -284,7 +335,23 @@ impl Flight {
     fn reset(&self) {
         self.epoch.fetch_add(1, Ordering::SeqCst);
         self.in_flight.store(0, Ordering::SeqCst);
+        self.shown_at.store(0, Ordering::SeqCst);
     }
+}
+
+/// Qué se puede hacer con un cuadro ahora mismo, según los drawables en vuelo.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// Hay drawable libre: se pinta.
+    Free,
+    /// No hay y la cuenta se movió hace poco: el cuadro se salta y queda pedido el aviso.
+    Busy,
+    /// No hay desde hace `STALE`: se da la cuenta por perdida y se vuelve a pedir.
+    Stale,
+    /// La cuenta deja, pero el drawable que estaba en pantalla no se libera hasta el
+    /// refresco siguiente a la última presentación: pedirlo antes haría esperar a
+    /// `nextDrawable`. Falta esto.
+    Soon(Duration),
 }
 
 /// Un drawable en vuelo. Lo sueltan el manejador de «presentado» o, si el drawable se
@@ -933,6 +1000,56 @@ fn scissor(clip: &egui::Rect, pixels_per_point: f32, target: [u32; 2]) -> Option
     })
 }
 
+/// Todo lo que decide los píxeles de un cuadro, en bytes: tamaño, escala, fondo, recortes,
+/// mallas con su textura e instancias de la rejilla. Si coincide con la del último cuadro
+/// presentado, el cuadro sería idéntico y no hace falta presentarlo. Devuelve `false` si hay
+/// algo que no sabe comparar (un callback que no es la rejilla): entonces se presenta.
+fn signature(
+    out: &mut Vec<u8>,
+    size_px: [u32; 2],
+    pixels_per_point: f32,
+    clear: [f32; 4],
+    primitives: &[egui::ClippedPrimitive],
+) -> bool {
+    /// SAFETY: solo con tipos sin relleno (`Vertex` de 20 bytes, `Instance` de 40 con su
+    /// `_pad`, `u32`, `f32`), igual que al copiarlos a los búferes de la GPU.
+    fn bytes<T: Copy>(v: &[T]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), size_of_val(v)) }
+    }
+    let rect = |r: egui::Rect| [r.min.x, r.min.y, r.max.x, r.max.y];
+    out.clear();
+    out.extend_from_slice(bytes(&size_px));
+    out.extend_from_slice(bytes(&[pixels_per_point]));
+    out.extend_from_slice(bytes(&clear));
+    for p in primitives {
+        out.extend_from_slice(bytes(&rect(p.clip_rect)));
+        match &p.primitive {
+            Primitive::Mesh(m) => {
+                let (kind, id) = match m.texture_id {
+                    TextureId::Managed(id) => (0u8, id),
+                    TextureId::User(id) => (1, id),
+                };
+                out.push(kind);
+                out.extend_from_slice(&id.to_le_bytes());
+                out.extend_from_slice(&(m.vertices.len() as u64).to_le_bytes());
+                out.extend_from_slice(bytes(&m.vertices));
+                out.extend_from_slice(&(m.indices.len() as u64).to_le_bytes());
+                out.extend_from_slice(bytes(&m.indices));
+            }
+            Primitive::Callback(c) => {
+                let Some(g) = c.callback.downcast_ref::<GridBatch>() else {
+                    return false;
+                };
+                out.push(2);
+                out.extend_from_slice(bytes(&rect(c.rect)));
+                out.extend_from_slice(&(g.instances.len() as u64).to_le_bytes());
+                out.extend_from_slice(bytes(&g.instances));
+            }
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------------------
 // Painter
 // ---------------------------------------------------------------------------------------
@@ -950,6 +1067,10 @@ pub struct Painter {
     last_try: Instant,
     /// La capa presenta dentro de la transacción de Core Animation (redimensionado en vivo).
     transaction: bool,
+    /// Firma del último cuadro presentado (`signature`); vacía obliga a presentar.
+    shown: Vec<u8>,
+    /// La del cuadro en curso (se reutiliza la memoria).
+    next: Vec<u8>,
 }
 
 /// Capa de Metal de la ventana: transparente, en sRGB, sin esperar a ciegas un drawable.
@@ -1019,12 +1140,75 @@ impl Painter {
             size: [0, 0],
             last_try: Instant::now(),
             transaction: false,
+            shown: Vec::new(),
+            next: Vec::new(),
         })
     }
 
     /// Lado máximo de una textura (para `RawInput::max_texture_side`).
     pub fn max_texture_side(&self) -> usize {
         MAX_TEXTURE_SIDE
+    }
+
+    /// Si ahora se puede pintar sin que `nextDrawable` espere. Si no, la pasada de egui que
+    /// prepara el cuadro se tiraría entera (sin drawable) o pararía el hilo principal (con el
+    /// drawable a punto de liberarse). Una cuenta perdida (`STALE`) no cuenta: `paint` vuelve
+    /// a pedir drawable.
+    pub fn ready(&self) -> Ready {
+        match self.gate() {
+            Gate::Free | Gate::Stale => Ready::Now,
+            Gate::Busy => {
+                stats::SKIPPED.fetch_add(1, Ordering::Relaxed);
+                Ready::Wake
+            }
+            Gate::Soon(left) => {
+                stats::DEFERRED.fetch_add(1, Ordering::Relaxed);
+                Ready::After(left)
+            }
+        }
+    }
+
+    /// Con la ventana a la vista pero quieta: suelta el drawable de reserva, el que no está en
+    /// pantalla (~14 MB en una Retina de 1180×760 pt). Pedir uno de 1×1 hace que la capa
+    /// descarte los libres de otro tamaño; el de pantalla sigue siendo su contenido y se ve
+    /// igual. El siguiente `paint` restaura el tamaño (`fit`) y la capa crea otro. Devuelve si
+    /// lo soltó: con un cuadro en vuelo `nextDrawable` podría esperar, y entonces no se toca.
+    pub fn release_reserve(&mut self) -> bool {
+        if self.size == [0, 0] || self.flight.in_flight.load(Ordering::SeqCst) > 0 {
+            return false;
+        }
+        self.layer.setDrawableSize(NSSize::new(1.0, 1.0));
+        autoreleasepool(|_| drop(self.layer.nextDrawable()));
+        self.size = [0, 0];
+        true
+    }
+
+    fn gate(&self) -> Gate {
+        let max = self.layer.maximumDrawableCount();
+        // Con dos drawables no hay uno de sobra: tras presentar, el que estaba en pantalla no
+        // vuelve hasta el refresco siguiente. Con tres, el tercero está libre.
+        let refresh = if max <= 2 {
+            self.refresh()
+        } else {
+            Duration::ZERO
+        };
+        self.flight.gate(
+            drawable_limit(max),
+            self.last_try.elapsed(),
+            CACurrentMediaTime(),
+            refresh,
+        )
+    }
+
+    /// Periodo de refresco de la pantalla de la ventana (8,3 ms con ProMotion, 16,7 a 60 Hz).
+    fn refresh(&self) -> Duration {
+        let fps = self
+            .view
+            .window()
+            .and_then(|w| w.screen())
+            .map_or(60, |s| s.maximumFramesPerSecond())
+            .clamp(24, 240);
+        Duration::from_secs_f64(1.0 / fps as f64)
     }
 
     /// Pinta un cuadro. Nunca bloquea el hilo esperando un drawable.
@@ -1042,10 +1226,32 @@ impl Painter {
         textures: &egui::TexturesDelta,
         capture: bool,
     ) -> Painted {
+        // Un cuadro idéntico al último presentado no se presenta: ni GPU ni servidor de
+        // ventanas. Con texturas nuevas o una captura pedida, sí.
+        let comparable = signature(&mut self.next, size_px, pixels_per_point, clear, primitives);
+        if comparable
+            && !capture
+            && textures.is_empty()
+            && !self.shown.is_empty()
+            && self.next == self.shown
+        {
+            stats::UNCHANGED.fetch_add(1, Ordering::Relaxed);
+            return Painted {
+                outcome: Outcome::Unchanged,
+                capture: None,
+            };
+        }
         self.renderer.set_textures(textures);
         let painted =
             autoreleasepool(|_| self.frame(size_px, pixels_per_point, clear, primitives, capture));
         self.renderer.free_textures(textures);
+        if painted.outcome == Outcome::Presented {
+            if comparable {
+                std::mem::swap(&mut self.shown, &mut self.next);
+            } else {
+                self.shown.clear();
+            }
+        }
         painted
     }
 
@@ -1070,6 +1276,8 @@ impl Painter {
         self.flight.reset();
         self.size = [0, 0];
         self.transaction = false;
+        // La capa nueva está vacía: el siguiente cuadro se presenta aunque sea igual.
+        self.shown.clear();
     }
 
     fn frame(
@@ -1115,7 +1323,12 @@ impl Painter {
         };
 
         let on_screen = ticket.clone();
-        let presented = RcBlock::new(move |_: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+        let presented = RcBlock::new(move |shown: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+            // SAFETY: Metal pasa el drawable que se acaba de presentar, vivo durante la llamada.
+            let at = unsafe { shown.as_ref() }.presentedTime();
+            on_screen
+                .flight
+                .shown(if at > 0.0 { at } else { CACurrentMediaTime() });
             on_screen.release();
         });
         // SAFETY: bloque válido; Metal lo copia. Lo llama desde otro hilo cuando el
@@ -1177,16 +1390,18 @@ impl Painter {
         // De los `maximumDrawableCount` de la capa, uno está en pantalla y no vuelve hasta
         // que otro lo sustituye; ese ya no cuenta como «en vuelo» (su manejador ya saltó).
         // Por eso el tope es uno menos: con más, `nextDrawable` esperaría.
-        let limit = drawable_limit(self.layer.maximumDrawableCount());
-        if !self.flight.free(limit) {
-            if self.last_try.elapsed() < STALE {
+        match self.gate() {
+            // Aplazar le toca a `ready`, antes de la pasada; aquí solo llega una captura, que
+            // puede esperar un momento a que se libere.
+            Gate::Free | Gate::Soon(_) => {}
+            Gate::Busy => {
                 stats::SKIPPED.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             // Hace mucho que nada se libera: se supone que algún manejador no llegó y se
             // prueba otra vez. Si la capa de verdad no tiene drawable, `nextDrawable`
             // devuelve nil al segundo y no se reintenta hasta pasado otro plazo.
-            self.flight.reset();
+            Gate::Stale => self.flight.reset(),
         }
         self.last_try = Instant::now();
         let next = self.layer.nextDrawable();
@@ -1638,5 +1853,133 @@ mod tests {
         assert_eq!(flight.in_flight.load(Ordering::SeqCst), 1);
         drop(d);
         assert_eq!(flight.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    /// Sin drawable libre el cuadro se salta (sin pasada de egui), salvo que la cuenta lleve
+    /// `STALE` sin moverse: entonces se perdió un manejador y hay que volver a pedir, o la
+    /// ventana no volvería a pintarse nunca.
+    #[test]
+    fn metal_sin_drawable_se_salta_salvo_cuenta_perdida() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let w = wakes.clone();
+        let flight = Flight::new(Arc::new(move || {
+            w.fetch_add(1, Ordering::SeqCst);
+        }));
+        let recent = Duration::from_millis(5);
+        let gate = |since_last_try| flight.gate(1, since_last_try, 0.0, Duration::ZERO);
+        assert_eq!(gate(recent), Gate::Free);
+        let a = flight.ticket();
+        assert_eq!(gate(recent), Gate::Busy);
+        // Queda pedido el aviso: al liberarse el drawable se despierta a la ventana.
+        a.release();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(gate(recent), Gate::Free);
+        let _b = flight.ticket();
+        assert_eq!(gate(STALE), Gate::Stale);
+    }
+
+    /// Con dos drawables, el que estaba en pantalla no se libera hasta el refresco siguiente a
+    /// la presentación del nuevo: pedir uno antes paraba el hilo principal en `nextDrawable`
+    /// (medido: 2,5–7,6 ms, en la mitad de los cuadros con salida continua). Se aplaza.
+    #[test]
+    fn metal_tras_presentar_se_espera_un_refresco() {
+        let flight = Flight::new(Arc::new(|| {}));
+        let refresh = Duration::from_micros(8333);
+        let recent = Duration::from_millis(5);
+        // Nada presentado todavía: libre.
+        assert_eq!(flight.gate(1, recent, 100.0, refresh), Gate::Free);
+        flight.shown(100.0);
+        // 3 ms después de presentar faltan ~5,3 ms de refresco.
+        match flight.gate(1, recent, 100.003, refresh) {
+            Gate::Soon(left) => assert_eq!(left.as_micros() / 100, 53, "{left:?}"),
+            other => panic!("se esperaba Soon y fue {other:?}"),
+        }
+        // Pasado el refresco: libre.
+        assert_eq!(flight.gate(1, recent, 100.009, refresh), Gate::Free);
+        // Con un drawable de sobra (sin periodo) no hace falta esperar.
+        assert_eq!(flight.gate(1, recent, 100.001, Duration::ZERO), Gate::Free);
+        // Sin drawable libre manda la cuenta, no el refresco.
+        let _a = flight.ticket();
+        assert_eq!(flight.gate(1, recent, 100.003, refresh), Gate::Busy);
+    }
+
+    /// Un cuadro idéntico al que ya se ve no se presenta (ni GPU ni servidor de ventanas), así
+    /// que la firma tiene que cambiar con cualquier cosa que cambie los píxeles.
+    #[test]
+    fn metal_firma_del_cuadro() {
+        use egui::epaint::PaintCallback;
+        let rect = Rect::from_min_max(pos2(1.0, 1.0), pos2(5.0, 5.0));
+        let mesh = |color, texture| {
+            let mut m = Mesh::default();
+            m.add_colored_rect(rect, color);
+            m.texture_id = texture;
+            vec![egui::ClippedPrimitive {
+                clip_rect: Rect::EVERYTHING,
+                primitive: Primitive::Mesh(m),
+            }]
+        };
+        let grid = |x: f32| {
+            let g = GridBatch {
+                instances: vec![Instance::solid(pos2(x, 0.0), pos2(4.0, 4.0), Color32::RED)],
+            };
+            vec![egui::ClippedPrimitive {
+                clip_rect: Rect::EVERYTHING,
+                primitive: Primitive::Callback(PaintCallback {
+                    rect,
+                    callback: Arc::new(g),
+                }),
+            }]
+        };
+        let sig = |size, clear, prims: &[egui::ClippedPrimitive]| {
+            let mut out = Vec::new();
+            assert!(signature(&mut out, size, 2.0, clear, prims));
+            out
+        };
+        let (size, clear, tex) = ([16, 16], [0.0; 4], TextureId::default());
+        let base = sig(size, clear, &mesh(Color32::RED, tex));
+        assert_eq!(
+            base,
+            sig(size, clear, &mesh(Color32::RED, tex)),
+            "mismo cuadro"
+        );
+        assert_ne!(
+            base,
+            sig(size, clear, &mesh(Color32::BLUE, tex)),
+            "otro color"
+        );
+        assert_ne!(
+            base,
+            sig(size, clear, &mesh(Color32::RED, TextureId::User(1))),
+            "otra textura"
+        );
+        assert_ne!(
+            base,
+            sig([17, 16], clear, &mesh(Color32::RED, tex)),
+            "otro tamaño"
+        );
+        assert_ne!(
+            base,
+            sig(size, [0.1, 0.0, 0.0, 1.0], &mesh(Color32::RED, tex)),
+            "otro fondo"
+        );
+        assert_eq!(
+            sig(size, clear, &grid(0.0)),
+            sig(size, clear, &grid(0.0)),
+            "misma rejilla"
+        );
+        assert_ne!(
+            sig(size, clear, &grid(0.0)),
+            sig(size, clear, &grid(1.0)),
+            "otra celda"
+        );
+        // Lo que no sabe comparar se presenta.
+        let unknown = vec![egui::ClippedPrimitive {
+            clip_rect: Rect::EVERYTHING,
+            primitive: Primitive::Callback(PaintCallback {
+                rect,
+                callback: Arc::new(5u8),
+            }),
+        }];
+        assert!(!signature(&mut Vec::new(), size, 2.0, clear, &unknown));
     }
 }
