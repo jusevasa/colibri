@@ -32,10 +32,12 @@ Requiere macOS 12 o posterior.
 ### Homebrew
 
 ```sh
+brew tap jusevasa/colibri
+brew trust --cask jusevasa/colibri/colibri
 brew install --cask jusevasa/colibri/colibri
 ```
 
-La app va firmada y notarizada por Apple, para Apple silicon e Intel. Para actualizar, `brew upgrade --cask colibri`: Colibrí lo nota y enseña el botón **Actualizar**, que la reinicia con la versión nueva (ver abajo qué pasa con las pestañas).
+Homebrew (desde la versión 7) solo carga casks de fuera de su catálogo oficial si se añade su tap y se marcan como de confianza; `brew trust --cask` confía solo en este cask, no en todo el tap. La app va firmada y notarizada por Apple, para Apple silicon e Intel. Para actualizar, `brew upgrade --cask colibri`: Colibrí lo nota y enseña el botón **Actualizar**, que la reinicia con la versión nueva (ver abajo qué pasa con las pestañas).
 
 ### Desde el código
 
