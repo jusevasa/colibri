@@ -207,7 +207,6 @@ fn primary_height() -> Option<f64> {
 
 /// Dónde está el puntero en la pantalla, en puntos con origen arriba a la izquierda de la
 /// pantalla principal (como `outer_position` de winit y `Win::frame`). Hilo principal.
-#[allow(dead_code)] // se usa al soltar una pestaña despegada (siguiente paso)
 pub fn pointer_on_screen() -> Option<egui::Pos2> {
     let height = primary_height()?;
     let at: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
@@ -219,7 +218,6 @@ pub fn pointer_on_screen() -> Option<egui::Pos2> {
 
 /// Número de la ventana que se ve en ese punto (de cualquier aplicación: respeta qué ventana
 /// tapa a cuál), o nada si no hay ninguna. Punto como el de `pointer_on_screen`.
-#[allow(dead_code)] // se usa al soltar una pestaña despegada (siguiente paso)
 pub fn window_number_at(p: egui::Pos2) -> Option<isize> {
     let height = primary_height()?;
     let at = NSPoint::new(p.x as f64, crate::drag::flip_y(p.y as f64, height));

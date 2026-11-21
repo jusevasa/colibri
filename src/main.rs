@@ -8,7 +8,6 @@ mod clip;
 mod complete;
 mod config;
 mod debug;
-#[allow(dead_code)] // se usa al despegar pestañas desde la barra (siguiente paso)
 mod drag;
 mod git;
 mod grid;
@@ -277,6 +276,9 @@ pub struct Win {
     overlay: overlay::Overlay,
     /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
     drag_tab: Option<(u64, f32)>,
+    /// Esa pestaña está despegada: el puntero se fue de la barra (`drag::detaching`). Se
+    /// queda atenuada en su hueco y, al soltarla, pasa a otra ventana o a una nueva.
+    detached: bool,
     /// Ancho y origen de las pestañas en el cuadro anterior: si cambian (se redimensiona la
     /// ventana, se abre una pestaña) las pestañas se recolocan sin animación.
     tab_layout: (f32, f32),
@@ -350,6 +352,7 @@ impl Win {
             agents_search_focus: false,
             overlay: overlay::Overlay::None,
             drag_tab: None,
+            detached: false,
             tab_layout: (0.0, 0.0),
             history: Vec::new(),
             picks: Vec::new(),
@@ -1094,6 +1097,33 @@ impl App {
         self.w.ctx.request_repaint();
     }
 
+    /// Se soltó despegada la pestaña `id`: a la ventana de Colibrí que macOS ve bajo el
+    /// puntero (al hueco de su barra si cae en ella, si no al final) o, si no hay ninguna, a
+    /// una ventana nueva con la esquina ahí. Sobre la propia ventana no pasa nada.
+    fn drop_detached(&mut self, id: u64) {
+        let Some(i) = self.w.sessions.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let Some(p) = macos::pointer_on_screen() else {
+            return;
+        };
+        match macos::window_number_at(p).and_then(shell::window_with_number) {
+            Some(win) if Some(win) == self.cur => {}
+            Some(win) => {
+                let slot = self.parked.get(&win).and_then(|w| {
+                    let [fx, fy, ..] = w.frame?;
+                    let (tab_w, tabs_left) = w.tab_layout;
+                    let y = p.y - fy;
+                    (0.0..=TAB_BAR_H)
+                        .contains(&y)
+                        .then(|| drag::drop_slot(p.x - fx, tabs_left, tab_w, w.sessions.len()))
+                });
+                self.move_to_window(i, win, slot);
+            }
+            None => self.detach_to_new_window(i, p),
+        }
+    }
+
     fn select(&mut self, i: usize) {
         if i < self.w.sessions.len() {
             self.w.active = i;
@@ -1603,10 +1633,18 @@ impl App {
         let mut grabbed = None;
         let mut recolor = None;
         let tabs_left = full.left() + left_reserved;
-        let pointer_x = ui.input(|i| i.pointer.latest_pos().map(|p| p.x));
+        let pointer = ui.input(|i| i.pointer.latest_pos());
+        let mut dropped = None;
         if !ui.input(|i| i.pointer.primary_down()) {
+            if self.w.detached {
+                dropped = self.w.drag_tab.map(|(id, _)| id);
+            }
             self.w.drag_tab = None;
         }
+        self.w.detached =
+            self.w.drag_tab.is_some() && drag::detaching(pointer, full, ctx.content_rect());
+        // Despegada, la pestaña no sigue al puntero: vuelve a su hueco y no reordena.
+        let pointer_x = pointer.map(|p| p.x).filter(|_| !self.w.detached);
         // Al cambiar de hueco la pestaña se desliza en vez de saltar.
         let slide = if self.w.tab_layout == (tab_w, tabs_left) {
             TAB_SLIDE
@@ -1797,6 +1835,11 @@ impl App {
                     FontId::proportional(10.5),
                     pal.muted.gamma_multiply(0.7),
                 );
+            }
+            // Despegada: atenuada con un velo de su propio fondo (con opacidad, el fondo de la
+            // activa dejaría ver lo de detrás de la ventana).
+            if self.w.detached && self.w.drag_tab.is_some_and(|(id, _)| id == s.id) {
+                p.rect_filled(rect, 0.0, surface.gamma_multiply(0.6));
             }
 
             if resp.clicked() {
@@ -2030,6 +2073,9 @@ impl App {
         }
         if let Some((from, to)) = moved {
             self.move_tab(from, to);
+        }
+        if let Some(id) = dropped {
+            self.drop_detached(id);
         }
         if let Some((i, color)) = recolor
             && let Some(s) = self.w.sessions.get_mut(i)

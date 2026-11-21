@@ -82,7 +82,6 @@ static NS_WINDOWS: Mutex<Vec<(WindowId, usize)>> = Mutex::new(Vec::new());
 
 /// La ventana de Colibrí con ese número de ventana de macOS (`windowNumber`). El número se
 /// consulta ahora y no al crearla: una ventana aún sin mostrar no tiene. Hilo principal.
-#[allow(dead_code)] // se usa al soltar una pestaña despegada (siguiente paso)
 pub fn window_with_number(number: isize) -> Option<WindowId> {
     let windows = NS_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     windows.iter().find_map(|&(id, ns)| {
