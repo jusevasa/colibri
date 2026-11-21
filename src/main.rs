@@ -23,6 +23,7 @@ mod procs;
 mod session;
 mod shell;
 mod state;
+mod switch;
 mod view;
 
 use config::{Config, Palette, Shortcut};
@@ -35,7 +36,6 @@ use shell::WindowId;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 const TAB_BAR_H: f32 = 38.0;
@@ -2092,7 +2092,7 @@ impl App {
             );
             let id = ui.scope_id().with("ports-refresh");
             if icon_button(ui, &pal, refresh, id, Icon::Refresh, "Actualizar ahora").0 {
-                self.ports.refresh.store(true, Ordering::Relaxed);
+                self.ports.refresh();
             }
             if web.is_empty() {
                 hint(ui, &pal, "No hay servidores web corriendo");
@@ -2141,7 +2141,7 @@ impl App {
             true
         });
         if refresh {
-            self.ports.refresh.store(true, Ordering::Relaxed);
+            self.ports.refresh();
         }
         if self
             .confirm_stop
@@ -2341,7 +2341,7 @@ impl App {
     fn stop_pid(&mut self, pid: i32) {
         procs::stop(pid, self.stubborn.contains(&pid));
         self.stopping.insert(pid, Instant::now());
-        self.ports.refresh.store(true, Ordering::Relaxed);
+        self.ports.refresh();
     }
 
     /// Pestaña desde la que se lanzó un proceso (su shell es antepasado del proceso).
@@ -2793,12 +2793,8 @@ impl shell::App for App {
             s.set_shown(!hidden && i == self.w.active);
         }
 
-        self.ports
-            .enabled
-            .store(self.show_ports || self.show_procs, Ordering::Relaxed);
-        self.monitor
-            .enabled
-            .store(self.show_procs, Ordering::Relaxed);
+        self.ports.switch.set(self.show_ports || self.show_procs);
+        self.monitor.switch.set(self.show_procs);
         // Solo hay trabajo periódico mientras algo corre; en reposo no se repinta nada.
         if self.w.sessions.iter().any(|s| s.wants_ticks()) {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -2913,9 +2909,9 @@ impl shell::App for App {
         let chips = self
             .w
             .sessions
-            .get(self.w.active)
+            .get_mut(self.w.active)
             .filter(|_| self.cfg.status_bar)
-            .map(|s| (s.cwd.clone(), s.activity))
+            .map(|s| (s.cwd.clone(), s.git_activity()))
             .map(|(cwd, activity)| {
                 let info = self.w.git.info(&ctx, &cwd, activity);
                 (cwd, info)

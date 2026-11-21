@@ -1,9 +1,10 @@
 //! Monitor de procesos: `ps` + `vm_stat` cada 2 s, solo mientras el apartado está visible.
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::switch::Switch;
 
 #[derive(Clone, PartialEq)]
 pub struct Proc {
@@ -26,14 +27,15 @@ pub struct Snapshot {
 
 pub struct Monitor {
     pub data: Arc<Mutex<Snapshot>>,
-    pub enabled: Arc<AtomicBool>,
+    /// Encendido mientras se ve Procesos; apagado, el hilo ni corre `ps` ni despierta.
+    pub switch: Arc<Switch>,
 }
 
 impl Monitor {
     pub fn start() -> Self {
         let data = Arc::new(Mutex::new(Snapshot::default()));
-        let enabled = Arc::new(AtomicBool::new(false));
-        let (d, e) = (data.clone(), enabled.clone());
+        let switch = Arc::new(Switch::default());
+        let (d, sw) = (data.clone(), switch.clone());
         std::thread::Builder::new()
             .name("colibri-procs".into())
             .spawn(move || {
@@ -42,7 +44,7 @@ impl Monitor {
                     .map(|n| n.get())
                     .unwrap_or(1) as f32;
                 loop {
-                    if e.load(Ordering::Relaxed) {
+                    if sw.is_on() {
                         let procs = scan();
                         let cpu_total =
                             (procs.iter().map(|p| p.cpu).sum::<f32>() / cores).min(100.0);
@@ -58,14 +60,12 @@ impl Monitor {
                             drop(guard);
                             crate::shell::wake_all();
                         }
-                        std::thread::sleep(Duration::from_secs(2));
-                    } else {
-                        std::thread::sleep(Duration::from_millis(400));
                     }
+                    sw.wait(Duration::from_secs(2));
                 }
             })
             .ok();
-        Self { data, enabled }
+        Self { data, switch }
     }
 }
 

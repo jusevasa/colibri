@@ -526,11 +526,12 @@ impl EventListener for Listener {
         let now = now_ms();
         let since_frame = now.saturating_sub(pace.last_frame.load(Ordering::Relaxed));
         let typing = now.saturating_sub(LAST_INPUT.load(Ordering::Relaxed)) < ECHO_WINDOW;
-        if typing {
-            return ctx.request_repaint();
-        }
         // Con espera (aunque sea de 1 ms) egui pinta un solo cuadro; `request_repaint()`
-        // pinta dos seguidos, y eso doblaba los cuadros de cualquier salida continua.
+        // pinta dos seguidos, y eso doblaba los cuadros de cualquier salida continua y del
+        // eco de cada tecla.
+        if typing {
+            return ctx.request_repaint_after(Duration::from_millis(1));
+        }
         let wait = OUTPUT_FRAME.saturating_sub(since_frame).max(1);
         ctx.request_repaint_after(Duration::from_millis(wait));
     }
@@ -617,6 +618,18 @@ impl Agent {
         }
         None
     }
+}
+
+/// La actividad que ve git (`git::Watch`, para las cajas del prompt): la de la pestaña
+/// mientras el shell está en primer plano. Con otro programa delante (un agente) no hay
+/// prompt donde se vean las cajas y se congela; así no se relee `.git/HEAD` en cada cuadro
+/// ni corre `git status` cada 3 s mientras el agente escribe. Al volver el shell, el salto
+/// hace que se consulte otra vez (el agente pudo cambiar de rama o hacer commits).
+fn git_activity(frozen: &mut u64, activity: u64, shell_in_front: bool) -> u64 {
+    if shell_in_front {
+        *frozen = activity;
+    }
+    *frozen
 }
 
 /// Qué hacer con la orden pendiente de una pestaña nueva (`Session::run_when_ready`).
@@ -748,6 +761,8 @@ pub struct Session {
     pub typed: Vec<String>,
     /// Sube cada vez que el programa escribe algo: sirve para saber si hubo novedades.
     pub activity: u64,
+    /// `activity` la última vez que el shell estaba en primer plano (`git_activity`).
+    git_frozen: u64,
     /// Última celda informada al programa y botón que se mantiene pulsado.
     pub mouse_cell: Option<(usize, usize)>,
     pub mouse_down: Option<u8>,
@@ -891,6 +906,7 @@ impl Session {
             line: Some(String::new()),
             typed: Vec::new(),
             activity: 0,
+            git_frozen: 0,
             mouse_cell: None,
             mouse_down: None,
         })
@@ -1781,6 +1797,15 @@ impl Session {
     pub fn wants_ticks(&self) -> bool {
         self.busy || self.dirty
     }
+
+    /// La actividad que debe ver `git::Watch` (ver `git_activity`).
+    pub fn git_activity(&mut self) -> u64 {
+        git_activity(
+            &mut self.git_frozen,
+            self.activity,
+            self.fg_pid == self.shell_pid,
+        )
+    }
 }
 
 impl Drop for Session {
@@ -1794,6 +1819,61 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    /// El eco de una tecla debe costar una sola pasada de egui: con `request_repaint()` egui
+    /// pinta dos seguidas y la segunda ya no tiene nada nuevo que enseñar.
+    #[test]
+    fn eco_de_una_tecla_una_sola_pasada() {
+        use super::{LAST_INPUT, Listener, Pace, now_ms};
+        use alacritty_terminal::event::{Event, EventListener};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        let ctx = egui::Context::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let listener = Listener {
+            tx,
+            pace: Arc::new(Pace {
+                shown: AtomicBool::new(true),
+                last_frame: AtomicU64::new(0),
+                ctx: Mutex::new(ctx.clone()),
+            }),
+        };
+        // Una pasada, como el lanzador: epaint exige vaciar las texturas que entrega.
+        let pass = || {
+            ctx.run_ui(egui::RawInput::default(), |_| {})
+                .textures_delta
+                .clear()
+        };
+        // Que egui no tenga nada pendiente antes del eco.
+        for _ in 0..5 {
+            pass();
+        }
+        assert!(!ctx.has_requested_repaint());
+
+        // Se acaba de pulsar una tecla y llega su eco.
+        LAST_INPUT.store(now_ms(), Ordering::Relaxed);
+        listener.send_event(Event::Wakeup);
+        let mut passes = 0;
+        while ctx.has_requested_repaint() && passes < 5 {
+            passes += 1;
+            pass();
+        }
+        assert_eq!(passes, 1, "pasadas de egui por el eco de una tecla");
+    }
+
+    #[test]
+    fn git_no_se_consulta_con_un_agente_delante() {
+        use super::git_activity;
+        let mut frozen = 0;
+        // Con el shell delante, git sigue a la salida de la pestaña.
+        assert_eq!(git_activity(&mut frozen, 5, true), 5);
+        assert_eq!(git_activity(&mut frozen, 6, true), 6);
+        // Con un agente delante, su salida no es motivo para mirar git.
+        assert_eq!(git_activity(&mut frozen, 40, false), 6);
+        assert_eq!(git_activity(&mut frozen, 90, false), 6);
+        // Vuelve el shell: se mira otra vez.
+        assert_eq!(git_activity(&mut frozen, 91, true), 91);
+    }
+
     #[test]
     fn orden_pendiente_cuando_toca() {
         use super::{PendingStep, pending_step};

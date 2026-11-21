@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::switch::Switch;
 
 #[derive(Clone, PartialEq)]
 pub struct Port {
@@ -21,23 +22,22 @@ pub struct Port {
 
 pub struct Ports {
     pub list: Arc<Mutex<Vec<Port>>>,
-    pub enabled: Arc<AtomicBool>,
-    /// Pide un escaneo inmediato.
-    pub refresh: Arc<AtomicBool>,
+    /// Encendido mientras se ven Puertos o Procesos. Apagado, el hilo ni corre `lsof` ni
+    /// despierta (al arrancar, tampoco: no se sondean los puertos si nadie los mira).
+    pub switch: Arc<Switch>,
 }
 
 impl Ports {
     pub fn start() -> Self {
         let list = Arc::new(Mutex::new(Vec::new()));
-        let enabled = Arc::new(AtomicBool::new(true));
-        let refresh = Arc::new(AtomicBool::new(false));
-        let (l, e, r) = (list.clone(), enabled.clone(), refresh.clone());
+        let switch = Arc::new(Switch::default());
+        let (l, sw) = (list.clone(), switch.clone());
         std::thread::Builder::new()
             .name("colibri-ports".into())
             .spawn(move || {
                 let mut web_cache: HashMap<(i32, u16), bool> = HashMap::new();
                 loop {
-                    if e.load(Ordering::Relaxed) {
+                    if sw.is_on() {
                         let found = scan(&mut web_cache);
                         let mut guard = l.lock().unwrap();
                         if *guard != found {
@@ -46,21 +46,17 @@ impl Ports {
                             crate::shell::wake_all();
                         }
                     }
-                    // Espera 3 s, pero despierta enseguida si piden refrescar.
-                    for _ in 0..30 {
-                        if r.swap(false, Ordering::Relaxed) {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
+                    // Cada 3 s mientras se ve; antes si piden refrescar o al encenderlo.
+                    sw.wait(Duration::from_secs(3));
                 }
             })
             .ok();
-        Self {
-            list,
-            enabled,
-            refresh,
-        }
+        Self { list, switch }
+    }
+
+    /// Pide un escaneo inmediato.
+    pub fn refresh(&self) {
+        self.switch.poke();
     }
 }
 
