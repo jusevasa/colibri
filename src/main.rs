@@ -2,6 +2,7 @@
 //! Sin telemetría: la app no abre ninguna conexión de red propia.
 
 mod agents;
+mod anim;
 mod blur;
 mod claude;
 mod clip;
@@ -52,8 +53,6 @@ const TAB_COLORS: [(&str, Color32); 7] = [
     ("morado", Color32::from_rgb(0xb0, 0x83, 0xf0)),
     ("rosa", Color32::from_rgb(0xf7, 0x78, 0xba)),
 ];
-/// Segundos que tarda una pestaña en deslizarse a su hueco nuevo.
-const TAB_SLIDE: f32 = 0.16;
 const TRAFFIC_LIGHTS_W: f32 = 78.0;
 
 /// Un archivo soltado por el guion de depuración.
@@ -193,6 +192,9 @@ struct App {
     keys: Keys,
     cfg_mtime: Option<SystemTime>,
     cfg_checked: Instant,
+    /// «Reducir movimiento» de macOS (Accesibilidad → Pantalla): las pestañas saltan a su
+    /// sitio en vez de deslizarse. Se mira con la configuración, cada segundo.
+    reduce_motion: bool,
     /// La ventana en curso: aquella cuya pasada se está corriendo. Casi todo el código
     /// trabaja con `self.w` sin saber que hay más ventanas (ver `enter`).
     w: Win,
@@ -279,9 +281,17 @@ pub struct Win {
     /// Esa pestaña está despegada: el puntero se alejó de la barra (`drag::detaching`). Se
     /// queda atenuada en su hueco y, al soltarla, pasa a otra ventana o a una nueva.
     detached: bool,
-    /// Ancho y origen de las pestañas en el cuadro anterior: si cambian (se redimensiona la
-    /// ventana, se abre una pestaña) las pestañas se recolocan sin animación.
+    /// Ancho y origen de los huecos de las pestañas en el último cuadro (para soltar aquí una
+    /// pestaña de otra ventana, `drag::drop_slot`).
     tab_layout: (f32, f32),
+    /// Ancho disponible y origen de la barra en el cuadro anterior: si cambian (se
+    /// redimensiona la ventana, se abre un panel) las pestañas se recolocan sin animación.
+    /// `None` hasta el primer cuadro: las pestañas con que nace la ventana no se animan.
+    tab_space: Option<(f32, f32)>,
+    /// Dónde se ve cada pestaña camino de su hueco, por id: su borde izquierdo y su ancho.
+    tab_springs: HashMap<u64, (anim::Spring, anim::Spring)>,
+    /// El botón «+», que va tras la última pestaña.
+    plus_spring: anim::Spring,
     /// Comandos que muestra el historial, del más reciente al más antiguo.
     history: Vec<history::Entry>,
     /// Lo que ofrece el desplegable de una caja del prompt (ramas, o carpetas y archivos)
@@ -354,6 +364,9 @@ impl Win {
             drag_tab: None,
             detached: false,
             tab_layout: (0.0, 0.0),
+            tab_space: None,
+            tab_springs: HashMap::new(),
+            plus_spring: anim::Spring::new(0.0, 0.0),
             history: Vec::new(),
             picks: Vec::new(),
             pick_anchor: Pos2::ZERO,
@@ -381,6 +394,7 @@ impl App {
             keys: Keys::new(&cfg.keys),
             cfg_mtime: config::mtime(),
             cfg_checked: Instant::now(),
+            reduce_motion: macos::reduce_motion(),
             // Hasta que se abra la primera ventana, una de relleno sin pestañas.
             w: Win::new(&egui::Context::default()),
             cur: None,
@@ -1704,61 +1718,91 @@ impl App {
             && drag::detaching(pointer, full, ctx.content_rect(), self.w.detached);
         // Despegada, la pestaña no sigue al puntero: vuelve a su hueco y no reordena.
         let pointer_x = pointer.map(|p| p.x).filter(|_| !self.w.detached);
-        // Al cambiar de hueco la pestaña se desliza en vez de saltar.
-        let slide = if self.w.tab_layout == (tab_w, tabs_left) {
-            TAB_SLIDE
-        } else {
-            0.0
-        };
         self.w.tab_layout = (tab_w, tabs_left);
         let last = tabs_left + (self.w.sessions.len().max(1) - 1) as f32 * tab_w;
+        let now = ctx.input(|i| i.time);
+        // Ventana redimensionada o un panel abierto o cerrado: las pestañas saltan a su
+        // sitio (animadas irían por detrás del borde de la ventana). Abrir, cerrar y mover
+        // pestañas sí se anima. Las del primer cuadro de la ventana tampoco: ya estaban.
+        let space = (avail, tabs_left);
+        let snap = self.reduce_motion || self.w.tab_space != Some(space);
+        self.w.tab_space = Some(space);
+        // La que sigue al puntero y por dónde se agarró.
+        let held = match (self.w.drag_tab, pointer_x) {
+            (Some((id, grab)), Some(px)) => Some((id, (px - grab).clamp(tabs_left, last))),
+            _ => None,
+        };
+        // Dónde se ve cada pestaña: su hueco, o camino de él (`anim::Spring` del borde
+        // izquierdo y del ancho), o bajo el puntero. Se calcula una vez por cuadro: antes la
+        // activa se calculaba dos veces con sumas distintas y, si diferían en el último
+        // decimal, su animación volvía a empezar en cada cuadro y la ventana repintaba sin
+        // parar (medido con 5 pestañas en reposo: ~60 pasadas/s en vez de ninguna).
+        let w = &mut self.w;
+        w.tab_springs
+            .retain(|id, _| w.sessions.iter().any(|s| s.id == *id));
+        let mut moving = false;
+        let mut rects = Vec::with_capacity(w.sessions.len());
+        for (i, s) in w.sessions.iter().enumerate() {
+            let slot = tabs_left + i as f32 * tab_w;
+            // Una pestaña nueva nace sin ancho en su hueco y crece; las demás le hacen sitio.
+            let (x, width) = w.tab_springs.entry(s.id).or_insert_with(|| {
+                let born = if snap { tab_w } else { 0.0 };
+                (anim::Spring::new(slot, now), anim::Spring::new(born, now))
+            });
+            let left = match held {
+                // Al soltarla se desliza desde donde quedó hasta su hueco.
+                Some((id, left)) if id == s.id => {
+                    x.snap(left, now);
+                    left
+                }
+                _ if snap => {
+                    x.snap(slot, now);
+                    slot
+                }
+                _ => x.update(slot, now),
+            };
+            let shown_w = if snap {
+                width.snap(tab_w, now);
+                tab_w
+            } else {
+                width.update(tab_w, now)
+            };
+            moving |= x.moving() || width.moving();
+            // Rectas, de toda la altura de la barra y pegadas unas a otras.
+            rects.push(Rect::from_min_size(
+                Pos2::new(left, full.top()),
+                Vec2::new(shown_w, full.height()),
+            ));
+        }
+        // El «+» va tras la última pestaña y la acompaña al abrir o cerrar.
+        let end = tabs_left + w.sessions.len() as f32 * tab_w;
+        let x = if snap {
+            w.plus_spring.snap(end, now);
+            end
+        } else {
+            w.plus_spring.update(end, now)
+        };
+        moving |= w.plus_spring.moving();
+        if moving {
+            ctx.request_repaint();
+        }
+        if moving || w.drag_tab.is_some() {
+            shell::animating(&ctx);
+        }
         // Dónde se ve la activa (deslizándose o arrastrada): las demás se recortan por ahí. Con
         // la ventana translúcida su fondo no es opaco y se verían a través de ella.
-        let active_cover = self.w.sessions.get(self.w.active).map(|s| {
-            let left = match (self.w.drag_tab, pointer_x) {
-                (Some((id, grab)), Some(px)) if id == s.id => (px - grab).clamp(tabs_left, last),
-                _ => ctx.animate_value_with_time(
-                    egui::Id::unique(("tab-x", s.id)),
-                    tabs_left + self.w.active as f32 * tab_w,
-                    slide,
-                ),
-            };
-            Rect::from_min_max(
-                Pos2::new(left, full.top()),
-                Pos2::new(left + tab_w, full.bottom()),
-            )
-        });
-        let mut x = tabs_left;
+        let active_cover = rects.get(self.w.active).copied();
         for (i, s) in self.w.sessions.iter().enumerate() {
-            let slide_id = egui::Id::unique(("tab-x", s.id));
-            let held = self.w.drag_tab.is_some_and(|(id, _)| id == s.id) && pointer_x.is_some();
-            let shown_x = if held {
-                x
-            } else {
-                ctx.animate_value_with_time(slide_id, x, slide)
-            };
-            // Rectas, de toda la altura de la barra y pegadas unas a otras.
-            let mut rect = Rect::from_min_size(
-                Pos2::new(shown_x, full.top()),
-                Vec2::new(tab_w, full.height()),
-            );
-            let slot_x = x;
-            x += tab_w;
+            let rect = rects[i];
+            let in_slot = rect.left() == tabs_left + i as f32 * tab_w && rect.width() == tab_w;
             // La pestaña arrastrada sigue al puntero; al cruzar a otro hueco cambia de sitio.
-            let dragging = match (self.w.drag_tab, pointer_x) {
-                (Some((id, grab)), Some(px)) if id == s.id => {
-                    let left = (px - grab).clamp(tabs_left, last);
-                    rect = rect.translate(Vec2::new(left - rect.left(), 0.0));
-                    // Al soltarla se desliza desde donde quedó hasta su hueco.
-                    ctx.animate_value_with_time(slide_id, left, 0.0);
-                    let slot = ((left + tab_w / 2.0 - tabs_left) / tab_w).floor() as usize;
-                    if slot != i {
-                        moved = Some((i, slot));
-                    }
-                    true
+            let dragging = held.is_some_and(|(id, _)| id == s.id);
+            if dragging {
+                let slot = ((rect.left() + tab_w / 2.0 - tabs_left) / tab_w).floor() as usize;
+                if slot != i {
+                    moved = Some((i, slot));
                 }
-                _ => false,
-            };
+            }
             let active = i == self.w.active;
             let resp = ui.interact(
                 rect,
@@ -1774,7 +1818,7 @@ impl App {
             // Encima de las demás mientras se mueve (arrastrada, o la activa deslizándose).
             // `Middle` y no `Foreground`: los menús emergentes (clic derecho) van en
             // `Foreground` y esta capa, creada después, los tapaba.
-            let p = &if dragging || (active && shown_x != slot_x) {
+            let p = &if dragging || (active && !in_slot) {
                 ui.painter().clone().with_layer_id(egui::LayerId::new(
                     egui::Order::Middle,
                     egui::Id::unique("tab-drag"),
@@ -1836,22 +1880,29 @@ impl App {
                 }
             }
 
+            // Lo de dentro, recortado a la pestaña: mientras nace no se sale de su ancho, y
+            // aparece poco a poco entre 16 y 64 pt (el ancho mínimo de una pestaña).
+            let pc = &{
+                let mut pc = p.with_clip_rect(p.clip_rect().intersect(rect));
+                pc.multiply_opacity(((rect.width() - 16.0) / 48.0).clamp(0.0, 1.0));
+                pc
+            };
             // Indicador a la izquierda: trabajando / terminó / agente en reposo.
             let ind = Pos2::new(rect.left() + 14.0, rect.center().y);
             // Con agente el icono se queda y el estado va en una insignia en su esquina.
             let surface = fade(if active { pal.bg } else { pal.tab_bar }, opacity);
             match (s.agent, s.busy, s.unseen) {
-                (Some(a), true, _) => badged_icon(p, ind, 5.5, a, Badge::Working(pal.fg), surface),
+                (Some(a), true, _) => badged_icon(pc, ind, 5.5, a, Badge::Working(pal.fg), surface),
                 (Some(a), false, true) => {
-                    badged_icon(p, ind, 5.5, a, Badge::Done(pal.done), surface)
+                    badged_icon(pc, ind, 5.5, a, Badge::Done(pal.done), surface)
                 }
-                (Some(a), false, false) => agent_icon(p, ind, 5.5, a),
-                (None, true, _) => spinner(p, ind, 5.0, pal.accent),
+                (Some(a), false, false) => agent_icon(pc, ind, 5.5, a),
+                (None, true, _) => spinner(pc, ind, 5.0, pal.accent),
                 (None, false, true) => {
-                    p.circle_filled(ind, 4.0, pal.done);
+                    pc.circle_filled(ind, 4.0, pal.done);
                 }
                 (None, false, false) => {
-                    p.circle_filled(ind, 2.0, pal.muted.gamma_multiply(0.5));
+                    pc.circle_filled(ind, 2.0, pal.muted.gamma_multiply(0.5));
                 }
             }
 
@@ -1859,7 +1910,7 @@ impl App {
             let right_w = 26.0;
             let max_w = rect.width() - 28.0 - right_w;
             let galley = elided(&ctx, &s.tab_label(), &ui_font, text_color, max_w);
-            p.galley(
+            pc.galley(
                 Pos2::new(rect.left() + 26.0, rect.center().y - galley.size().y / 2.0),
                 galley,
                 text_color,
@@ -1873,13 +1924,13 @@ impl App {
             let over_close = hovered && !dragging && ui.rect_contains_pointer(close_rect);
             if hovered {
                 if over_close {
-                    p.rect_filled(
+                    pc.rect_filled(
                         close_rect,
                         CornerRadius::same(4),
                         pal.muted.gamma_multiply(0.3),
                     );
                 }
-                p.text(
+                pc.text(
                     close_rect.center(),
                     Align2::CENTER_CENTER,
                     "×",
@@ -1887,7 +1938,7 @@ impl App {
                     pal.fg,
                 );
             } else if i < 9 {
-                p.text(
+                pc.text(
                     close_rect.center(),
                     Align2::CENTER_CENTER,
                     format!("⌘{}", i + 1),
@@ -2728,6 +2779,7 @@ impl shell::App for App {
 
         if self.cfg_checked.elapsed() > Duration::from_secs(1) {
             self.cfg_checked = Instant::now();
+            self.reduce_motion = macos::reduce_motion();
             let m = config::mtime();
             if m != self.cfg_mtime {
                 self.cfg_mtime = m;

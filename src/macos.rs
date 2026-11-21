@@ -187,6 +187,17 @@ pub fn hidden() -> bool {
     }
 }
 
+/// «Reducir movimiento» (Ajustes → Accesibilidad → Pantalla). Hilo principal.
+pub fn reduce_motion() -> bool {
+    unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        if workspace.is_null() {
+            return false;
+        }
+        msg_send![workspace, accessibilityDisplayShouldReduceMotion]
+    }
+}
+
 /// Altura de la pantalla principal (la primera de `NSScreen.screens`, la de la barra de
 /// menús, no `mainScreen`): es la que fija el origen de las coordenadas de Cocoa.
 fn primary_height() -> Option<f64> {

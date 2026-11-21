@@ -250,6 +250,27 @@ fn type_into(ctx: &egui::Context, text: &mut String) -> bool {
     *text != before
 }
 
+/// Cuánto se ve ya un cuadro que acaba de aparecer, de 0 a 1: el fundido de entrada que egui
+/// da a sus `Area` (`animation_time`, curva `quadratic_out`), para que lo que va con él (el
+/// fondo atenuado) lo siga. Mientras dura, el pintor va en modo fluido.
+fn fade_in(ctx: &egui::Context, area: Id) -> f32 {
+    let Some(since) = egui::AreaState::load(ctx, area).and_then(|s| s.last_became_visible_at)
+    else {
+        return 1.0;
+    };
+    let (age, dt) = ctx.input(|i| ((i.time - since) as f32, i.predicted_dt));
+    let duration = ctx.global_style().animation_time;
+    let t = egui::emath::easing::quadratic_out(egui::remap_clamp(
+        age + dt * 0.5,
+        0.0..=duration,
+        0.0..=1.0,
+    ));
+    if t < 1.0 {
+        crate::shell::animating(ctx);
+    }
+    t
+}
+
 /// Dibuja un cuadro centrado arriba, con el fondo atenuado. Devuelve su rectángulo.
 fn modal(
     ctx: &egui::Context,
@@ -259,8 +280,6 @@ fn modal(
     add: impl FnOnce(&mut egui::Ui),
 ) -> Rect {
     let screen = ctx.content_rect();
-    ctx.layer_painter(LayerId::new(Order::Middle, Id::unique("overlay-dim")))
-        .rect_filled(screen, 0.0, Color32::from_black_alpha(110));
     let width = width.min(screen.width() - 40.0);
     let pos = Pos2::new(screen.center().x - width / 2.0, screen.top() + 64.0);
     let out = egui::Area::new(Id::unique(id))
@@ -277,6 +296,15 @@ fn modal(
                     add(ui);
                 });
         });
+    // Después del cuadro (va en otra capa, debajo): su fundido empieza al mostrarlo y el
+    // fondo se oscurece a la vez, en vez de aparecer de golpe.
+    let shown = fade_in(ctx, Id::unique(id));
+    ctx.layer_painter(LayerId::new(Order::Middle, Id::unique("overlay-dim")))
+        .rect_filled(
+            screen,
+            0.0,
+            Color32::from_black_alpha((110.0 * shown) as u8),
+        );
     out.response.rect
 }
 
@@ -540,6 +568,8 @@ impl App {
                         ui.add_space(4.0);
                     });
             });
+        // Su fundido de entrada (el de egui) sale fluido.
+        fade_in(ctx, Id::unique("picker"));
 
         if let Some(i) = pick {
             let (kind, name) = (items[i].kind, items[i].name.clone());
@@ -766,6 +796,8 @@ impl App {
                         );
                     });
             });
+        // Su fundido de entrada (el de egui) sale fluido.
+        fade_in(ctx, Id::unique("history"));
 
         if let Some(i) = pick {
             sel = i;
@@ -1001,6 +1033,8 @@ impl App {
                         );
                     });
             });
+        // Su fundido de entrada (el de egui) sale fluido.
+        fade_in(ctx, Id::unique("complete"));
 
         // Lo elegido se escribe en el prompt en lugar de lo que hubiera (la palabra
         // original o la opción anterior).
