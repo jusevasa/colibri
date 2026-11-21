@@ -238,3 +238,36 @@ pub fn primary_button_down() -> bool {
     let buttons: usize = unsafe { msg_send![class!(NSEvent), pressedMouseButtons] };
     buttons & 1 != 0
 }
+
+/// Zona útil (sin barra de menús ni Dock) de la pantalla que contiene el punto, en puntos con
+/// origen arriba a la izquierda de la pantalla principal; si ninguna lo contiene, la de la
+/// principal. Para que una ventana nueva no nazca medio fuera. Hilo principal.
+pub fn visible_frame_at(p: egui::Pos2) -> Option<egui::Rect> {
+    let height = primary_height()?;
+    let at = NSPoint::new(p.x as f64, crate::drag::flip_y(p.y as f64, height));
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        let count: usize = msg_send![screens, count];
+        let mut chosen = None;
+        for i in 0..count {
+            let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i];
+            let frame: NSRect = msg_send![screen, frame];
+            let inside = at.x >= frame.origin.x
+                && at.x < frame.origin.x + frame.size.width
+                && at.y >= frame.origin.y
+                && at.y < frame.origin.y + frame.size.height;
+            if inside || (i == 0 && chosen.is_none()) {
+                chosen = Some(screen);
+            }
+            if inside {
+                break;
+            }
+        }
+        let visible: NSRect = msg_send![chosen?, visibleFrame];
+        let top = crate::drag::flip_y(visible.origin.y + visible.size.height, height);
+        Some(egui::Rect::from_min_size(
+            egui::pos2(visible.origin.x as f32, top as f32),
+            egui::vec2(visible.size.width as f32, visible.size.height as f32),
+        ))
+    }
+}

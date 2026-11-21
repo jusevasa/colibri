@@ -50,6 +50,10 @@ pub trait App {
         Vec::new()
     }
 
+    /// No se pudo abrir una de las ventanas pedidas en `new_windows` (la siguiente de las que
+    /// faltan, en el mismo orden): la aplicación recupera lo que iba dentro.
+    fn window_failed(&mut self) {}
+
     /// Permite tocar la entrada cruda antes de que egui la vea.
     fn raw_input_hook(&mut self, _win: WindowId, _ctx: &egui::Context, _raw: &mut egui::RawInput) {}
 
@@ -480,6 +484,9 @@ impl<F> Runner<F> {
         for frame in wanted.into_iter().flatten() {
             if let Err(error) = self.open_window(event_loop, frame) {
                 eprintln!("{error}");
+                if let Some(app) = &mut self.app {
+                    app.window_failed();
+                }
             }
         }
 
@@ -860,6 +867,9 @@ impl<F: FnOnce() -> Box<dyn App>> ApplicationHandler<UserEvent> for Runner<F> {
             for frame in frames {
                 if let Err(error) = self.open_window(event_loop, frame) {
                     eprintln!("{error}");
+                    if let Some(app) = &mut self.app {
+                        app.window_failed();
+                    }
                 }
             }
             if self.windows.is_empty() {

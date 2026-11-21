@@ -1112,17 +1112,38 @@ impl App {
         self.w.ctx.request_repaint();
     }
 
-    /// Se soltó despegada la pestaña `id`: a la ventana de Colibrí que macOS ve bajo el
-    /// puntero (al hueco de su barra si cae en ella, si no al final) o, si no hay ninguna, a
-    /// una ventana nueva con la esquina ahí. Sobre la propia ventana no pasa nada.
-    fn drop_detached(&mut self, id: u64) {
+    /// Se soltó despegada la pestaña `id` (agarrada a `grab` de su borde izquierdo): a la
+    /// ventana de Colibrí que macOS ve bajo el puntero (al hueco de su barra si cae en ella,
+    /// si no al final) o, si no hay ninguna, a una ventana nueva con la pestaña bajo el
+    /// puntero. Sobre la propia ventana no pasa nada. Con el guion, el punto y la ventana
+    /// salen de su puntero simulado (`pointer`, en puntos de esta ventana) y de los marcos de
+    /// las ventanas, no del ratón de verdad.
+    fn drop_detached(&mut self, ctx: &egui::Context, id: u64, grab: f32, pointer: Option<Pos2>) {
         let Some(i) = self.w.sessions.iter().position(|s| s.id == id) else {
             return;
         };
-        let Some(p) = macos::pointer_on_screen() else {
-            return;
+        let (p, target) = if self.script.is_some() {
+            let (Some([fx, fy, ..]), Some(local)) = (self.w.frame, pointer) else {
+                return;
+            };
+            let p = Pos2::new(fx + local.x, fy + local.y);
+            let frames: Vec<_> = self
+                .order
+                .iter()
+                .rev()
+                .filter_map(|&w| Some((w, self.win(w)?.frame?)))
+                .collect();
+            (p, drag::frame_at(&frames, p))
+        } else {
+            let Some(p) = macos::pointer_on_screen() else {
+                return;
+            };
+            (
+                p,
+                macos::window_number_at(p).and_then(shell::window_with_number),
+            )
         };
-        match macos::window_number_at(p).and_then(shell::window_with_number) {
+        match target {
             Some(win) if Some(win) == self.cur => {}
             Some(win) => {
                 let slot = self.parked.get(&win).and_then(|w| {
@@ -1134,8 +1155,23 @@ impl App {
                         .then(|| drag::drop_slot(p.x - fx, tabs_left, tab_w, w.sessions.len()))
                 });
                 self.move_to_window(i, win, slot);
+                // Si era su última pestaña, esta pasada ya pintó media ventana vacía: se
+                // descarta (egui la repite sin pestañas y no pinta nada) y se cierra ya.
+                if self.w.sessions.is_empty() {
+                    ctx.request_discard("se movió la última pestaña de la ventana");
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
             }
-            None => self.detach_to_new_window(i, p),
+            None => {
+                let size = self
+                    .w
+                    .frame
+                    .map_or(Vec2::ZERO, |[_, _, w, h]| Vec2::new(w, h));
+                // En la ventana nueva será la única pestaña, al principio de la barra.
+                let grab = Vec2::new(self.w.tab_layout.1 + grab, TAB_BAR_H / 2.0);
+                let corner = drag::new_window_corner(p, grab, size, macos::visible_frame_at(p));
+                self.detach_to_new_window(i, corner);
+            }
         }
     }
 
@@ -1660,7 +1696,7 @@ impl App {
         }
         if released {
             if self.w.detached {
-                dropped = self.w.drag_tab.map(|(id, _)| id);
+                dropped = self.w.drag_tab;
             }
             self.w.drag_tab = None;
         }
@@ -2097,8 +2133,8 @@ impl App {
         if let Some((from, to)) = moved {
             self.move_tab(from, to);
         }
-        if let Some(id) = dropped {
-            self.drop_detached(id);
+        if let Some((id, grab)) = dropped {
+            self.drop_detached(&ctx, id, grab, pointer);
         }
         if let Some((i, color)) = recolor
             && let Some(s) = self.w.sessions.get_mut(i)
@@ -2617,6 +2653,20 @@ impl shell::App for App {
 
     fn new_windows(&mut self) -> Vec<Option<[f32; 4]>> {
         std::mem::take(&mut self.want_windows)
+    }
+
+    fn window_failed(&mut self) {
+        // Lo de esa ventana sale de la cola, para que no acabe en la siguiente que se abra.
+        // Una pestaña que llegaba viva vuelve a la ventana en curso (la de la que salió);
+        // sin ninguna abierta se suelta y su proceso termina.
+        if let Some(Fill::Move(s)) = self.opening.pop_front()
+            && self.cur.is_some()
+        {
+            s.set_context(&self.w.ctx);
+            self.w.sessions.push(*s);
+            self.w.active = self.w.sessions.len() - 1;
+            self.w.ctx.request_repaint();
+        }
     }
 
     fn raw_input_hook(&mut self, win: WindowId, ctx: &egui::Context, raw: &mut egui::RawInput) {
