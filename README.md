@@ -23,7 +23,12 @@
 
 ## Privacidad
 
-Colibrí no abre conexiones de red propias: no hay telemetría ni comprobación de actualizaciones. La única sonda es una petición HTTP a `127.0.0.1` para saber si un puerto local sirve una web. Ningún programa puede leer tu portapapeles a través de Colibrí.
+Colibrí no tiene telemetría. Solo abre dos conexiones:
+
+- Una petición HTTP a `127.0.0.1` para saber si un puerto local sirve una web.
+- **Buscar actualizaciones**, activada por defecto: al abrirse y luego cada 24 h lee el cask de Homebrew en `raw.githubusercontent.com` para saber si hay una versión nueva. Usa el `curl` del sistema y no envía ningún dato tuyo (GitHub ve tu IP, como en cualquier descarga). Se apaga en Preferencias → «Buscar actualizaciones», y entonces Colibrí no se conecta a nada.
+
+Ningún programa puede leer tu portapapeles a través de Colibrí.
 
 ## Instalación
 
@@ -53,6 +58,8 @@ open target/Colibri.app
 `bundle.sh` firma con tu certificado de Apple si tienes uno en el llavero (Developer ID o Apple Development; `COLIBRI_SIGN_ID` elige otro). Sin ninguno firma «ad-hoc», y macOS volverá a pedir los permisos (carpetas, notificaciones) tras cada compilación. Las notificaciones con clic solo funcionan desde `Colibri.app`, no con `cargo run`.
 
 ### Actualizar
+
+Con «Buscar actualizaciones» activada (lo está por defecto), cuando sale una versión nueva aparece en la barra de pestañas un botón con una flecha hacia abajo. Un clic abre una pestaña que ejecuta `brew upgrade --cask colibri` o, si no la instalaste con Homebrew, la página de la versión.
 
 Cuando el ejecutable cambia en disco (tras `brew upgrade` o al recompilar), aparece en la barra de pestañas el botón **Actualizar**, que reinicia Colibrí con la versión nueva. Lo que esté corriendo en las pestañas se detiene, así que espera a que terminen tus agentes y comandos antes de pulsarlo. Las pestañas se reabren en sus carpetas si está activada la preferencia «Recuperar pestañas al abrir» (lo está por defecto), y donde corría Claude Code te ofrece retomar la conversación.
 

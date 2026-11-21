@@ -3,7 +3,8 @@
 //! `move <de> <a>`, `agent next|prev`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`,
 //! `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab|paste`,
 //! `agents filter all|waiting|working`, `agents search <texto>`, `agents focus`, `agents folder`,
-//! `press <x> <y>`, `moveto <x> <y>`, `release <x> <y>`, `rclick <x> <y>`, `pref <id> <+1|-1>`, `cmd down|up`, `drop <ruta>`, `minimize`, `update`, `quit`.
+//! `press <x> <y>`, `moveto <x> <y>`, `release <x> <y>`, `rclick <x> <y>`, `pref <id> <+1|-1>`, `cmd down|up`, `drop <ruta>`, `minimize`, `update`,
+//! `update available <versión> [brew]`, `update none`, `quit`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -55,6 +56,10 @@ pub enum Step {
     Scroll(i32),
     /// Muestra u oculta el botón «Actualizar» sin que haya una compilación nueva.
     Update,
+    /// Simula lo que encontraría «Buscar actualizaciones» sin conectarse:
+    /// `update available <versión> [brew]` (con `brew`, como si se hubiera instalado con
+    /// Homebrew) o `update none`.
+    UpdateAvailable(Option<String>, bool),
     /// Ventanas: `window new` abre una, `window close` cierra la del frente y
     /// `window <n>` trae al frente la n-ésima (por orden de apertura, desde 0).
     Window(String),
@@ -117,6 +122,12 @@ impl Script {
                     "drop" => Step::Drop(arg.to_string()),
                     "minimize" => Step::Minimize,
                     "scroll" => Step::Scroll(arg.parse().ok()?),
+                    "update" if arg == "none" => Step::UpdateAvailable(None, false),
+                    "update" if arg.starts_with("available ") => {
+                        let mut words = arg.split_whitespace().skip(1);
+                        let version = words.next()?.to_string();
+                        Step::UpdateAvailable(Some(version), words.next() == Some("brew"))
+                    }
                     "update" => Step::Update,
                     "window" => Step::Window(arg.to_string()),
                     "menu" => Step::Menu(arg.to_string()),

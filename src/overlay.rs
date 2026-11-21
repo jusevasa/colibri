@@ -117,7 +117,7 @@ pub enum Overlay {
 
 /// Filas de Preferencias, por id (el que usa el guion: `pref <id>`); la etiqueta sale de
 /// `pref_label` en el idioma de la interfaz.
-const PREF_ROWS: [&str; 23] = [
+const PREF_ROWS: [&str; 24] = [
     "theme",
     "font",
     "font_size",
@@ -136,6 +136,7 @@ const PREF_ROWS: [&str; 23] = [
     "shell_integration",
     "editor",
     "secure_input",
+    "check_updates",
     "show_agents",
     "agents_side",
     "show_ports",
@@ -163,6 +164,7 @@ fn pref_label(o: &'static i18n::overlay::T, id: &str) -> &'static str {
         "shell_integration" => o.pref_shell_integration,
         "editor" => o.pref_editor,
         "secure_input" => o.pref_secure_input,
+        "check_updates" => o.pref_check_updates,
         "show_agents" => o.pref_show_agents,
         "agents_side" => o.pref_agents_side,
         "show_ports" => o.pref_show_ports,
@@ -1288,6 +1290,7 @@ impl App {
             "editor" if c.editor.is_empty() => (o.editor_default.to_string(), None),
             "editor" => (c.editor.clone(), None),
             "secure_input" => (String::new(), Some(c.secure_input)),
+            "check_updates" => (String::new(), Some(c.check_updates)),
             "show_agents" => (String::new(), Some(c.show_agents)),
             "agents_side" if c.agents_on_right() => (o.side_right.to_string(), None),
             "agents_side" => (o.side_left.to_string(), None),
@@ -1361,6 +1364,7 @@ impl App {
                 c.editor = editors[i].to_string();
             }
             "secure_input" => c.secure_input = !c.secure_input,
+            "check_updates" => c.check_updates = !c.check_updates,
             "show_agents" => c.show_agents = !c.show_agents,
             "agents_side" => {
                 c.agents_side = if c.agents_on_right() {

@@ -15,6 +15,12 @@ pub struct T {
     pub ports_hint: &'static str,
     pub update: &'static str,
     pub update_hint: &'static str,
+    /// «Colibrí 0.3.0 disponible»: hay una versión publicada más nueva (`updates.rs`).
+    pub update_available: fn(&str) -> String,
+    /// Qué hace el clic si Colibrí se instaló con Homebrew…
+    pub update_available_brew: &'static str,
+    /// …y si no.
+    pub update_available_web: &'static str,
     // Pista de una pestaña al pasar el ratón.
     pub running: &'static str,
     /// «Terminó hace 5 min», a partir de los segundos transcurridos.
@@ -178,6 +184,9 @@ pub const ES: T = T {
     ports_hint: "Puertos  ⌘⇧P",
     update: "Actualizar",
     update_hint: "Hay una compilación nueva. Reinicia Colibrí y reabre tus pestañas;\nlo que esté corriendo en ellas se detiene.",
+    update_available: |v| format!("Colibrí {v} disponible"),
+    update_available_brew: "Abre una pestaña con «brew upgrade --cask colibri». Al terminar,\neste botón pasa a «Actualizar» para reiniciar con la versión nueva.",
+    update_available_web: "Abre en el navegador la página de la versión para descargarla.",
     running: "Corriendo…",
     finished_ago: finished_ago_es,
     ago: ago_es,
@@ -225,6 +234,9 @@ pub const EN: T = T {
     ports_hint: "Ports  ⌘⇧P",
     update: "Update",
     update_hint: "A new build is available. Restart Colibrí and reopen your tabs;\nanything running in them will stop.",
+    update_available: |v| format!("Colibrí {v} available"),
+    update_available_brew: "Opens a tab running “brew upgrade --cask colibri”. When it finishes,\nthis button turns into “Update” to restart with the new version.",
+    update_available_web: "Opens the release page in your browser to download it.",
     running: "Running…",
     finished_ago: finished_ago_en,
     ago: ago_en,
