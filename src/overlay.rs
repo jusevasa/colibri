@@ -1,6 +1,7 @@
 //! Ventanas flotantes sobre la terminal: paleta de comandos, preferencias y renombrar pestaña.
 
 use crate::config::{self, Palette};
+use crate::i18n;
 use crate::{App, Cmd, elided};
 use egui::{
     self, Align2, Color32, CornerRadius, FontId, Id, Key, LayerId, Modifiers, Order, Pos2, Rect,
@@ -114,31 +115,62 @@ pub enum Overlay {
     },
 }
 
-const PREF_ROWS: [(&str, &str); 23] = [
-    ("theme", "Tema"),
-    ("font", "Fuente"),
-    ("font_size", "Tamaño de fuente"),
-    ("line_height", "Interlineado"),
-    ("padding", "Margen"),
-    ("cursor", "Cursor"),
-    ("cursor_blink", "Cursor parpadeante"),
-    ("opacity", "Opacidad del fondo"),
-    ("blur", "Desenfocar el fondo"),
-    ("scrollback", "Historial por pestaña"),
-    ("restore_tabs", "Recuperar pestañas al abrir"),
-    ("notify", "Notificar cuando algo termina"),
-    ("history_popup", "Historial de comandos con ↑"),
-    ("complete_popup", "Sugerir carpetas y archivos con ⇥"),
-    ("status_bar", "Carpeta y rama en cajas, en el prompt"),
-    ("shell_integration", "Integración con zsh (pestañas nuevas)"),
-    ("editor", "Abrir archivos (⌘+clic) con"),
-    ("secure_input", "Entrada segura de teclado"),
-    ("show_agents", "Agentes"),
-    ("agents_side", "Lado del panel de agentes"),
-    ("show_ports", "Puertos"),
-    ("show_processes", "Procesos"),
-    ("open_file", "Abrir config.toml en el editor…"),
+/// Filas de Preferencias, por id (el que usa el guion: `pref <id>`); la etiqueta sale de
+/// `pref_label` en el idioma de la interfaz.
+const PREF_ROWS: [&str; 23] = [
+    "theme",
+    "font",
+    "font_size",
+    "line_height",
+    "padding",
+    "cursor",
+    "cursor_blink",
+    "opacity",
+    "blur",
+    "scrollback",
+    "restore_tabs",
+    "notify",
+    "history_popup",
+    "complete_popup",
+    "status_bar",
+    "shell_integration",
+    "editor",
+    "secure_input",
+    "show_agents",
+    "agents_side",
+    "show_ports",
+    "show_processes",
+    "open_file",
 ];
+
+fn pref_label(o: &'static i18n::overlay::T, id: &str) -> &'static str {
+    match id {
+        "theme" => o.pref_theme,
+        "font" => o.pref_font,
+        "font_size" => o.pref_font_size,
+        "line_height" => o.pref_line_height,
+        "padding" => o.pref_padding,
+        "cursor" => o.pref_cursor,
+        "cursor_blink" => o.pref_cursor_blink,
+        "opacity" => o.pref_opacity,
+        "blur" => o.pref_blur,
+        "scrollback" => o.pref_scrollback,
+        "restore_tabs" => o.pref_restore_tabs,
+        "notify" => o.pref_notify,
+        "history_popup" => o.pref_history_popup,
+        "complete_popup" => o.pref_complete_popup,
+        "status_bar" => o.pref_status_bar,
+        "shell_integration" => o.pref_shell_integration,
+        "editor" => o.pref_editor,
+        "secure_input" => o.pref_secure_input,
+        "show_agents" => o.pref_show_agents,
+        "agents_side" => o.pref_agents_side,
+        "show_ports" => o.pref_show_ports,
+        "show_processes" => o.pref_show_processes,
+        "open_file" => o.pref_open_file,
+        _ => "",
+    }
+}
 
 /// Vista previa de macOS (Quick Look) de un archivo o carpeta. Si ya hay una abierta
 /// se cierra: espacio la abre y la cierra, como en Finder.
@@ -169,12 +201,12 @@ fn quick_look(preview: &mut Option<std::process::Child>, path: Option<std::path:
         .ok();
 }
 
-fn section_before(id: &str) -> Option<&'static str> {
+fn section_before(o: &'static i18n::overlay::T, id: &str) -> Option<&'static str> {
     match id {
-        "theme" => Some("APARIENCIA"),
-        "scrollback" => Some("TERMINAL"),
-        "show_agents" => Some("PANELES VISIBLES AL ABRIR"),
-        "open_file" => Some("AVANZADO"),
+        "theme" => Some(o.sec_appearance),
+        "scrollback" => Some(o.sec_terminal),
+        "show_agents" => Some(o.sec_panels),
+        "open_file" => Some(o.sec_advanced),
         _ => None,
     }
 }
@@ -184,12 +216,7 @@ fn ago(at: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    match now.saturating_sub(at) {
-        s if s < 60 => "ahora".to_string(),
-        s if s < 3600 => format!("hace {} min", s / 60),
-        s if s < 86_400 => format!("hace {} h", s / 3600),
-        s => format!("hace {} d", s / 86_400),
-    }
+    (i18n::t().overlay.ago)(now.saturating_sub(at))
 }
 
 fn pressed(ctx: &egui::Context, key: Key) -> bool {
@@ -373,6 +400,7 @@ impl App {
         const ROW: f32 = 28.0;
         const HEAD: f32 = 34.0;
         let pal = self.pal.clone();
+        let o = &i18n::t().overlay;
         let mono = FontId::monospace(12.5);
         let screen = ctx.content_rect();
         let width = 440.0_f32.min(screen.width() - 16.0);
@@ -404,18 +432,11 @@ impl App {
                         let (shown, color) = if !query.is_empty() {
                             (query.clone(), pal.fg)
                         } else if branches {
-                            ("Buscar rama…".to_string(), pal.muted)
+                            (o.search_branch.to_string(), pal.muted)
                         } else if self.w.pick_new_tab {
-                            (
-                                "Carpeta para la sesión nueva…  ·  → entra  ·  ↩ abre aquí"
-                                    .to_string(),
-                                pal.muted,
-                            )
+                            (o.new_tab_folder.to_string(), pal.muted)
                         } else {
-                            (
-                                "Buscar carpeta o archivo…  ·  espacio: vista previa".to_string(),
-                                pal.muted,
-                            )
+                            (o.search_files.to_string(), pal.muted)
                         };
                         let r = p.text(
                             Pos2::new(head.left() + 14.0, head.center().y),
@@ -449,7 +470,7 @@ impl App {
                             ui.painter().text(
                                 Pos2::new(r.left() + 14.0, r.center().y),
                                 Align2::LEFT_CENTER,
-                                "Nada coincide",
+                                o.no_matches,
                                 mono.clone(),
                                 pal.muted,
                             );
@@ -475,7 +496,9 @@ impl App {
                             }
                             let icon_at = Pos2::new(r.left() + 20.0, r.center().y);
                             let (label, color, note) = match item.kind {
-                                PickKind::CurrentBranch => (item.name.clone(), pal.done, "actual"),
+                                PickKind::CurrentBranch => {
+                                    (item.name.clone(), pal.done, o.current_branch)
+                                }
                                 PickKind::Branch => (item.name.clone(), pal.fg, ""),
                                 PickKind::Parent => {
                                     p.text(
@@ -485,7 +508,7 @@ impl App {
                                         mono.clone(),
                                         pal.muted,
                                     );
-                                    (".. (carpeta superior)".to_string(), pal.muted, "")
+                                    (o.parent_folder.to_string(), pal.muted, "")
                                 }
                                 PickKind::Dir => {
                                     crate::file_icon(p, icon_at, true, pal.accent);
@@ -621,6 +644,7 @@ impl App {
         const ROW: f32 = 26.0;
         const FOOT: f32 = 28.0;
         let pal = self.pal.clone();
+        let o = &i18n::t().overlay;
         let mono = FontId::monospace(12.5);
         let small = FontId::proportional(11.0);
         let screen = ctx.content_rect();
@@ -719,9 +743,13 @@ impl App {
                             Stroke::new(1.0, pal.border),
                         );
                         let left = if original.is_empty() {
-                            format!("{} de {n}", sel + 1)
+                            (o.of)(sel + 1, n)
                         } else {
-                            format!("{} de {n}  ·  empiezan por «{original}»", sel + 1)
+                            format!(
+                                "{}  ·  {}",
+                                (o.of)(sel + 1, n),
+                                (o.starting_with)(&original)
+                            )
                         };
                         let g = elided(ui.ctx(), &left, &small, pal.muted, foot.width() - 330.0);
                         p.galley(
@@ -732,7 +760,7 @@ impl App {
                         p.text(
                             Pos2::new(foot.right() - 14.0, foot.center().y),
                             Align2::RIGHT_CENTER,
-                            "↑↓ elegir  ·  ↩ ejecutar  ·  ⇥ editar  ·  esc cancelar",
+                            o.history_keys,
                             small.clone(),
                             pal.muted,
                         );
@@ -805,6 +833,7 @@ impl App {
         const ROW: f32 = 28.0;
         const FOOT: f32 = 26.0;
         let pal = self.pal.clone();
+        let o = &i18n::t().overlay;
         let mono = FontId::monospace(12.5);
         let small = FontId::proportional(11.0);
         let screen = ctx.content_rect();
@@ -918,11 +947,11 @@ impl App {
                                 None => add(&name, dim),
                             }
                             let kind = if item.command {
-                                "Comando"
+                                o.kind_command
                             } else if item.is_dir {
-                                "Carpeta"
+                                o.kind_folder
                             } else {
-                                "Archivo"
+                                o.kind_file
                             };
                             let kind_w = 64.0;
                             job.wrap = egui::text::TextWrapping::truncate_at_width(
@@ -953,8 +982,8 @@ impl App {
                             Stroke::new(1.0, pal.border),
                         );
                         let count = match next {
-                            Some(i) => format!("{} de {n}", i + 1),
-                            None => format!("{n} opciones"),
+                            Some(i) => (o.of)(i + 1, n),
+                            None => (o.options)(n),
                         };
                         p.text(
                             Pos2::new(foot.left() + 14.0, foot.center().y),
@@ -966,7 +995,7 @@ impl App {
                         p.text(
                             Pos2::new(foot.right() - 14.0, foot.center().y),
                             Align2::RIGHT_CENTER,
-                            "⇥ ↑↓ elegir  ·  escribe para filtrar  ·  esc cerrar",
+                            o.complete_keys,
                             small.clone(),
                             pal.muted,
                         );
@@ -1006,32 +1035,33 @@ impl App {
     }
 
     fn palette_items(&self) -> Vec<(String, String, Cmd)> {
+        let o = &i18n::t().overlay;
         let commands = [
-            ("Nueva pestaña", Cmd::NewTab),
-            ("Cerrar pestaña", Cmd::CloseTab),
-            ("Nueva ventana", Cmd::NewWindow),
-            ("Cerrar ventana", Cmd::CloseWindow),
-            ("Reabrir lo último cerrado", Cmd::ReopenClosed),
-            ("Pestaña siguiente", Cmd::NextTab),
-            ("Pestaña anterior", Cmd::PrevTab),
-            ("Mover pestaña a la izquierda", Cmd::MoveTabLeft),
-            ("Mover pestaña a la derecha", Cmd::MoveTabRight),
-            ("Renombrar pestaña…", Cmd::RenameTab),
-            ("Agente siguiente", Cmd::NextAgent),
-            ("Agente anterior", Cmd::PrevAgent),
-            ("Ir al agente que terminó", Cmd::JumpFinished),
-            ("Preferencias: tema, fuente, tamaño…", Cmd::Prefs),
-            ("Panel de agentes", Cmd::ToggleAgents),
-            ("Panel de puertos", Cmd::TogglePorts),
-            ("Panel de procesos (CPU y memoria)", Cmd::ToggleProcs),
-            ("Mostrar u ocultar paneles", Cmd::TogglePanel),
-            ("Agrandar texto", Cmd::FontBigger),
-            ("Reducir texto", Cmd::FontSmaller),
-            ("Tamaño de texto original", Cmd::FontReset),
-            ("Limpiar pantalla e historial", Cmd::Clear),
-            ("Abrir config.toml en el editor", Cmd::OpenConfig),
-            ("Reiniciar Colibrí con la última compilación", Cmd::Restart),
-            ("Historial de comandos", Cmd::History),
+            (o.new_tab, Cmd::NewTab),
+            (o.close_tab, Cmd::CloseTab),
+            (o.new_window, Cmd::NewWindow),
+            (o.close_window, Cmd::CloseWindow),
+            (o.reopen_closed, Cmd::ReopenClosed),
+            (o.next_tab, Cmd::NextTab),
+            (o.prev_tab, Cmd::PrevTab),
+            (o.move_tab_left, Cmd::MoveTabLeft),
+            (o.move_tab_right, Cmd::MoveTabRight),
+            (o.rename_tab, Cmd::RenameTab),
+            (o.next_agent, Cmd::NextAgent),
+            (o.prev_agent, Cmd::PrevAgent),
+            (o.jump_finished, Cmd::JumpFinished),
+            (o.prefs, Cmd::Prefs),
+            (o.agents_panel, Cmd::ToggleAgents),
+            (o.ports_panel, Cmd::TogglePorts),
+            (o.procs_panel, Cmd::ToggleProcs),
+            (o.toggle_panel, Cmd::TogglePanel),
+            (o.font_bigger, Cmd::FontBigger),
+            (o.font_smaller, Cmd::FontSmaller),
+            (o.font_reset, Cmd::FontReset),
+            (o.clear, Cmd::Clear),
+            (o.open_config, Cmd::OpenConfig),
+            (o.restart, Cmd::Restart),
+            (o.history, Cmd::History),
         ];
         let mut items: Vec<(String, String, Cmd)> = commands
             .iter()
@@ -1043,7 +1073,7 @@ impl App {
             } else {
                 String::new()
             };
-            items.push((format!("Ir a: {}", s.tab_label()), key, Cmd::GoTab(i)));
+            items.push(((o.go_to)(&s.tab_label()), key, Cmd::GoTab(i)));
         }
         items
     }
@@ -1075,6 +1105,7 @@ impl App {
         let mut run = pressed(ctx, Key::Enter).then_some(sel);
 
         let pal = self.pal.clone();
+        let o = &i18n::t().overlay;
         let mono = FontId::monospace(13.0);
         let small = FontId::monospace(11.5);
         const VISIBLE: usize = 11;
@@ -1091,7 +1122,7 @@ impl App {
                 pal.accent,
             );
             let shown = if query.is_empty() {
-                "Escribe un comando o el nombre de una pestaña".to_string()
+                o.palette_placeholder.to_string()
             } else {
                 query.clone()
             };
@@ -1126,7 +1157,7 @@ impl App {
                 ui.painter().text(
                     Pos2::new(r.left() + 36.0, r.center().y),
                     Align2::LEFT_CENTER,
-                    "Sin resultados",
+                    o.no_results,
                     mono.clone(),
                     pal.muted,
                 );
@@ -1178,13 +1209,14 @@ impl App {
     /// Valor mostrado de una preferencia y, si es un interruptor, su estado.
     fn pref_value(&self, id: &str) -> (String, Option<bool>) {
         let c = &self.cfg;
+        let o = &i18n::t().overlay;
         match id {
             "theme" => {
                 let name = config::presets()
                     .into_iter()
                     .find(|(_, t)| *t == c.theme)
                     .map(|(n, _)| n)
-                    .unwrap_or("Personalizado");
+                    .unwrap_or(o.custom_theme);
                 (name.to_string(), None)
             }
             "font" => {
@@ -1193,24 +1225,24 @@ impl App {
                     .iter()
                     .find(|(_, path, _)| *path == c.font_path)
                     .map(|(n, _, _)| n.clone())
-                    .unwrap_or_else(|| "Personalizada".into());
+                    .unwrap_or_else(|| o.custom_font.into());
                 (name, None)
             }
             "font_size" => (format!("{:.0} pt", c.font_size), None),
             "line_height" => (format!("{:.2}", c.line_height), None),
             "padding" => (format!("{:.0} pt", c.padding), None),
-            "opacity" => (format!("{:.0} %", c.opacity * 100.0), None),
+            "opacity" => ((o.percent)(c.opacity * 100.0), None),
             "cursor" => (
                 match c.cursor.as_str() {
-                    "bar" | "beam" => "Barra",
-                    "underline" => "Subrayado",
-                    _ => "Bloque",
+                    "bar" | "beam" => o.cursor_bar,
+                    "underline" => o.cursor_underline,
+                    _ => o.cursor_block,
                 }
                 .to_string(),
                 None,
             ),
             "cursor_blink" => (String::new(), Some(c.cursor_blink)),
-            "scrollback" => (format!("{} líneas", c.scrollback), None),
+            "scrollback" => ((o.lines)(c.scrollback), None),
             "blur" => (String::new(), Some(c.blur)),
             "restore_tabs" => (String::new(), Some(c.restore_tabs)),
             "notify" => (String::new(), Some(c.notify)),
@@ -1218,12 +1250,12 @@ impl App {
             "complete_popup" => (String::new(), Some(c.complete_popup)),
             "status_bar" => (String::new(), Some(c.status_bar)),
             "shell_integration" => (String::new(), Some(c.shell_integration)),
-            "editor" if c.editor.is_empty() => ("Lo que diga macOS".to_string(), None),
+            "editor" if c.editor.is_empty() => (o.editor_default.to_string(), None),
             "editor" => (c.editor.clone(), None),
             "secure_input" => (String::new(), Some(c.secure_input)),
             "show_agents" => (String::new(), Some(c.show_agents)),
-            "agents_side" if c.agents_on_right() => ("Derecha".to_string(), None),
-            "agents_side" => ("Izquierda".to_string(), None),
+            "agents_side" if c.agents_on_right() => (o.side_right.to_string(), None),
+            "agents_side" => (o.side_left.to_string(), None),
             "show_ports" => (String::new(), Some(c.show_ports)),
             "show_processes" => (String::new(), Some(c.show_processes)),
             _ => (String::new(), None),
@@ -1333,12 +1365,11 @@ impl App {
         }
 
         let pal = self.pal.clone();
+        let o = &i18n::t().overlay;
         let mono = FontId::monospace(13.0);
         let small = FontId::monospace(11.0);
-        let values: Vec<(String, Option<bool>)> = PREF_ROWS
-            .iter()
-            .map(|(id, _)| self.pref_value(id))
-            .collect();
+        let values: Vec<(String, Option<bool>)> =
+            PREF_ROWS.iter().map(|id| self.pref_value(id)).collect();
         let rect = modal(ctx, &pal, "prefs", 620.0, |ui| {
             let (head, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
@@ -1346,7 +1377,7 @@ impl App {
             p.text(
                 Pos2::new(head.left() + 18.0, head.center().y),
                 Align2::LEFT_CENTER,
-                "Preferencias",
+                o.prefs_title,
                 FontId::proportional(14.5),
                 pal.fg,
             );
@@ -1362,8 +1393,8 @@ impl App {
                 Stroke::new(1.0, pal.border),
             );
 
-            for (i, (id, label)) in PREF_ROWS.iter().enumerate() {
-                if let Some(title) = section_before(id) {
+            for (i, id) in PREF_ROWS.iter().enumerate() {
+                if let Some(title) = section_before(o, id) {
                     let (r, _) = ui
                         .allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::hover());
                     ui.painter().text(
@@ -1390,7 +1421,7 @@ impl App {
                 p.text(
                     Pos2::new(r.left() + 28.0, r.center().y),
                     Align2::LEFT_CENTER,
-                    *label,
+                    pref_label(o, id),
                     mono.clone(),
                     pal.fg,
                 );
@@ -1475,19 +1506,15 @@ impl App {
                 [foot.left_top(), foot.right_top()],
                 Stroke::new(1.0, pal.border),
             );
-            let hint = match PREF_ROWS[sel].0 {
-                "font" => {
-                    "Menlo, Hack (incluida) y las monoespaciadas de tu Mac. Otras: font_path en el archivo."
-                }
-                "opacity" => "Menos de 100 % deja ver lo que hay detrás de la ventana.",
-                "blur" => "Solo se nota con la opacidad por debajo de 100 %.",
-                "scrollback" => "Se aplica a las pestañas que abras a partir de ahora.",
-                "theme" => "Colores a medida: sección [theme] del archivo.",
-                "show_agents" | "show_ports" | "show_processes" => {
-                    "Qué apartados aparecen abiertos al iniciar Colibrí."
-                }
-                "agents_side" => "Puertos y Procesos van en el lado contrario.",
-                _ => "Los cambios se guardan al momento.",
+            let hint = match PREF_ROWS[sel] {
+                "font" => o.hint_font,
+                "opacity" => o.hint_opacity,
+                "blur" => o.hint_blur,
+                "scrollback" => o.hint_scrollback,
+                "theme" => o.hint_theme,
+                "show_agents" | "show_ports" | "show_processes" => o.hint_panels,
+                "agents_side" => o.hint_agents_side,
+                _ => o.hint_default,
             };
             p.text(
                 Pos2::new(foot.left() + 18.0, foot.center().y),
@@ -1511,13 +1538,14 @@ impl App {
         }
         self.w.overlay = Overlay::Prefs { sel };
         if let Some((i, dir)) = change {
-            self.pref_change(ctx, PREF_ROWS[i].0, dir);
+            self.pref_change(ctx, PREF_ROWS[i], dir);
         }
     }
 
     fn rename_ui(&mut self, ctx: &egui::Context, mut text: String) {
         type_into(ctx, &mut text);
         let pal = self.pal.clone();
+        let o = &i18n::t().overlay;
         let mono = FontId::monospace(13.0);
         let small = FontId::monospace(11.0);
         let rect = modal(ctx, &pal, "rename", 460.0, |ui| {
@@ -1526,7 +1554,7 @@ impl App {
             ui.painter().text(
                 Pos2::new(head.left() + 18.0, head.center().y + 3.0),
                 Align2::LEFT_CENTER,
-                "Nombre de la pestaña",
+                o.rename_title,
                 small.clone(),
                 pal.muted,
             );
@@ -1534,7 +1562,7 @@ impl App {
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::hover());
             let p = ui.painter();
             let shown = if text.is_empty() {
-                "automático (carpeta o agente)".to_string()
+                o.rename_placeholder.to_string()
             } else {
                 text.clone()
             };
@@ -1568,7 +1596,7 @@ impl App {
             p.text(
                 Pos2::new(foot.left() + 18.0, foot.center().y),
                 Align2::LEFT_CENTER,
-                "↩ guardar  ·  vacío = automático  ·  esc cancelar",
+                o.rename_keys,
                 small.clone(),
                 pal.muted,
             );

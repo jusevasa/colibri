@@ -61,6 +61,8 @@ impl Entry {
 pub struct Menu {
     pub title: String,
     pub entries: Vec<Entry>,
+    /// El menú de ventanas de macOS (donde macOS añade la lista de ventanas abiertas).
+    pub windows: bool,
 }
 
 /// Lo que hace cada entrada de las nuestras, por su `tag`, y dónde está (para el guion).
@@ -202,8 +204,8 @@ pub fn build(menus: &[Menu]) -> bool {
                         let _: () = msg_send![sub, addItem: sep];
                     }
                     Entry::Services => {
-                        let services = new_menu("Servicios");
-                        let item = new_item("Servicios", None, "");
+                        let services = new_menu(crate::i18n::t().menu.services);
+                        let item = new_item(crate::i18n::t().menu.services, None, "");
                         let _: () = msg_send![item, setSubmenu: services];
                         let _: () = msg_send![sub, addItem: item];
                         let _: () = msg_send![app, setServicesMenu: services];
@@ -242,7 +244,7 @@ pub fn build(menus: &[Menu]) -> bool {
             let holder = new_item(&menu.title, None, "");
             let _: () = msg_send![holder, setSubmenu: sub];
             let _: () = msg_send![bar, addItem: holder];
-            if menu.title == "Ventana" {
+            if menu.windows {
                 let _: () = msg_send![app, setWindowsMenu: sub];
             }
         }

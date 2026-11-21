@@ -202,15 +202,10 @@ fn show_grid(
             );
             painter.rect_filled(bar, 1.0, pal.ansi[1]);
         }
-        let time = if ms < 1000 {
-            format!("{ms} ms")
-        } else if ms < 60_000 {
-            format!("{:.1} s", ms as f32 / 1000.0)
-        } else {
-            format!("{} min {} s", ms / 60_000, ms % 60_000 / 1000)
-        };
+        let tx = &crate::i18n::t().term;
+        let time = (tx.duration)(ms);
         let label = match (failed, ms >= 1000) {
-            (true, _) => format!("falló ({status})  ·  {time}"),
+            (true, _) => (tx.failed)(status, &time),
             (false, true) => time,
             (false, false) => continue,
         };

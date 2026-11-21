@@ -574,7 +574,7 @@ impl Agent {
             Agent::Gemini => "Gemini",
             Agent::Aider => "Aider",
             Agent::OpenCode => "OpenCode",
-            Agent::Other => "Agente",
+            Agent::Other => crate::i18n::t().term.other_agent,
         }
     }
     pub fn color(self) -> egui::Color32 {

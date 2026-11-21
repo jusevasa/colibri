@@ -27,6 +27,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$BUILD</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <!-- Idiomas de la interfaz (src/i18n): sin declararlos, macOS no ofrece Colibrí en
+       Ajustes → General → Idioma y región → Aplicaciones. -->
+  <key>CFBundleDevelopmentRegion</key><string>es</string>
+  <key>CFBundleLocalizations</key><array><string>es</string><string>en</string></array>
   <!-- Carpetas: «Abrir con → Colibrí», soltarlas en el icono del Dock y
        open -a Colibri <carpeta>. Alternate: no se queda con las carpetas por defecto. -->
   <key>CFBundleDocumentTypes</key><array><dict>
@@ -44,6 +48,13 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   </dict></array>
 </dict></plist>
 PLIST
+# Una carpeta por idioma (macOS decide con ellas en qué idioma va la app) y el nombre del
+# servicio de Finder traducido.
+for L in es en; do mkdir -p "$APP/Contents/Resources/$L.lproj"; done
+printf '"Nueva pestaña de Colibrí aquí" = "Nueva pestaña de Colibrí aquí";\n' \
+  > "$APP/Contents/Resources/es.lproj/ServicesMenu.strings"
+printf '"Nueva pestaña de Colibrí aquí" = "New Colibrí Tab Here";\n' \
+  > "$APP/Contents/Resources/en.lproj/ServicesMenu.strings"
 # Firma con una identidad estable para que macOS recuerde los permisos (carpetas,
 # notificaciones) entre compilaciones. Con firma ad-hoc cada compilación cuenta como una
 # app nueva y vuelve a preguntar. Otra identidad: COLIBRI_SIGN_ID="<hash o nombre>".

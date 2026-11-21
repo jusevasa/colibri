@@ -12,6 +12,7 @@ mod git;
 mod grid;
 mod history;
 mod hotkey;
+mod i18n;
 mod macos;
 mod menu;
 mod metal;
@@ -40,7 +41,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 const TAB_BAR_H: f32 = 38.0;
 /// Colores que se le pueden poner a una pestaña desde su menú (clic derecho).
-/// El nombre es el que se guarda en `session.toml`.
+/// El nombre es el que se guarda en `session.toml`; el que se ve, `i18n::chrome::T::color_names`.
 const TAB_COLORS: [(&str, Color32); 7] = [
     ("rojo", Color32::from_rgb(0xf4, 0x70, 0x67)),
     ("naranja", Color32::from_rgb(0xf0, 0x88, 0x3e)),
@@ -69,6 +70,7 @@ impl egui::DroppedFile for Dropped {
 }
 
 fn main() -> Result<(), String> {
+    i18n::init();
     // Con la entrada de texto del sistema activa (hace falta para ver las teclas muertas),
     // macOS cambiaría la repetición de una tecla mantenida por su menú de acentos. En una
     // terminal mantener una tecla debe repetirla.
@@ -530,83 +532,89 @@ impl App {
             )
         };
         use objc2::sel;
+        let m = &i18n::t().menu;
         vec![
             Menu {
-                title: "Colibrí".into(),
+                title: m.app.into(),
+                windows: false,
                 entries: vec![
-                    system("Acerca de Colibrí", sel!(orderFrontStandardAboutPanel:), ""),
+                    system(m.about, sel!(orderFrontStandardAboutPanel:), ""),
                     Entry::Separator,
-                    cmd("Preferencias…", Cmd::Prefs),
-                    cmd("Abrir config.toml", Cmd::OpenConfig),
+                    cmd(m.prefs, Cmd::Prefs),
+                    cmd(m.open_config, Cmd::OpenConfig),
                     Entry::Separator,
                     Entry::Services,
                     Entry::Separator,
-                    system("Ocultar Colibrí", sel!(hide:), "cmd+h"),
-                    system("Ocultar otros", sel!(hideOtherApplications:), "cmd+alt+h"),
-                    system("Mostrar todo", sel!(unhideAllApplications:), ""),
+                    system(m.hide, sel!(hide:), "cmd+h"),
+                    system(m.hide_others, sel!(hideOtherApplications:), "cmd+alt+h"),
+                    system(m.show_all, sel!(unhideAllApplications:), ""),
                     Entry::Separator,
-                    cmd("Reiniciar Colibrí", Cmd::Restart),
-                    system("Salir de Colibrí", sel!(terminate:), "cmd+q"),
+                    cmd(m.restart, Cmd::Restart),
+                    system(m.quit, sel!(terminate:), "cmd+q"),
                 ],
             },
             Menu {
-                title: "Archivo".into(),
+                title: m.file.into(),
+                windows: false,
                 entries: vec![
-                    cmd("Nueva ventana", Cmd::NewWindow),
-                    cmd("Nueva pestaña", Cmd::NewTab),
+                    cmd(m.new_window, Cmd::NewWindow),
+                    cmd(m.new_tab, Cmd::NewTab),
                     Entry::Separator,
-                    cmd("Cerrar pestaña", Cmd::CloseTab),
-                    cmd("Cerrar ventana", Cmd::CloseWindow),
-                    cmd("Reabrir lo último cerrado", Cmd::ReopenClosed),
+                    cmd(m.close_tab, Cmd::CloseTab),
+                    cmd(m.close_window, Cmd::CloseWindow),
+                    cmd(m.reopen_closed, Cmd::ReopenClosed),
                     Entry::Separator,
-                    cmd("Renombrar pestaña…", Cmd::RenameTab),
+                    cmd(m.rename_tab, Cmd::RenameTab),
                 ],
             },
             Menu {
-                title: "Edición".into(),
+                title: m.edit.into(),
+                windows: false,
                 entries: vec![
-                    key("Cortar", egui::Key::X),
-                    key("Copiar", egui::Key::C),
-                    key("Pegar", egui::Key::V),
-                    key("Seleccionar todo", egui::Key::A),
+                    key(m.cut, egui::Key::X),
+                    key(m.copy, egui::Key::C),
+                    key(m.paste, egui::Key::V),
+                    key(m.select_all, egui::Key::A),
                     Entry::Separator,
-                    cmd("Historial de comandos", Cmd::History),
-                    cmd("Limpiar pantalla e historial", Cmd::Clear),
+                    cmd(m.history, Cmd::History),
+                    cmd(m.clear, Cmd::Clear),
                 ],
             },
             Menu {
-                title: "Visualización".into(),
+                title: m.view.into(),
+                windows: false,
                 entries: vec![
-                    cmd("Paleta de comandos", Cmd::Palette),
+                    cmd(m.palette, Cmd::Palette),
                     Entry::Separator,
-                    cmd("Mostrar u ocultar paneles", Cmd::TogglePanel),
-                    cmd("Panel de agentes", Cmd::ToggleAgents),
-                    cmd("Panel de puertos", Cmd::TogglePorts),
-                    cmd("Panel de procesos", Cmd::ToggleProcs),
+                    cmd(m.toggle_panel, Cmd::TogglePanel),
+                    cmd(m.agents_panel, Cmd::ToggleAgents),
+                    cmd(m.ports_panel, Cmd::TogglePorts),
+                    cmd(m.procs_panel, Cmd::ToggleProcs),
                     Entry::Separator,
-                    cmd("Agrandar texto", Cmd::FontBigger),
-                    cmd("Reducir texto", Cmd::FontSmaller),
-                    cmd("Tamaño original", Cmd::FontReset),
+                    cmd(m.font_bigger, Cmd::FontBigger),
+                    cmd(m.font_smaller, Cmd::FontSmaller),
+                    cmd(m.font_reset, Cmd::FontReset),
                     Entry::Separator,
-                    system("Pantalla completa", sel!(toggleFullScreen:), "cmd+ctrl+f"),
+                    system(m.full_screen, sel!(toggleFullScreen:), "cmd+ctrl+f"),
                 ],
             },
             Menu {
-                title: "Ventana".into(),
+                title: m.window.into(),
+                windows: true,
                 entries: vec![
-                    system("Minimizar", sel!(performMiniaturize:), "cmd+m"),
-                    system("Zoom", sel!(performZoom:), ""),
+                    system(m.minimize, sel!(performMiniaturize:), "cmd+m"),
+                    system(m.zoom, sel!(performZoom:), ""),
                     Entry::Separator,
-                    cmd("Pestaña siguiente", Cmd::NextTab),
-                    cmd("Pestaña anterior", Cmd::PrevTab),
-                    cmd("Mover pestaña a la izquierda", Cmd::MoveTabLeft),
-                    cmd("Mover pestaña a la derecha", Cmd::MoveTabRight),
+                    cmd(m.next_tab, Cmd::NextTab),
+                    cmd(m.prev_tab, Cmd::PrevTab),
+                    cmd(m.move_tab_left, Cmd::MoveTabLeft),
+                    cmd(m.move_tab_right, Cmd::MoveTabRight),
                     Entry::Separator,
-                    cmd("Agente siguiente", Cmd::NextAgent),
-                    cmd("Agente anterior", Cmd::PrevAgent),
-                    cmd("Ir al agente que terminó", Cmd::JumpFinished),
+                    cmd(m.next_agent, Cmd::NextAgent),
+                    cmd(m.prev_agent, Cmd::PrevAgent),
+                    cmd(m.jump_finished, Cmd::JumpFinished),
                     Entry::Separator,
-                    system("Traer todo al frente", sel!(arrangeInFront:), ""),
+                    system(m.bring_all, sel!(arrangeInFront:), ""),
                 ],
             },
         ]
@@ -1729,8 +1737,9 @@ impl App {
             }
             // Clic derecho: color de la pestaña, renombrar y cerrar.
             resp.context_menu(|ui| {
+                let tx = &i18n::t().chrome;
                 ui.set_min_width(196.0);
-                ui.label(egui::RichText::new("Color").color(pal.muted).size(11.0));
+                ui.label(egui::RichText::new(tx.color).color(pal.muted).size(11.0));
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     let choices =
@@ -1739,10 +1748,14 @@ impl App {
                         let (dot, sw) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
                         let p = ui.painter();
                         let c = dot.center();
-                        let label = match choice.and_then(|k| TAB_COLORS.get(k as usize)) {
-                            Some((name, color)) => {
-                                p.circle_filled(c, 7.0, *color);
-                                *name
+                        let swatch = choice.and_then(|k| {
+                            let k = k as usize;
+                            Some((TAB_COLORS.get(k)?.1, *tx.color_names.get(k)?))
+                        });
+                        let label = match swatch {
+                            Some((color, name)) => {
+                                p.circle_filled(c, 7.0, color);
+                                name
                             }
                             None => {
                                 p.circle_stroke(c, 6.5, Stroke::new(1.2, pal.muted));
@@ -1750,7 +1763,7 @@ impl App {
                                     [c + Vec2::new(-4.5, 4.5), c + Vec2::new(4.5, -4.5)],
                                     Stroke::new(1.2, pal.muted),
                                 );
-                                "sin color"
+                                tx.no_color
                             }
                         };
                         if s.color == choice || sw.hovered() {
@@ -1764,11 +1777,11 @@ impl App {
                     }
                 });
                 ui.separator();
-                if ui.button("Renombrar…").clicked() {
+                if ui.button(tx.rename).clicked() {
                     rename = Some(i);
                     ui.close();
                 }
-                if ui.button("Cerrar pestaña").clicked() {
+                if ui.button(tx.close_tab).clicked() {
                     close = Some(i);
                     ui.close();
                 }
@@ -1821,7 +1834,7 @@ impl App {
             pal.muted,
         );
         let plus_clicked = plus_resp.clicked();
-        plus_resp.on_hover_text("Nueva pestaña  ⌘T");
+        plus_resp.on_hover_text(i18n::t().chrome.new_tab_hint);
 
         // Panel de agentes oculto: el botón que lo muestra va tras los semáforos.
         if !self.show_agents {
@@ -1840,8 +1853,8 @@ impl App {
             Rect::from_center_size(Pos2::new(full.right() - 62.0, cy), Vec2::new(30.0, 24.0));
         let toggle = procs_btn;
         for (rect, section, hint) in [
-            (procs_btn, Section::Processes, "Procesos  ⌘⇧M"),
-            (ports_btn, Section::Ports, "Puertos  ⌘⇧P"),
+            (procs_btn, Section::Processes, i18n::t().chrome.procs_hint),
+            (ports_btn, Section::Ports, i18n::t().chrome.ports_hint),
         ] {
             let resp = ui.interact(rect, ui.scope_id().with(("section", hint)), Sense::click());
             let on = match section {
@@ -1902,14 +1915,12 @@ impl App {
             p.text(
                 Pos2::new(pill.left() + 23.0, cy),
                 Align2::LEFT_CENTER,
-                "Actualizar",
+                i18n::t().chrome.update,
                 FontId::proportional(11.5),
                 text,
             );
             restart = resp.clicked();
-            resp.on_hover_text(
-                "Hay una compilación nueva. Reinicia Colibrí y reabre tus pestañas;\nlo que esté corriendo en ellas se detiene.",
-            );
+            resp.on_hover_text(i18n::t().chrome.update_hint);
             right_edge = pill.left() - 8.0;
         }
 
@@ -1967,18 +1978,16 @@ impl App {
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal.clone();
         let small = FontId::proportional(11.5);
+        let tx = &i18n::t().chrome;
 
         if self.show_ports {
             let ports = self.ports.list.lock().unwrap().clone();
             let web: Vec<_> = ports.iter().filter(|p| p.web).collect();
             let other: Vec<_> = ports.iter().filter(|p| !p.web).collect();
-            let count = match web.len() {
-                1 => "1 servidor web".to_string(),
-                n => format!("{n} servidores web"),
-            };
+            let count = (tx.web_servers)(web.len());
             let header_top = ui.cursor().min.y;
             let header_right = ui.max_rect().right();
-            if section_header(ui, &pal, Section::Ports, "Puertos", &count, 26.0) {
+            if section_header(ui, &pal, Section::Ports, tx.ports, &count, 26.0) {
                 self.show_ports = false;
             }
             let refresh = Rect::from_center_size(
@@ -1986,18 +1995,18 @@ impl App {
                 Vec2::splat(22.0),
             );
             let id = ui.scope_id().with("ports-refresh");
-            if icon_button(ui, &pal, refresh, id, Icon::Refresh, "Actualizar ahora").0 {
+            if icon_button(ui, &pal, refresh, id, Icon::Refresh, tx.refresh_now).0 {
                 self.ports.refresh();
             }
             if web.is_empty() {
-                hint(ui, &pal, "No hay servidores web corriendo");
+                hint(ui, &pal, tx.no_web_servers);
             }
             for port in &web {
                 self.port_row(ui, &pal, port, true);
             }
             if !other.is_empty() {
                 let arrow = if self.show_other_ports { "⌄" } else { "›" };
-                let label = format!("{arrow}  {} puertos más (no web)", other.len());
+                let label = format!("{arrow}  {}", (tx.more_ports)(other.len()));
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), Sense::click());
                 ui.painter().text(
@@ -2052,15 +2061,11 @@ impl App {
         if !self.show_procs {
             return;
         }
+        let tx = &i18n::t().chrome;
         let snap = self.monitor.data.lock().unwrap().clone();
         let gb = |b: u64| b as f64 / 1_073_741_824.0;
-        let detail = format!(
-            "CPU {:.0} %  ·  RAM {:.0}/{:.0} GB",
-            snap.cpu_total,
-            gb(snap.mem_used),
-            gb(snap.mem_total)
-        );
-        if section_header(ui, pal, Section::Processes, "Procesos", &detail, 0.0) {
+        let detail = (tx.procs_detail)(snap.cpu_total, gb(snap.mem_used), gb(snap.mem_total));
+        if section_header(ui, pal, Section::Processes, tx.processes, &detail, 0.0) {
             self.show_procs = false;
             self.w.search_focus = false;
             return;
@@ -2079,7 +2084,7 @@ impl App {
         let edit = ui.put(
             field,
             egui::TextEdit::singleline(&mut self.proc_search)
-                .hint_text("Buscar…")
+                .hint_text(tx.search)
                 .font(small.clone())
                 .desired_width(field.width()),
         );
@@ -2090,7 +2095,7 @@ impl App {
             edit.surrender_focus();
             self.w.search_focus = false;
         }
-        for (label, x, by_mem) in [("CPU", cpu_x, false), ("Memoria", mem_x, true)] {
+        for (label, x, by_mem) in [(tx.col_cpu, cpu_x, false), (tx.col_memory, mem_x, true)] {
             let active = self.proc_sort_mem == by_mem;
             let color = if active { pal.accent } else { pal.muted };
             let r = ui.painter().text(
@@ -2108,7 +2113,7 @@ impl App {
             if resp.clicked() {
                 self.proc_sort_mem = by_mem;
             }
-            resp.on_hover_text("Ordenar por esta columna");
+            resp.on_hover_text(tx.sort_by);
         }
         ui.painter().line_segment(
             [bar.left_bottom(), bar.right_bottom()],
@@ -2140,9 +2145,9 @@ impl App {
                 ui,
                 pal,
                 if snap.procs.is_empty() {
-                    "Leyendo procesos…"
+                    tx.reading_procs
                 } else {
-                    "Nada coincide con la búsqueda"
+                    tx.no_match
                 },
             );
         }
@@ -2194,11 +2199,7 @@ impl App {
             } else {
                 pal.muted
             };
-            let cpu = if proc.cpu >= 10.0 {
-                format!("{:.0} %", proc.cpu)
-            } else {
-                format!("{:.1} %", proc.cpu)
-            };
+            let cpu = (tx.percent)(proc.cpu, if proc.cpu >= 10.0 { 0 } else { 1 });
             p.text(
                 Pos2::new(cpu_x, rect.center().y),
                 Align2::RIGHT_CENTER,
@@ -2265,6 +2266,7 @@ impl App {
             ui.painter()
                 .rect_filled(rect, 0.0, pal.border.gamma_multiply(0.4));
         }
+        let tx = &i18n::t().chrome;
         let red = Color32::from_rgb(0xe5, 0x53, 0x4b);
         let small = FontId::proportional(11.5);
         let url = format!("http://localhost:{}", port.port);
@@ -2281,7 +2283,7 @@ impl App {
             let r = ui.painter().text(
                 Pos2::new(rect.right() - 12.0, cy),
                 Align2::RIGHT_CENTER,
-                "Deteniendo…",
+                tx.stopping,
                 small.clone(),
                 red,
             );
@@ -2289,9 +2291,9 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(500));
         } else if armed {
             let label = if self.stubborn.contains(&port.pid) {
-                "Forzar"
+                tx.force
             } else {
-                "Detener"
+                tx.stop
             };
             let pill = Rect::from_min_size(
                 Pos2::new(rect.right() - 70.0, cy - 11.0),
@@ -2328,17 +2330,17 @@ impl App {
                 over_button |= over;
                 clicked
             };
-            if button(ui, Icon::Trash, "Detener el proceso") {
+            if button(ui, Icon::Trash, tx.stop_process) {
                 self.confirm_stop = Some((port.pid, Instant::now()));
             }
-            if button(ui, Icon::Copy, "Copiar la URL") {
+            if button(ui, Icon::Copy, tx.copy_url) {
                 ctx.copy_text(url.clone());
             }
-            if web && button(ui, Icon::External, "Abrir en el navegador") {
+            if web && button(ui, Icon::External, tx.open_browser) {
                 spawn_detached("/usr/bin/open", &[url.clone()]);
             }
             if let Some(tab) = owner {
-                if button(ui, Icon::Arrow, "Ir a la pestaña que lo lanzó") {
+                if button(ui, Icon::Arrow, tx.go_to_tab) {
                     self.select(tab);
                 }
             }
@@ -2550,13 +2552,11 @@ impl shell::App for App {
             s.drain(ctx, &self.pal);
             let watching = self.w.focused && i == self.w.active;
             if s.poll(ctx, watching) {
-                let what = s
-                    .agent
-                    .map(|a| a.label().to_string())
-                    .unwrap_or_else(|| "Comando".into());
+                let tx = &i18n::t().chrome;
+                let what = s.agent.map_or(tx.command, |a| a.label());
                 notes.push((
-                    format!("{what} terminó"),
-                    format!("{} — clic o ⌘J para ir", s.project()),
+                    (tx.finished_title)(what),
+                    (tx.finished_body)(&s.project()),
                     s.id,
                 ));
             }
@@ -2827,7 +2827,7 @@ impl shell::App for App {
                         p.text(
                             Pos2::new(r.right() + 14.0, cell.center().y),
                             Align2::LEFT_CENTER,
-                            "↩ ejecutar  ·  ⇥ escribir",
+                            i18n::t().chrome.suggestion_keys,
                             FontId::proportional(10.5),
                             pal.muted.gamma_multiply(0.55),
                         );
@@ -3488,9 +3488,10 @@ fn tab_tooltip(ui: &mut egui::Ui, s: &Session, pal: &Palette) {
         ui.label(egui::RichText::new(s.clean_title()).color(pal.muted));
     }
     if s.busy {
-        ui.label(egui::RichText::new("Corriendo…").color(pal.accent));
+        ui.label(egui::RichText::new(i18n::t().chrome.running).color(pal.accent));
     } else if let Some(t) = s.finished_at {
-        ui.label(egui::RichText::new(format!("Terminó hace {}", ago(t.elapsed()))).color(pal.done));
+        let text = (i18n::t().chrome.finished_ago)(t.elapsed().as_secs());
+        ui.label(egui::RichText::new(text).color(pal.done));
     }
 }
 
@@ -3581,7 +3582,7 @@ fn section_header(
         Stroke::new(1.0, pal.border),
     );
     let clicked = resp.clicked();
-    resp.on_hover_text("Ocultar");
+    resp.on_hover_text(i18n::t().chrome.hide);
     clicked
 }
 
@@ -3719,7 +3720,7 @@ fn stop_control(
         p.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "Detener",
+            i18n::t().chrome.stop,
             FontId::proportional(11.5),
             Color32::WHITE,
         );
@@ -3750,21 +3751,17 @@ fn stop_control(
         }
     }
     let over = resp.hovered();
+    let tx = &i18n::t().chrome;
     resp.on_hover_text(if armed {
-        format!("Confirmar: terminar pid {pid}")
+        (tx.confirm_stop_pid)(pid)
     } else {
-        format!("Detener proceso (pid {pid})")
+        (tx.stop_pid)(pid)
     });
     (over, stopped)
 }
 
 fn ago(d: Duration) -> String {
-    let s = d.as_secs();
-    match s {
-        0..=59 => "un momento".into(),
-        60..=3599 => format!("{} min", s / 60),
-        _ => format!("{} h", s / 3600),
-    }
+    (i18n::t().chrome.ago)(d.as_secs())
 }
 
 fn exe_mtime() -> Option<SystemTime> {

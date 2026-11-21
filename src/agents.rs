@@ -317,6 +317,7 @@ impl App {
         let folder = Rect::from_min_size(Pos2::new(right - 30.0, y), Vec2::new(30.0, 30.0));
         let new = Rect::from_min_max(Pos2::new(left, y), Pos2::new(folder.left() - 6.0, y + 30.0));
         let resp = ui.interact(new, ui.scope_id().with("agents-new"), Sense::click());
+        let tx = &crate::i18n::t().agents;
         let p = ui.painter();
         if resp.hovered() {
             p.rect_filled(new, CornerRadius::same(6), pal.border);
@@ -334,7 +335,7 @@ impl App {
         p.text(
             Pos2::new(new.left() + 28.0, new.center().y),
             Align2::LEFT_CENTER,
-            "Nueva sesión",
+            tx.new_session,
             FontId::proportional(body),
             pal.fg,
         );
@@ -357,7 +358,7 @@ impl App {
             if resp.hovered() { pal.fg } else { pal.muted },
         );
         let folder_clicked = resp.clicked();
-        resp.on_hover_text("Nueva sesión en otra carpeta…");
+        resp.on_hover_text(tx.new_session_in_folder);
         y = new.bottom() + 8.0;
 
         // Buscador: solo recibe teclas tras un clic; Esc lo vacía y devuelve el teclado.
@@ -382,7 +383,7 @@ impl App {
             text_rect,
             egui::TextEdit::singleline(&mut self.agents_query)
                 .id(search_id())
-                .hint_text("Buscar agentes")
+                .hint_text(tx.search)
                 .font(FontId::proportional(12.5))
                 .frame(egui::Frame::NONE)
                 .align(egui::Align2::LEFT_CENTER)
@@ -406,9 +407,9 @@ impl App {
         let n = counts(&rows);
         let mut x = left;
         for (k, (filter, label)) in [
-            (Filter::All, "Todos"),
-            (Filter::Waiting, "Esperando"),
-            (Filter::Working, "Trabajando"),
+            (Filter::All, tx.filter_all),
+            (Filter::Waiting, tx.filter_waiting),
+            (Filter::Working, tx.filter_working),
         ]
         .into_iter()
         .enumerate()
@@ -464,7 +465,7 @@ impl App {
                 if resp.clicked() {
                     launch = Some(*agent);
                 }
-                resp.on_hover_text(format!("Nueva sesión con {}", agent.label()));
+                resp.on_hover_text((tx.new_session_with)(agent.label()));
             }
         }
 
@@ -491,9 +492,9 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     if grouped.is_empty() {
                         let msg = if rows.is_empty() {
-                            "Sin agentes. Abre uno con los iconos de abajo."
+                            tx.empty
                         } else {
-                            "Nada coincide."
+                            tx.no_match
                         };
                         let (r, _) = ui.allocate_exact_size(
                             Vec2::new(ui.available_width(), 40.0),
@@ -607,10 +608,11 @@ impl App {
             time,
             pal.muted,
         );
+        let texts = &crate::i18n::t().agents;
         let (status, color) = match row.state {
-            State::Working => ("Trabajando…", pal.fg),
-            State::Done => ("Terminó", pal.done),
-            State::Waiting => ("Esperando tu mensaje", pal.muted),
+            State::Working => (texts.working, pal.fg),
+            State::Done => (texts.done, pal.done),
+            State::Waiting => (texts.waiting, pal.muted),
         };
         p.text(
             Pos2::new(tx, rect.top() + 31.0),
@@ -707,14 +709,9 @@ impl App {
                 );
             }
         }
-        let hint = format!(
-            "{} panel de agentes  {}",
-            if self.show_agents {
-                "Ocultar"
-            } else {
-                "Mostrar"
-            },
-            self.keys.label(Cmd::ToggleAgents)
+        let hint = (crate::i18n::t().agents.toggle_hint)(
+            self.show_agents,
+            &self.keys.label(Cmd::ToggleAgents),
         );
         if resp.clicked() {
             self.show_agents = !self.show_agents;
