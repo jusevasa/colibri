@@ -135,6 +135,40 @@ enum Mode {
     LogicOnly,
 }
 
+/// Lo de la salida de egui que vale hasta la siguiente pasada de interfaz (ver `Running::kept`).
+#[derive(Clone, Default)]
+struct Kept {
+    cursor_icon: egui::CursorIcon,
+    cursor_image: Option<egui::output::CustomCursorImage>,
+    ime: Option<egui::output::IMEOutput>,
+}
+
+impl Kept {
+    fn from(output: &egui::PlatformOutput) -> Self {
+        Self {
+            cursor_icon: output.cursor_icon,
+            cursor_image: output.cursor_image.clone(),
+            // Interrumpir la composición es una orden de esa pasada, no un estado.
+            ime: output.ime.map(|ime| egui::output::IMEOutput {
+                should_interrupt_composition: false,
+                ..ime
+            }),
+        }
+    }
+
+    /// Pone en la salida de una pasada de solo `logic()` lo de la última de interfaz, salvo
+    /// lo que `logic()` haya pedido él mismo.
+    fn restore(&self, output: &mut egui::PlatformOutput) {
+        if output.cursor_icon == egui::CursorIcon::Default && output.cursor_image.is_none() {
+            output.cursor_icon = self.cursor_icon;
+            output.cursor_image = self.cursor_image.clone();
+        }
+        if output.ime.is_none() {
+            output.ime = self.ime;
+        }
+    }
+}
+
 /// Abre la primera ventana y corre la aplicación hasta que se cierre la última. Hilo
 /// principal.
 ///
@@ -194,6 +228,11 @@ struct Running {
     actions: Vec<ActionRequested>,
     /// Entrada recibida que egui aún no ha visto porque solo se corrió `logic()`.
     pending_input: egui::RawInput,
+    /// Lo que la última pasada de egui dijo del puntero y de la entrada de texto. Una pasada
+    /// de solo `logic()` no dibuja nada y su salida trae el puntero por defecto y la entrada
+    /// de texto apagada: entregada tal cual, el puntero saltaba de la I a la flecha (y
+    /// vuelta) con cada una, y la entrada de texto del sistema se apagaba y encendía.
+    kept: Kept,
     beginning: Instant,
     /// La ventana nace oculta y se muestra tras el primer cuadro.
     first_frame: bool,
@@ -348,6 +387,7 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
                 info,
                 actions: Vec::new(),
                 pending_input: egui::RawInput::default(),
+                kept: Kept::default(),
                 beginning: Instant::now(),
                 first_frame: true,
                 close: false,
@@ -594,11 +634,12 @@ impl Running {
         if mode == Mode::LogicOnly || !visible || deferred {
             // Sin pasada de egui: el estado de la interfaz queda como estaba para cuando
             // la ventana vuelva a verse.
-            let output = self.ctx.run_logic(&input, |ctx| app.logic(win, ctx));
+            let mut output = self.ctx.run_logic(&input, |ctx| app.logic(win, ctx));
             // Ninguna pasada consumió la entrada: se guarda para la siguiente.
             self.pending_input = input;
 
             self.info.events.clear();
+            self.kept.restore(&mut output.platform_output);
             self.state.handle_platform_output_with_event_loop(
                 &self.window,
                 event_loop,
@@ -625,6 +666,7 @@ impl Running {
         });
 
         self.info.events.clear();
+        self.kept = Kept::from(&platform_output);
         self.state.handle_platform_output_with_event_loop(
             &self.window,
             event_loop,
@@ -873,8 +915,51 @@ impl<F: FnOnce() -> Box<dyn App>> ApplicationHandler<UserEvent> for Runner<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RESERVE_IDLE, reserve_due};
+    use super::{Kept, RESERVE_IDLE, reserve_due};
     use std::time::Instant;
+
+    /// Con un agente trabajando hay pasadas de solo `logic()` entre las de interfaz (sin
+    /// drawable libre, refresco de 250 ms). Su salida no puede devolver la flecha ni apagar la
+    /// entrada de texto que dejó la última pasada de interfaz.
+    #[test]
+    fn pasada_de_solo_logica_conserva_puntero_y_entrada_de_texto() {
+        let ctx = egui::Context::default();
+        let ime = egui::output::IMEOutput {
+            purpose: egui::IMEPurpose::Normal,
+            should_interrupt_composition: false,
+            rect: egui::Rect::from_min_size(egui::pos2(1.0, 2.0), egui::vec2(3.0, 4.0)),
+            cursor_rect: egui::Rect::from_min_size(egui::pos2(1.0, 2.0), egui::vec2(1.0, 4.0)),
+        };
+        let full = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            ui.ctx().output_mut(|o| {
+                o.ime = Some(egui::output::IMEOutput {
+                    should_interrupt_composition: true,
+                    ..ime
+                })
+            });
+        });
+        let kept = Kept::from(&full.platform_output);
+        full.drop_without_applying_deltas();
+
+        let mut logic = ctx.run_logic(&egui::RawInput::default(), |_| {});
+        assert_eq!(
+            logic.platform_output.cursor_icon,
+            egui::CursorIcon::Default,
+            "egui deja la salida de `run_logic` con el puntero por defecto"
+        );
+        assert!(logic.platform_output.ime.is_none());
+        kept.restore(&mut logic.platform_output);
+        assert_eq!(logic.platform_output.cursor_icon, egui::CursorIcon::Text);
+        assert_eq!(logic.platform_output.ime, Some(ime));
+
+        // Lo que pida `logic()` por su cuenta manda.
+        let mut logic = ctx.run_logic(&egui::RawInput::default(), |ctx| {
+            ctx.set_cursor_icon(egui::CursorIcon::Wait);
+        });
+        kept.restore(&mut logic.platform_output);
+        assert_eq!(logic.platform_output.cursor_icon, egui::CursorIcon::Wait);
+    }
 
     #[test]
     fn reserva_se_suelta_tras_un_rato_sin_pintar_y_una_vez() {
