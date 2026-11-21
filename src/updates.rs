@@ -142,24 +142,53 @@ fn compare(a: &str, b: &str) -> Option<Ordering> {
     }))
 }
 
-/// «MAYOR.MENOR.PARCHE[-pre][+compilación]» → números y piezas del prerelease.
+/// «MAYOR.MENOR.PARCHE[-pre][+compilación]» → números y piezas del prerelease. Valida la
+/// versión entera con las reglas de semver antes de quedarse con lo que se compara: sin
+/// identificadores vacíos, solo letras, cifras y «-», y números sin ceros a la izquierda.
 fn parse(v: &str) -> Option<([u64; 3], Vec<&str>)> {
-    let v = v.split('+').next()?;
+    let (v, build) = match v.split_once('+') {
+        Some((v, build)) => (v, Some(build)),
+        None => (v, None),
+    };
+    // Los metadatos de compilación no cuentan al comparar, pero tienen que estar bien.
+    if build.is_some_and(|b| !b.split('.').all(identifier)) {
+        return None;
+    }
     let (core, pre) = match v.split_once('-') {
         Some((core, pre)) => (core, pre.split('.').collect()),
         None => (v, Vec::new()),
     };
-    let mut nums = core.split('.').map(|n| n.parse::<u64>().ok());
+    let mut nums = core.split('.').map(number);
     let core = [nums.next()??, nums.next()??, nums.next()??];
-    if nums.next().is_some() || pre.iter().any(|p: &&str| p.is_empty()) {
+    let pre_ok = pre
+        .iter()
+        .all(|p: &&str| identifier(p) && (!digits(p) || number(p).is_some()));
+    if nums.next().is_some() || !pre_ok {
         return None;
     }
     Some((core, pre))
 }
 
+/// Un identificador de semver: no vacío, de letras ASCII, cifras y «-».
+fn identifier(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Un número de semver: solo cifras (`u64::from_str` aceptaría «+5») y sin ceros a la
+/// izquierda, salvo el propio «0».
+fn number(s: &str) -> Option<u64> {
+    (digits(s) && (s == "0" || !s.starts_with('0')))
+        .then(|| s.parse().ok())
+        .flatten()
+}
+
 fn compare_pre(a: &[&str], b: &[&str]) -> Ordering {
     for (x, y) in a.iter().zip(b) {
-        let o = match (x.parse::<u64>(), y.parse::<u64>()) {
+        let o = match (number(x).ok_or(()), number(y).ok_or(())) {
             (Ok(m), Ok(n)) => m.cmp(&n),
             // Un número va antes que un texto: beta.1 < beta.rc.
             (Ok(_), Err(_)) => Ordering::Less,
@@ -237,6 +266,16 @@ mod tests {
         assert!(!newer("1.2.3.4", "0.2.0"));
         assert!(!newer("1.0.0-", "0.2.0"));
         assert!(!newer("1.0.0-beta..1", "0.2.0"));
+        // Lo que semver no admite, aunque el núcleo parezca una versión.
+        assert!(!newer("9.9.9+", "0.2.0"));
+        assert!(!newer("9.9.9+a..b", "0.2.0"));
+        assert!(!newer("9.9.9-beta.01", "0.2.0"));
+        assert!(!newer("09.9.9", "0.2.0"));
+        assert!(!newer("+9.9.9", "0.2.0"));
+        assert!(!newer("9.+9.9", "0.2.0"));
+        // Los metadatos de compilación bien formados se aceptan y no cuentan.
+        assert!(newer("9.9.9+51", "0.2.0"));
+        assert!(newer("0.2.0-beta.0", "0.2.0-alpha"));
     }
 
     #[test]

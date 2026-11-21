@@ -1011,8 +1011,13 @@ impl App {
             return;
         };
         if self.upgrades_with_brew() {
+            // Si la pestaña no se pudo abrir, la última es otra que ya estaba: nada de escribir
+            // la orden ahí.
+            let before = self.w.sessions.len();
             self.new_tab(ctx, dirs::home_dir());
-            if let Some(s) = self.w.sessions.last_mut() {
+            if self.w.sessions.len() > before
+                && let Some(s) = self.w.sessions.last_mut()
+            {
                 s.run_when_ready(updates::BREW_UPGRADE.to_string());
             }
         } else {
