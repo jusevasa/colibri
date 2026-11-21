@@ -270,6 +270,7 @@ fn tag_result(link: &Hyperlink) -> Option<(i32, u64)> {
 
 /// Una línea de cajas visible: fila en pantalla, celdas que ocupa su texto, dónde empieza
 /// lo siguiente a su derecha y los datos (marca + texto) de cada caja.
+#[derive(Clone, PartialEq)]
 pub struct ChipRow {
     pub row: i32,
     pub end: usize,
@@ -735,6 +736,8 @@ pub struct Session {
     /// Filas en pantalla que se pintan corridas a la izquierda (sin el símbolo del prompt)
     /// y cuántas celdas; el ratón tiene que deshacer ese corrimiento.
     pub row_shifts: Vec<(i32, i32)>,
+    /// La rejilla del cuadro anterior, para rehacer solo las filas que cambian.
+    pub grid: crate::view::GridCache,
     /// Texto a medio componer (tecla muerta: «˜» antes de la «ñ»; o un método de entrada),
     /// que aún no se ha enviado al programa. Se pinta en el cursor, subrayado.
     pub preedit: String,
@@ -896,6 +899,7 @@ impl Session {
             cursor_px: None,
             chips_px: Vec::new(),
             row_shifts: Vec::new(),
+            grid: Default::default(),
             preedit: String::new(),
             preedit_frame: 0,
             tag_cache: None,

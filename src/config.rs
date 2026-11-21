@@ -509,7 +509,7 @@ pub fn hex(s: &str, fallback: Color32) -> Color32 {
 }
 
 /// Colores ya resueltos, listos para pintar.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Palette {
     pub bg: Color32,
     pub fg: Color32,

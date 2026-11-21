@@ -183,20 +183,6 @@ fn show_grid(
         })
         .collect();
     let shifts = s.row_shifts.clone();
-    let shift_of = |row: i32| {
-        shifts
-            .iter()
-            .find(|(r, _)| *r == row)
-            .map_or(0, |(_, n)| *n)
-    };
-    // Colores del comando que se escribe en una máquina remota (allí no hay resaltado).
-    let token_at = |row: i32, col: usize| {
-        chip_rows
-            .iter()
-            .flat_map(|c| c.tokens.iter())
-            .find(|(r, from, to, _)| *r == row && (*from..*to).contains(&col))
-            .map(|(.., tok)| *tok)
-    };
     let prompt_bar = !shifts.is_empty() && s.at_prompt();
     let painter = ui.painter().with_clip_rect(rect);
     // Cada prompt marcado sabe cómo acabó el comando anterior: si falló, una barra roja
@@ -238,136 +224,59 @@ fn show_grid(
             );
         }
     }
-    let mut bgs: Vec<BgRun> = Vec::new();
-    let mut texts: Vec<TextRun> = Vec::new();
-    let mut lines_deco: Vec<(i32, usize, usize, Color32, bool)> = Vec::new();
-    let mut dots: Vec<(i32, usize, Color32)> = Vec::new();
+    // Fondos, letras, subrayados y viñetas, fila a fila (`walk_row`). Con instancias, solo
+    // se rehacen las filas que cambiaron (`grid_pass`). Lo que no son fondos ni letras
+    // (viñetas, subrayados, cursor, cajas) va encima, con egui.
     let cursor;
     let cursor_cell_fg;
-    {
-        let term = s.term.lock();
+    let out = {
+        let mut term = s.term.lock();
+        let out = if crate::grid::instanced() {
+            let ctx = ui.ctx().clone();
+            let glyphs: Glyphs = ctx.data_mut(|d| {
+                d.get_temp_mut_or_default::<Glyphs>(egui::Id::unique("colibri-glyphs"))
+                    .clone()
+            });
+            let mut glyphs = glyphs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pass = GridPass {
+                pal,
+                m,
+                origin,
+                link: link.as_ref(),
+                chip_rows: &chip_rows,
+                shifts: &shifts,
+            };
+            pass.run(&mut term, &mut s.grid, &mut glyphs, &ctx, no_grid_cache())
+        } else {
+            GridOut::default()
+        };
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
-        let colors = content.colors;
-        let selection = content.selection;
+        let look = Look {
+            pal,
+            colors: content.colors,
+            selection: content.selection,
+            link: link.as_ref(),
+            chip_rows: &chip_rows,
+            shifts: &shifts,
+        };
         let cursor_row = content.cursor.point.line.0 + offset;
         cursor = (
             content.cursor.shape,
             cursor_row,
-            (content.cursor.point.column.0 as i32 - shift_of(cursor_row)).max(0) as usize,
+            (content.cursor.point.column.0 as i32 - shift_of(&shifts, cursor_row)).max(0) as usize,
         );
-        let mut under_cursor = None;
-
-        for ind in content.display_iter {
-            let cell = ind.cell;
-            let flags = cell.flags;
-            if flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let row = ind.point.line.0 + offset;
-            let col = ind.point.column.0;
-            if chip_rows.iter().any(|c| c.row == row && col < c.end) {
-                continue;
-            }
-            let token = token_at(row, col);
-            let shifted = col as i32 - shift_of(row);
-            if shifted < 0 {
-                continue;
-            }
-            let col = shifted as usize;
-            let width = if flags.contains(Flags::WIDE_CHAR) {
-                2
-            } else {
-                1
-            };
-
-            let mut fg = match token {
-                Some(crate::session::Tok::Command) => pal.ansi[2],
-                Some(crate::session::Tok::Flag) => pal.ansi[4],
-                Some(crate::session::Tok::Str) => pal.ansi[3],
-                None => resolve(cell.fg, colors, pal),
-            };
-            let mut bg = resolve(cell.bg, colors, pal);
-            if flags.contains(Flags::DIM) {
-                fg = dim(fg);
-            }
-            if flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if selection.is_some_and(|sel| sel.contains(ind.point)) {
-                bg = pal.selection;
-            }
-            // El enlace bajo el puntero (con ⌘): del color de acento y subrayado.
-            let linked = link.as_ref().is_some_and(|l| l.contains(ind.point, cell));
-            if linked {
-                fg = pal.accent;
-            }
-            if bg != pal.bg {
-                match bgs.last_mut() {
-                    Some(last) if last.row == row && last.end == col && last.color == bg => {
-                        last.end = col + width
-                    }
-                    _ => bgs.push(BgRun {
-                        row,
-                        col,
-                        end: col + width,
-                        color: bg,
-                    }),
-                }
-            }
-            if row == cursor.1 && col == cursor.2 {
-                under_cursor = Some((cell.c, flags.contains(Flags::BOLD)));
-            }
-            if linked {
-                lines_deco.push((row, col, width, fg, false));
-            } else if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
-                lines_deco.push((row, col, width, fg, flags.contains(Flags::STRIKEOUT)));
-            }
-            let c = cell.c;
-            if c == ' ' || c == '\0' || flags.contains(Flags::HIDDEN) {
-                continue;
-            }
-            // ⏺ (la viñeta de Claude Code) solo existe como emoji de color en macOS:
-            // se dibuja a mano para que salga como un punto del color del texto.
-            if c == '\u{23FA}' {
-                dots.push((row, col, fg));
-                continue;
-            }
-            let bold = flags.contains(Flags::BOLD);
-            let zero = cell.zerowidth();
-            let ascii = c.is_ascii() && zero.is_none();
-            match texts.last_mut() {
-                Some(last)
-                    if ascii
-                        && last.ascii
-                        && last.row == row
-                        && last.next_col == col
-                        && last.fg == fg
-                        && last.bold == bold =>
-                {
-                    last.text.push(c);
-                    last.next_col = col + 1;
-                }
-                _ => {
-                    let mut text = String::from(c);
-                    if let Some(z) = zero {
-                        // Las marcas de las cajas no son texto (se ven si las cajas están apagadas).
-                        text.extend(z.iter().filter(|c| !('\u{E0D0}'..='\u{E0D5}').contains(*c)));
-                    }
-                    texts.push(TextRun {
-                        row,
-                        col,
-                        next_col: col + width,
-                        text,
-                        fg,
-                        bold,
-                        ascii,
-                    });
-                }
-            }
+        cursor_cell_fg = under_cursor(&term, cursor.1, cursor.2, offset, &look);
+        if crate::grid::instanced() {
+            out
+        } else {
+            // Camino de siempre de egui (`COLIBRI_GRID=egui`, para comparar): sin caché.
+            let rows: Vec<RowRuns> = (0..term.screen_lines() as i32)
+                .map(|row| walk_row(&term, row, offset, &look))
+                .collect();
+            GridOut::from_runs(rows)
         }
-        cursor_cell_fg = under_cursor;
-    }
+    };
 
     let cell_pos = |row: i32, col: usize| {
         Pos2::new(
@@ -375,61 +284,37 @@ fn show_grid(
             origin.y + row as f32 * m.cell_h,
         )
     };
-    if crate::grid::instanced() {
+    if let Some(batch) = &out.batch {
+        crate::debug::timing::INSTANCES.fetch_add(
+            batch.instances.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Fondos y letras como instancias de Metal (`grid.rs`), en un solo `Callback` en
-        // el mismo sitio del orden de pintado: lo que va después (puntos, subrayados,
-        // cursor, cajas) queda encima, como antes.
-        let ctx = ui.ctx().clone();
-        let ppp = ctx.pixels_per_point();
-        let mut instances = Vec::with_capacity(bgs.len() + texts.len() * 8);
-        for b in &bgs {
-            // Como `rect_filled`: el teselador lleva el rectángulo a píxeles enteros.
-            let min = cell_pos(b.row, b.col);
-            let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
-            let r = egui::emath::GuiRounding::round_to_pixels(Rect::from_min_max(min, max), ppp);
-            instances.push(crate::grid::Instance::solid(r.min, r.max, b.color));
-        }
-        let glyphs: Glyphs = ctx.data_mut(|d| {
-            d.get_temp_mut_or_default::<Glyphs>(egui::Id::unique("colibri-glyphs"))
-                .clone()
-        });
-        {
-            let mut cache = glyphs.lock().unwrap_or_else(|e| e.into_inner());
-            cache.begin(&ctx, &m.font, &m.bold);
-            for t in &texts {
-                let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
-                cache.push_text(&ctx, &mut instances, pos, &t.text, t.ascii, t.bold, t.fg);
-            }
-        }
-        crate::debug::timing::INSTANCES
-            .fetch_add(instances.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        if !instances.is_empty() {
-            painter.add(egui::Shape::Callback(egui::PaintCallback {
-                rect,
-                callback: std::sync::Arc::new(crate::grid::GridBatch { instances }),
-            }));
-        }
-    } else {
-        for b in &bgs {
-            let min = cell_pos(b.row, b.col);
-            let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
-            painter.rect_filled(Rect::from_min_max(min, max), 0.0, b.color);
-        }
-        for t in texts {
-            let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
-            let font = if t.bold {
-                m.bold.clone()
-            } else {
-                m.font.clone()
-            };
-            painter.text(pos, Align2::LEFT_TOP, t.text, font, t.fg);
-        }
+        // el mismo sitio del orden de pintado: lo que va después queda encima, como antes.
+        painter.add(egui::Shape::Callback(egui::PaintCallback {
+            rect,
+            callback: batch.clone(),
+        }));
     }
-    for (row, col, color) in dots {
+    for b in out.runs.iter().flat_map(|r| &r.bgs) {
+        let min = cell_pos(b.row, b.col);
+        let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
+        painter.rect_filled(Rect::from_min_max(min, max), 0.0, b.color);
+    }
+    for t in out.runs.iter().flat_map(|r| &r.texts) {
+        let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
+        let font = if t.bold {
+            m.bold.clone()
+        } else {
+            m.font.clone()
+        };
+        painter.text(pos, Align2::LEFT_TOP, &t.text, font, t.fg);
+    }
+    for &(row, col, color) in &out.dots {
         let center = cell_pos(row, col) + Vec2::new(m.cell_w, m.cell_h) / 2.0;
         painter.circle_filled(center, (m.cell_w * 0.45).min(m.cell_h * 0.3), color);
     }
-    for (row, col, width, color, strike) in lines_deco {
+    for &(row, col, width, color, strike) in &out.deco {
         let p = cell_pos(row, col);
         let y = if strike {
             p.y + m.cell_h * 0.5
@@ -530,6 +415,417 @@ fn show_grid(
                 should_interrupt_composition: false,
             })
         });
+    }
+}
+
+/// `COLIBRI_NO_GRID_CACHE`: rehacer la rejilla entera en cada cuadro, para comparar.
+fn no_grid_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("COLIBRI_NO_GRID_CACHE").is_some())
+}
+
+/// Lo que sale de una fila: fondos y letras como instancias, subrayados (columna, ancho,
+/// color, tachado) y viñetas ⏺ (columna, color).
+#[derive(Default, PartialEq)]
+struct RowOut {
+    bgs: Vec<crate::grid::Instance>,
+    letters: Vec<crate::grid::Instance>,
+    deco: Vec<(usize, usize, Color32, bool)>,
+    dots: Vec<(usize, Color32)>,
+}
+
+/// Todo lo que decide la rejilla y no está en las celdas: si cambia, se rehace entera. Las
+/// celdas las sigue alacritty (`Term::damage`), salvo lo que Colibrí escribe por su cuenta
+/// (las cajas del prompt), que cambia `chip_rows`.
+#[derive(PartialEq)]
+struct GridKey {
+    origin: Pos2,
+    cell: [f32; 3],
+    fonts: (FontId, FontId),
+    ppp: f32,
+    size: (usize, usize),
+    offset: usize,
+    selection: Option<alacritty_terminal::selection::SelectionRange>,
+    link: Option<Span>,
+    chip_rows: Vec<crate::session::ChipRow>,
+    shifts: Vec<(i32, i32)>,
+    palette: Palette,
+    /// `GlyphCache::generation`: si el atlas se rehízo, las coordenadas de los glifos ya no
+    /// valen.
+    glyphs: u64,
+}
+
+/// La rejilla del cuadro anterior, fila a fila, para rehacer en el siguiente solo las que
+/// cambian. Una por pestaña (`Session::grid`).
+#[derive(Default)]
+pub struct GridCache {
+    key: Option<GridKey>,
+    rows: Vec<RowOut>,
+    batch: Option<std::sync::Arc<crate::grid::GridBatch>>,
+    /// Filas rehechas en el último cuadro.
+    rebuilt: usize,
+}
+
+/// Lo que sale de la rejilla en un cuadro. Con instancias: el lote (fondos y letras) y, con
+/// su fila, subrayados y viñetas. Por el camino de egui, los tramos (`runs`).
+#[derive(Default)]
+struct GridOut {
+    batch: Option<std::sync::Arc<crate::grid::GridBatch>>,
+    runs: Vec<RowRuns>,
+    deco: Vec<(i32, usize, usize, Color32, bool)>,
+    dots: Vec<(i32, usize, Color32)>,
+}
+
+impl GridOut {
+    fn from_runs(mut runs: Vec<RowRuns>) -> Self {
+        let mut out = GridOut::default();
+        for (row, r) in runs.iter_mut().enumerate() {
+            let row = row as i32;
+            out.deco
+                .extend(r.deco.drain(..).map(|(c, w, k, s)| (row, c, w, k, s)));
+            out.dots.extend(r.dots.drain(..).map(|(c, k)| (row, c, k)));
+        }
+        out.runs = runs;
+        out
+    }
+}
+
+/// Una pasada de la rejilla con instancias: lo que no está en las celdas.
+struct GridPass<'a> {
+    pal: &'a Palette,
+    m: &'a Metrics,
+    origin: Pos2,
+    link: Option<&'a Link>,
+    chip_rows: &'a [crate::session::ChipRow],
+    shifts: &'a [(i32, i32)],
+}
+
+impl GridPass<'_> {
+    /// Rehace en `cache` las filas que cambiaron desde el cuadro anterior (todas con `full`
+    /// o si cambió algo de `GridKey`) y devuelve el lote del cuadro: el mismo `Arc` si
+    /// ninguna fila salió distinta.
+    fn run<T>(
+        &mut self,
+        term: &mut Term<T>,
+        cache: &mut GridCache,
+        glyphs: &mut crate::grid::GlyphCache,
+        ctx: &egui::Context,
+        full: bool,
+    ) -> GridOut {
+        use alacritty_terminal::term::TermDamage;
+        // Lo que cambió en las celdas desde la última vez (`None` = todo). Se consume aquí:
+        // esta caché es la única que lo usa.
+        let damaged: Option<Vec<usize>> = match term.damage() {
+            TermDamage::Full => None,
+            TermDamage::Partial(lines) => Some(lines.map(|l| l.line).collect()),
+        };
+        term.reset_damage();
+
+        glyphs.begin(ctx, &self.m.font, &self.m.bold);
+        let ppp = ctx.pixels_per_point();
+        let offset = term.grid().display_offset() as i32;
+        let selection = term.selection.as_ref().and_then(|s| s.to_range(term));
+        let lines = term.screen_lines();
+        let key = GridKey {
+            origin: self.origin,
+            cell: [self.m.cell_w, self.m.cell_h, self.m.text_dy],
+            fonts: (self.m.font.clone(), self.m.bold.clone()),
+            ppp,
+            size: (term.columns(), lines),
+            offset: offset as usize,
+            selection,
+            link: self.link.map(|l| l.span.clone()),
+            chip_rows: self.chip_rows.to_vec(),
+            shifts: self.shifts.to_vec(),
+            palette: self.pal.clone(),
+            glyphs: glyphs.generation(),
+        };
+        let full = full
+            || damaged.is_none()
+            || cache.key.as_ref() != Some(&key)
+            || cache.rows.len() != lines;
+        let rows: Vec<usize> = match &damaged {
+            Some(rows) if !full => rows.iter().copied().filter(|&r| r < lines).collect(),
+            _ => (0..lines).collect(),
+        };
+        if full {
+            cache.rows.clear();
+            cache.rows.resize_with(lines, RowOut::default);
+        }
+
+        let look = Look {
+            pal: self.pal,
+            colors: term.colors(),
+            selection,
+            link: self.link,
+            chip_rows: self.chip_rows,
+            shifts: self.shifts,
+        };
+        let mut changed = full;
+        for &row in &rows {
+            let runs = walk_row(term, row as i32, offset, &look);
+            let mut out = RowOut::default();
+            row_instances(
+                &runs,
+                ctx,
+                glyphs,
+                self.origin,
+                self.m,
+                ppp,
+                &mut out.bgs,
+                &mut out.letters,
+            );
+            out.deco = runs.deco;
+            out.dots = runs.dots;
+            if cache.rows[row] != out {
+                cache.rows[row] = out;
+                changed = true;
+            }
+        }
+        cache.rebuilt = rows.len();
+        cache.key = Some(key);
+        if changed {
+            let mut instances: Vec<_> = cache
+                .rows
+                .iter()
+                .flat_map(|r| r.bgs.iter().copied())
+                .collect();
+            instances.extend(cache.rows.iter().flat_map(|r| r.letters.iter().copied()));
+            cache.batch = (!instances.is_empty())
+                .then(|| std::sync::Arc::new(crate::grid::GridBatch { instances }));
+        }
+        crate::debug::timing::GRID_ROWS
+            .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        cache.out()
+    }
+}
+
+impl GridCache {
+    /// El cuadro tal como está guardado.
+    fn out(&self) -> GridOut {
+        let mut out = GridOut {
+            batch: self.batch.clone(),
+            ..Default::default()
+        };
+        for (row, r) in self.rows.iter().enumerate() {
+            let row = row as i32;
+            out.deco
+                .extend(r.deco.iter().map(|&(c, w, k, s)| (row, c, w, k, s)));
+            out.dots.extend(r.dots.iter().map(|&(c, k)| (row, c, k)));
+        }
+        out
+    }
+}
+
+/// Desplazamiento en celdas de la fila `row` (ver `Session::row_shifts`).
+fn shift_of(shifts: &[(i32, i32)], row: i32) -> i32 {
+    shifts
+        .iter()
+        .find(|(r, _)| *r == row)
+        .map_or(0, |(_, n)| *n)
+}
+
+/// Color del comando que se escribe en una máquina remota (allí no hay resaltado).
+fn token_at(
+    chip_rows: &[crate::session::ChipRow],
+    row: i32,
+    col: usize,
+) -> Option<crate::session::Tok> {
+    chip_rows
+        .iter()
+        .flat_map(|c| c.tokens.iter())
+        .find(|(r, from, to, _)| *r == row && (*from..*to).contains(&col))
+        .map(|(.., tok)| *tok)
+}
+
+/// Lo que decide cómo se pintan las celdas y no está en ellas.
+struct Look<'a> {
+    pal: &'a Palette,
+    colors: &'a Colors,
+    selection: Option<alacritty_terminal::selection::SelectionRange>,
+    link: Option<&'a Link>,
+    chip_rows: &'a [crate::session::ChipRow],
+    shifts: &'a [(i32, i32)],
+}
+
+/// Fondos, letras, subrayados (columna, ancho, color, tachado) y viñetas ⏺ (columna, color)
+/// de una fila de la pantalla.
+#[derive(Default)]
+struct RowRuns {
+    bgs: Vec<BgRun>,
+    texts: Vec<TextRun>,
+    deco: Vec<(usize, usize, Color32, bool)>,
+    dots: Vec<(usize, Color32)>,
+}
+
+/// Los tramos de la fila `row` de la pantalla (`offset`: desplazamiento por el historial).
+fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
+    let pal = look.pal;
+    let mut out = RowRuns::default();
+    let line = Line(row - offset);
+    let cells = &term.grid()[line];
+    let shift = shift_of(look.shifts, row);
+    for col in 0..term.columns() {
+        let point = Point::new(line, Column(col));
+        let cell = &cells[Column(col)];
+        let flags = cell.flags;
+        if flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        if look.chip_rows.iter().any(|c| c.row == row && col < c.end) {
+            continue;
+        }
+        let token = token_at(look.chip_rows, row, col);
+        let shifted = col as i32 - shift;
+        if shifted < 0 {
+            continue;
+        }
+        let col = shifted as usize;
+        let width = if flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+
+        let mut fg = match token {
+            Some(crate::session::Tok::Command) => pal.ansi[2],
+            Some(crate::session::Tok::Flag) => pal.ansi[4],
+            Some(crate::session::Tok::Str) => pal.ansi[3],
+            None => resolve(cell.fg, look.colors, pal),
+        };
+        let mut bg = resolve(cell.bg, look.colors, pal);
+        if flags.contains(Flags::DIM) {
+            fg = dim(fg);
+        }
+        if flags.contains(Flags::INVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+        if look.selection.is_some_and(|sel| sel.contains(point)) {
+            bg = pal.selection;
+        }
+        // El enlace bajo el puntero (con ⌘): del color de acento y subrayado.
+        let linked = look.link.is_some_and(|l| l.contains(point, cell));
+        if linked {
+            fg = pal.accent;
+        }
+        if bg != pal.bg {
+            match out.bgs.last_mut() {
+                Some(last) if last.end == col && last.color == bg => last.end = col + width,
+                _ => out.bgs.push(BgRun {
+                    row,
+                    col,
+                    end: col + width,
+                    color: bg,
+                }),
+            }
+        }
+        if linked {
+            out.deco.push((col, width, fg, false));
+        } else if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
+            out.deco
+                .push((col, width, fg, flags.contains(Flags::STRIKEOUT)));
+        }
+        let c = cell.c;
+        if c == ' ' || c == '\0' || flags.contains(Flags::HIDDEN) {
+            continue;
+        }
+        // ⏺ (la viñeta de Claude Code) solo existe como emoji de color en macOS:
+        // se dibuja a mano para que salga como un punto del color del texto.
+        if c == '\u{23FA}' {
+            out.dots.push((col, fg));
+            continue;
+        }
+        let bold = flags.contains(Flags::BOLD);
+        let zero = cell.zerowidth();
+        let ascii = c.is_ascii() && zero.is_none();
+        match out.texts.last_mut() {
+            Some(last)
+                if ascii
+                    && last.ascii
+                    && last.next_col == col
+                    && last.fg == fg
+                    && last.bold == bold =>
+            {
+                last.text.push(c);
+                last.next_col = col + 1;
+            }
+            _ => {
+                let mut text = String::from(c);
+                if let Some(z) = zero {
+                    // Las marcas de las cajas no son texto (se ven si las cajas están apagadas).
+                    text.extend(z.iter().filter(|c| !('\u{E0D0}'..='\u{E0D5}').contains(*c)));
+                }
+                out.texts.push(TextRun {
+                    row,
+                    col,
+                    next_col: col + width,
+                    text,
+                    fg,
+                    bold,
+                    ascii,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// La letra bajo el cursor (`row`, `col` ya desplazada), que el cursor de bloque pinta del
+/// color del fondo: la celda que el recorrido de esa fila pondría en esa columna.
+fn under_cursor<T>(
+    term: &Term<T>,
+    row: i32,
+    col: usize,
+    offset: i32,
+    look: &Look,
+) -> Option<(char, bool)> {
+    if row < 0 || row as usize >= term.screen_lines() {
+        return None;
+    }
+    let orig = col as i32 + shift_of(look.shifts, row);
+    if orig < 0 || orig as usize >= term.columns() {
+        return None;
+    }
+    let orig = orig as usize;
+    if look.chip_rows.iter().any(|c| c.row == row && orig < c.end) {
+        return None;
+    }
+    let cell = &term.grid()[Line(row - offset)][Column(orig)];
+    if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+        return None;
+    }
+    Some((cell.c, cell.flags.contains(Flags::BOLD)))
+}
+
+/// Las instancias de una fila: sus fondos en `bgs` y sus letras en `letters` (van detrás de
+/// todos los fondos de la pantalla).
+#[allow(clippy::too_many_arguments)]
+fn row_instances(
+    runs: &RowRuns,
+    ctx: &egui::Context,
+    cache: &mut crate::grid::GlyphCache,
+    origin: Pos2,
+    m: &Metrics,
+    ppp: f32,
+    bgs: &mut Vec<crate::grid::Instance>,
+    letters: &mut Vec<crate::grid::Instance>,
+) {
+    let cell_pos = |row: i32, col: usize| {
+        Pos2::new(
+            origin.x + col as f32 * m.cell_w,
+            origin.y + row as f32 * m.cell_h,
+        )
+    };
+    for b in &runs.bgs {
+        // Como `rect_filled`: el teselador lleva el rectángulo a píxeles enteros.
+        let min = cell_pos(b.row, b.col);
+        let max = Pos2::new(origin.x + b.end as f32 * m.cell_w, min.y + m.cell_h);
+        let r = egui::emath::GuiRounding::round_to_pixels(Rect::from_min_max(min, max), ppp);
+        bgs.push(crate::grid::Instance::solid(r.min, r.max, b.color));
+    }
+    for t in &runs.texts {
+        let pos = cell_pos(t.row, t.col) + Vec2::new(0.0, m.text_dy);
+        cache.push_text(ctx, letters, pos, &t.text, t.ascii, t.bold, t.fg);
     }
 }
 
@@ -777,6 +1073,7 @@ enum Target {
 }
 
 /// Qué celdas ocupa el enlace.
+#[derive(Clone, PartialEq)]
 enum Span {
     /// Las del hiperenlace OSC 8 con esta dirección. Se compara la dirección y no el id:
     /// un enlace partido en varias líneas llega como varios hiperenlaces.
@@ -1274,6 +1571,95 @@ fn report_mouse(
 mod tests {
     use super::{file_command, mouse_seq, path_span, split_position, url_span};
     use std::path::Path;
+
+    /// La rejilla con caché sale igual que rehecha entera y rehace solo las filas que
+    /// cambian (`Term::damage`), o todas si cambia algo que no está en las celdas.
+    #[test]
+    fn rejilla_incremental_igual_que_entera() {
+        use super::{GridCache, GridOut, GridPass, Metrics};
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::{CursorShape, Processor};
+        use egui::{FontId, Pos2};
+        let size = crate::session::TermSize {
+            cols: 40,
+            lines: 10,
+        };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        let text = "\x1b[41mrojo\x1b[0m normal \x1b[1mnegrita\x1b[0m\r\n\x1b[4msub\x1b[0m \u{23FA} 漢字 ñ\r\nfin";
+        parser.advance(&mut term, text.as_bytes());
+        let ctx = egui::Context::default();
+        let pal = crate::config::Palette::new(&crate::config::Theme::default());
+        let m = Metrics {
+            font: FontId::monospace(13.0),
+            bold: FontId::monospace(13.0),
+            cell_w: 8.0,
+            cell_h: 16.0,
+            text_dy: 1.0,
+            pad: 4.0,
+            cursor: CursorShape::Block,
+            blink: false,
+            editor: String::new(),
+        };
+        let mut glyphs = crate::grid::GlyphCache::default();
+        let mut pass = |term: &mut Term<VoidListener>, cache: &mut GridCache, full: bool| {
+            let mut out = GridOut::default();
+            let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let ctx = ui.ctx().clone();
+                let mut p = GridPass {
+                    pal: &pal,
+                    m: &m,
+                    origin: Pos2::new(4.0, 4.0),
+                    link: None,
+                    chip_rows: &[],
+                    shifts: &[],
+                };
+                out = p.run(term, cache, &mut glyphs, &ctx, full);
+            });
+            frame.textures_delta.clear();
+            out
+        };
+        let same = |a: &GridOut, b: &GridOut| {
+            let inst = |o: &GridOut| o.batch.as_ref().map(|b| b.instances.clone());
+            assert_eq!(inst(a), inst(b), "instancias");
+            assert_eq!(a.deco, b.deco, "subrayados");
+            assert_eq!(a.dots, b.dots, "viñetas");
+        };
+        let mut cache = GridCache::default();
+        pass(&mut term, &mut cache, false);
+        assert_eq!(cache.rebuilt, 10, "la primera vez, todas");
+
+        // Cambia una fila: solo esa y las del cursor (la de antes y la de ahora).
+        parser.advance(&mut term, b"\x1b[2;3HXYZ");
+        let inc = pass(&mut term, &mut cache, false);
+        assert!(cache.rebuilt <= 3, "filas rehechas: {}", cache.rebuilt);
+        same(&inc, &pass(&mut term, &mut GridCache::default(), true));
+
+        // La selección no está en las celdas: se rehace entera.
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(1)),
+            Side::Left,
+        );
+        sel.update(Point::new(Line(1), Column(5)), Side::Right);
+        term.selection = Some(sel);
+        let inc = pass(&mut term, &mut cache, false);
+        assert_eq!(cache.rebuilt, 10, "con la selección nueva, todas");
+        same(&inc, &pass(&mut term, &mut GridCache::default(), true));
+
+        // Sin cambios: solo la fila del cursor, y el mismo lote de antes.
+        let before = cache.batch.clone().expect("hay lote");
+        pass(&mut term, &mut cache, false);
+        assert!(cache.rebuilt <= 1, "filas rehechas: {}", cache.rebuilt);
+        let after = cache.batch.clone().expect("hay lote");
+        assert!(
+            std::sync::Arc::ptr_eq(&before, &after),
+            "el mismo lote, sin copiarlo"
+        );
+    }
 
     fn url(text: &str, at: &str) -> Option<String> {
         let chars: Vec<char> = text.chars().collect();

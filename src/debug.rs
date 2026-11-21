@@ -159,6 +159,8 @@ pub mod timing {
     pub static VERTICES: AtomicU64 = AtomicU64::new(0);
     /// Rectángulos de la rejilla con instancias (`grid.rs`), que no cuentan como vértices.
     pub static INSTANCES: AtomicU64 = AtomicU64::new(0);
+    /// Filas de la rejilla rehechas (`view::GridPass`); las demás salen de la caché.
+    pub static GRID_ROWS: AtomicU64 = AtomicU64::new(0);
 
     pub fn add(slot: &AtomicU64, d: Duration) {
         slot.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
@@ -194,11 +196,12 @@ pub fn count_frame() {
         );
         let verts = timing::take(&timing::VERTICES) / frames.max(1);
         let insts = timing::take(&timing::INSTANCES) / frames.max(1);
+        let rows = timing::take(&timing::GRID_ROWS) as f64 / frames.max(1) as f64;
         let (pass, logic) = (per(&timing::PASS), per(&timing::LOGIC));
         eprintln!(
             "cuadros/s: {frames} (presentados {shown}, saltados {skipped}, aplazados {deferred}, sin cambios {same}, espera máx. {:.1} ms) \
              ms/cuadro: pasada {pass:.2} lógica {logic:.2} interfaz {ui:.2} (rejilla {grid:.2}) teselado {tess:.2} pintor {paint:.2} \
-             vértices {verts} instancias {insts}",
+             vértices {verts} instancias {insts} filas rehechas {rows:.1}",
             wait as f64 / 1000.0
         );
     }

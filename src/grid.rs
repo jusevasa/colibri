@@ -147,9 +147,17 @@ pub struct GlyphCache {
     /// Cualquier otro texto de una celda (con sus caracteres de ancho cero): sus glifos,
     /// relativos al origen del galley.
     other: HashMap<(String, bool), Vec<Quad>>,
+    /// Sube cada vez que se tira lo guardado: las instancias hechas antes ya no valen (el
+    /// atlas se rehízo o cambió la fuente).
+    generation: u64,
 }
 
 impl GlyphCache {
+    /// Ver `generation`.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Al principio de cada rejilla, antes de usar nada: tira lo guardado si ya no vale.
     pub fn begin(&mut self, ctx: &egui::Context, font: &FontId, bold: &FontId) {
         let ppp = ctx.pixels_per_point();
@@ -162,6 +170,7 @@ impl GlyphCache {
             self.space_px = [None; 2];
             self.other.clear();
             self.key = Some(key);
+            self.generation += 1;
         }
         self.probe = Some(probe);
         self.font = Some((font.clone(), bold.clone()));
