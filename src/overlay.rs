@@ -7,7 +7,7 @@ use egui::{
     Sense, Stroke, Vec2,
 };
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum PickKind {
     Branch,
     CurrentBranch,
@@ -20,6 +20,48 @@ pub enum PickKind {
 pub struct Pick {
     pub kind: PickKind,
     pub name: String,
+}
+
+/// Lo que ofrece el selector de carpetas en `dir`: `..` (si hay carpeta superior), las
+/// carpetas y, con `files`, los archivos; cada grupo por nombre sin mirar mayúsculas.
+pub fn dir_picks(dir: &std::path::Path, files: bool) -> Vec<Pick> {
+    let mut picks = Vec::new();
+    if dir.parent().is_some() {
+        picks.push(Pick {
+            kind: PickKind::Parent,
+            name: "..".into(),
+        });
+    }
+    let mut entries: Vec<(bool, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            Some((!e.path().is_dir(), name))
+        })
+        .filter(|(file, _)| files || !file)
+        .collect();
+    entries.sort_by(|a, b| (a.0, a.1.to_lowercase()).cmp(&(b.0, b.1.to_lowercase())));
+    picks.extend(entries.into_iter().take(2000).map(|(file, name)| Pick {
+        kind: if file { PickKind::File } else { PickKind::Dir },
+        name,
+    }));
+    picks
+}
+
+/// Carpeta en la que abrir una pestaña nueva al elegir `name` en el selector de carpetas
+/// (botón de carpeta del panel de agentes). Un archivo no abre nada.
+pub fn pick_target(
+    cwd: &std::path::Path,
+    kind: PickKind,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    match kind {
+        PickKind::Dir => Some(cwd.join(name)),
+        PickKind::Parent => cwd.parent().map(|p| p.to_path_buf()),
+        _ => None,
+    }
 }
 
 /// Argumento listo para el shell: entre comillas simples si hace falta.
@@ -72,7 +114,7 @@ pub enum Overlay {
     },
 }
 
-const PREF_ROWS: [(&str, &str); 22] = [
+const PREF_ROWS: [(&str, &str); 23] = [
     ("theme", "Tema"),
     ("font", "Fuente"),
     ("font_size", "Tamaño de fuente"),
@@ -92,6 +134,7 @@ const PREF_ROWS: [(&str, &str); 22] = [
     ("editor", "Abrir archivos (⌘+clic) con"),
     ("secure_input", "Entrada segura de teclado"),
     ("show_agents", "Agentes"),
+    ("agents_side", "Lado del panel de agentes"),
     ("show_ports", "Puertos"),
     ("show_processes", "Procesos"),
     ("open_file", "Abrir config.toml en el editor…"),
@@ -296,9 +339,28 @@ impl App {
         let mut pick = pressed(ctx, Key::Enter)
             .then_some(sel)
             .filter(|_| !items.is_empty());
+        // Desde el panel de agentes, → entra en la carpeta elegida (o sube con `..`) en vez de
+        // abrir ya la pestaña: así se llega a una carpeta hermana.
+        let enter = self.w.pick_new_tab && pressed(ctx, Key::ArrowRight);
+        if enter
+            && let Some(p) = items.get(sel)
+            && let Some(dir) = self
+                .pick_dir()
+                .and_then(|base| pick_target(&base, p.kind, &p.name))
+        {
+            self.w.picks = dir_picks(&dir, false);
+            self.w.pick_base = Some(dir);
+            self.w.overlay = Overlay::Picker {
+                query: String::new(),
+                sel: 0,
+            };
+            ctx.request_repaint();
+            return;
+        }
         if preview {
+            let base = self.pick_dir();
             let path = items.get(sel).and_then(|p| {
-                let cwd = &self.w.sessions.get(self.w.active)?.cwd;
+                let cwd = base.as_ref()?;
                 Some(match p.kind {
                     PickKind::Parent => cwd.parent()?.to_path_buf(),
                     _ => cwd.join(&p.name),
@@ -343,6 +405,12 @@ impl App {
                             (query.clone(), pal.fg)
                         } else if branches {
                             ("Buscar rama…".to_string(), pal.muted)
+                        } else if self.w.pick_new_tab {
+                            (
+                                "Carpeta para la sesión nueva…  ·  → entra  ·  ↩ abre aquí"
+                                    .to_string(),
+                                pal.muted,
+                            )
                         } else {
                             (
                                 "Buscar carpeta o archivo…  ·  espacio: vista previa".to_string(),
@@ -453,7 +521,17 @@ impl App {
         if let Some(i) = pick {
             let (kind, name) = (items[i].kind, items[i].name.clone());
             self.w.overlay = Overlay::None;
-            if let Some(s) = self.w.sessions.get_mut(self.w.active) {
+            if self.w.pick_new_tab {
+                // Desde el panel de agentes: pestaña nueva en esa carpeta, sin `cd`.
+                let target = self
+                    .pick_dir()
+                    .and_then(|base| pick_target(&base, kind, &name));
+                self.w.pick_new_tab = false;
+                self.w.pick_base = None;
+                if let Some(dir) = target {
+                    self.new_tab(ctx, Some(dir));
+                }
+            } else if let Some(s) = self.w.sessions.get_mut(self.w.active) {
                 let run = match kind {
                     PickKind::CurrentBranch => None,
                     PickKind::Branch => Some(format!("git checkout {}", shell_arg(&name))),
@@ -471,6 +549,8 @@ impl App {
             }
         } else if clicked_outside(ctx, out.response.rect) {
             self.w.overlay = Overlay::None;
+            self.w.pick_new_tab = false;
+            self.w.pick_base = None;
         } else {
             self.w.overlay = Overlay::Picker { query, sel };
         }
@@ -480,6 +560,8 @@ impl App {
     /// historial devuelve lo que estaba escrito y las sugerencias, la palabra original.
     pub fn cancel_overlay(&mut self) {
         let overlay = std::mem::replace(&mut self.w.overlay, Overlay::None);
+        self.w.pick_new_tab = false;
+        self.w.pick_base = None;
         let Some(s) = self.w.sessions.get_mut(self.w.active) else {
             return;
         };
@@ -1140,6 +1222,8 @@ impl App {
             "editor" => (c.editor.clone(), None),
             "secure_input" => (String::new(), Some(c.secure_input)),
             "show_agents" => (String::new(), Some(c.show_agents)),
+            "agents_side" if c.agents_on_right() => ("Derecha".to_string(), None),
+            "agents_side" => ("Izquierda".to_string(), None),
             "show_ports" => (String::new(), Some(c.show_ports)),
             "show_processes" => (String::new(), Some(c.show_processes)),
             _ => (String::new(), None),
@@ -1211,6 +1295,14 @@ impl App {
             }
             "secure_input" => c.secure_input = !c.secure_input,
             "show_agents" => c.show_agents = !c.show_agents,
+            "agents_side" => {
+                c.agents_side = if c.agents_on_right() {
+                    "izquierda"
+                } else {
+                    "derecha"
+                }
+                .into()
+            }
             "show_ports" => c.show_ports = !c.show_ports,
             "show_processes" => c.show_processes = !c.show_processes,
             "open_file" => {
@@ -1394,6 +1486,7 @@ impl App {
                 "show_agents" | "show_ports" | "show_processes" => {
                     "Qué apartados aparecen abiertos al iniciar Colibrí."
                 }
+                "agents_side" => "Puertos y Procesos van en el lado contrario.",
                 _ => "Los cambios se guardan al momento.",
             };
             p.text(
@@ -1490,5 +1583,50 @@ impl App {
         } else {
             self.w.overlay = Overlay::Rename { text };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn carpeta_elegida_para_pestana_nueva() {
+        let cwd = Path::new("/p/colibri");
+        assert_eq!(
+            pick_target(cwd, PickKind::Dir, "src"),
+            Some(PathBuf::from("/p/colibri/src"))
+        );
+        assert_eq!(
+            pick_target(cwd, PickKind::Parent, ".."),
+            Some(PathBuf::from("/p"))
+        );
+        assert_eq!(pick_target(cwd, PickKind::File, "a.rs"), None);
+    }
+
+    #[test]
+    fn lista_de_una_carpeta() {
+        let dir = std::env::temp_dir().join(format!("colibri-picks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Beta")).unwrap();
+        std::fs::create_dir_all(dir.join("alfa")).unwrap();
+        std::fs::write(dir.join("nota.txt"), "").unwrap();
+        let names = |picks: Vec<Pick>| -> Vec<(PickKind, String)> {
+            picks.into_iter().map(|p| (p.kind, p.name)).collect()
+        };
+        // `..` primero, carpetas por nombre sin mirar mayúsculas y luego archivos.
+        assert_eq!(
+            names(dir_picks(&dir, true)),
+            vec![
+                (PickKind::Parent, "..".to_string()),
+                (PickKind::Dir, "alfa".to_string()),
+                (PickKind::Dir, "Beta".to_string()),
+                (PickKind::File, "nota.txt".to_string()),
+            ]
+        );
+        // Para una pestaña nueva, solo carpetas.
+        assert_eq!(names(dir_picks(&dir, false)).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -46,6 +46,9 @@ pub struct Config {
     pub secure_input: bool,
     /// Qué apartados del panel lateral están visibles al abrir.
     pub show_agents: bool,
+    /// Lado del panel de agentes: `"izquierda"` (por defecto) o `"derecha"`. Puertos y
+    /// Procesos van en el contrario.
+    pub agents_side: String,
     pub show_ports: bool,
     pub show_processes: bool,
     pub theme: Theme,
@@ -134,12 +137,20 @@ impl Default for Config {
             shell_integration: true,
             editor: String::new(),
             secure_input: false,
-            show_agents: false,
+            show_agents: true,
+            agents_side: "izquierda".into(),
             show_ports: false,
             show_processes: false,
             theme: Theme::default(),
             keys: Keys::default(),
         }
+    }
+}
+
+impl Config {
+    /// El panel de agentes va a la derecha (cualquier otro valor: a la izquierda).
+    pub fn agents_on_right(&self) -> bool {
+        matches!(self.agents_side.trim(), "derecha" | "right")
     }
 }
 

@@ -1,6 +1,7 @@
 //! Colibrí — una terminal rápida para correr varios agentes.
 //! Sin telemetría: la app no abre ninguna conexión de red propia.
 
+mod agents;
 mod blur;
 mod claude;
 mod clip;
@@ -38,8 +39,6 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 const TAB_BAR_H: f32 = 38.0;
-/// Radio de las esquinas de las pestañas.
-const TAB_RADIUS: f32 = 7.0;
 /// Colores que se le pueden poner a una pestaña desde su menú (clic derecho).
 /// El nombre es el que se guarda en `session.toml`.
 const TAB_COLORS: [(&str, Color32); 7] = [
@@ -215,6 +214,11 @@ struct App {
     order: Vec<WindowId>,
     next_id: u64,
     show_agents: bool,
+    /// Filtro y texto del buscador del panel de agentes (compartidos por las ventanas).
+    agents_filter: agents::Filter,
+    agents_query: String,
+    /// Agentes que se pueden lanzar desde el panel (`None` hasta que el hilo responda).
+    installed: Arc<std::sync::Mutex<Option<Vec<session::Agent>>>>,
     show_ports: bool,
     show_procs: bool,
     monitor: procs::Monitor,
@@ -264,6 +268,8 @@ pub struct Win {
     /// Radio de desenfoque aplicado a la ventana, si ya se aplicó alguno.
     blur_applied: Option<i64>,
     search_focus: bool,
+    /// El buscador del panel de agentes tiene el teclado (la terminal no lo recibe).
+    agents_search_focus: bool,
     overlay: overlay::Overlay,
     /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
     drag_tab: Option<(u64, f32)>,
@@ -276,6 +282,12 @@ pub struct Win {
     /// y dónde se ancla en pantalla.
     picks: Vec<overlay::Pick>,
     pick_anchor: Pos2,
+    /// El selector de carpetas se abrió desde el panel de agentes: elegir una abre una
+    /// pestaña nueva en ella en vez de hacer `cd`.
+    pick_new_tab: bool,
+    /// Carpeta que lista ese selector (se puede entrar en otras con →); `None` = la de la
+    /// pestaña activa.
+    pick_base: Option<PathBuf>,
     /// Rama y cambios de la carpeta de la pestaña activa (barra de estado).
     git: git::Watch,
     /// Vista previa (Quick Look) abierta desde el desplegable de carpetas.
@@ -354,12 +366,15 @@ impl Win {
             focused: true,
             blur_applied: None,
             search_focus: false,
+            agents_search_focus: false,
             overlay: overlay::Overlay::None,
             drag_tab: None,
             tab_layout: (0.0, 0.0),
             history: Vec::new(),
             picks: Vec::new(),
             pick_anchor: Pos2::ZERO,
+            pick_new_tab: false,
+            pick_base: None,
             git: git::Watch::new(),
             preview: None,
             window_movable: None,
@@ -394,6 +409,9 @@ impl App {
             order: Vec::new(),
             next_id: 1,
             show_agents: cfg.show_agents,
+            agents_filter: Default::default(),
+            agents_query: String::new(),
+            installed: agents::find_installed(&cfg.shell),
             show_ports: cfg.show_ports,
             show_procs: cfg.show_processes,
             monitor: procs::Monitor::start(),
@@ -804,6 +822,24 @@ impl App {
         }
     }
 
+    /// Selector de carpetas en modo «pestaña nueva» (botón de carpeta del panel de
+    /// agentes): solo `..` y las carpetas, empezando por la de la pestaña activa.
+    fn open_dir_picker(&mut self, ctx: &egui::Context, at: Pos2) {
+        self.open_picker(ctx, session::CHIP_DIR, at);
+        if self.w.overlay != overlay::Overlay::None {
+            self.w.picks.retain(|p| p.kind != overlay::PickKind::File);
+            self.w.pick_new_tab = true;
+        }
+    }
+
+    /// La carpeta que lista el selector de carpetas.
+    fn pick_dir(&self) -> Option<PathBuf> {
+        self.w
+            .pick_base
+            .clone()
+            .or_else(|| self.w.sessions.get(self.w.active).map(|s| s.cwd.clone()))
+    }
+
     /// Abre el desplegable de una caja del prompt, anclado en `at`: las ramas del repo
     /// (caja de la rama) o lo que hay en la carpeta (caja de la carpeta).
     fn open_picker(&mut self, ctx: &egui::Context, chip: char, at: Pos2) {
@@ -811,6 +847,8 @@ impl App {
         let Some(cwd) = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone()) else {
             return;
         };
+        self.w.pick_new_tab = false;
+        self.w.pick_base = None;
         let mut picks: Vec<Pick> = Vec::new();
         if chip == session::CHIP_BRANCH {
             let current = git::branch(&cwd);
@@ -825,27 +863,7 @@ impl App {
             // La rama en la que estás va primero.
             picks.sort_by_key(|p| p.kind != PickKind::CurrentBranch);
         } else {
-            if cwd.parent().is_some() {
-                picks.push(Pick {
-                    kind: PickKind::Parent,
-                    name: "..".into(),
-                });
-            }
-            let mut entries: Vec<(bool, String)> = std::fs::read_dir(&cwd)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| {
-                    let name = e.file_name().into_string().ok()?;
-                    Some((!e.path().is_dir(), name))
-                })
-                .collect();
-            // Carpetas primero, luego archivos; cada grupo por nombre.
-            entries.sort_by(|a, b| (a.0, a.1.to_lowercase()).cmp(&(b.0, b.1.to_lowercase())));
-            picks.extend(entries.into_iter().take(2000).map(|(file, name)| Pick {
-                kind: if file { PickKind::File } else { PickKind::Dir },
-                name,
-            }));
+            picks = overlay::dir_picks(&cwd, true);
         }
         if picks.is_empty() {
             return;
@@ -1374,6 +1392,25 @@ impl App {
                 ctx.request_screenshot(move |image| debug::save_bmp(&path, &image))
             }
             Some(debug::Step::Procs) => self.show_procs = !self.show_procs,
+            Some(debug::Step::Agents(what)) => {
+                let (kind, arg) = what.split_once(' ').unwrap_or((what.as_str(), ""));
+                match kind {
+                    "filter" => {
+                        self.agents_filter = match arg {
+                            "waiting" => agents::Filter::Waiting,
+                            "working" => agents::Filter::Working,
+                            _ => agents::Filter::All,
+                        }
+                    }
+                    "search" => self.agents_query = arg.to_string(),
+                    // Da el teclado al buscador, como un clic en él (el clic simulado falla
+                    // si el puntero de verdad se mueve sobre la ventana).
+                    "focus" => ctx.memory_mut(|m| m.request_focus(agents::search_id())),
+                    // Lo mismo que el botón de carpeta del panel.
+                    "folder" => self.open_dir_picker(ctx, Pos2::new(220.0, 76.0)),
+                    _ => eprintln!("guion: agents {what}?"),
+                }
+            }
             Some(debug::Step::Ports) => self.show_ports = !self.show_ports,
             Some(debug::Step::Hover) => self.force_hover = !self.force_hover,
             Some(debug::Step::KillPort(port)) => {
@@ -1559,8 +1596,22 @@ impl App {
         let full = ui.max_rect();
         let n = self.w.sessions.len().max(1);
         let show_update = self.update_ready || self.force_update;
-        let right_reserved = if show_update { 252.0 } else { 158.0 };
-        let avail = tabs_avail(full, right_reserved, self.w.term_rect);
+        let right_reserved = if show_update { 216.0 } else { 122.0 };
+        // Puertos/Procesos a la izquierda (agentes a la derecha) van bajo la barra: las
+        // pestañas empiezan donde acaba ese panel (el del cuadro anterior), o la primera,
+        // siendo la activa, se «uniría» a él en vez de a la terminal.
+        let term = self.w.term_rect;
+        let side_left = if self.cfg.agents_on_right()
+            && (self.show_ports || self.show_procs)
+            && term.is_positive()
+        {
+            term.left() - full.left()
+        } else {
+            0.0
+        };
+        let left_reserved =
+            tabs_left_reserved(self.show_agents, self.cfg.agents_on_right(), side_left);
+        let avail = tabs_avail(full, right_reserved, self.w.term_rect, left_reserved);
         let tab_w = (avail / n as f32).clamp(64.0, 230.0);
         let ui_font = FontId::proportional(12.5);
         let opacity = self.cfg.opacity.clamp(0.3, 1.0);
@@ -1575,7 +1626,7 @@ impl App {
         let mut moved = None;
         let mut grabbed = None;
         let mut recolor = None;
-        let tabs_left = full.left() + TRAFFIC_LIGHTS_W;
+        let tabs_left = full.left() + left_reserved;
         let pointer_x = ui.input(|i| i.pointer.latest_pos().map(|p| p.x));
         if !ui.input(|i| i.pointer.primary_down()) {
             self.w.drag_tab = None;
@@ -1601,7 +1652,7 @@ impl App {
             };
             Rect::from_min_max(
                 Pos2::new(left, full.top()),
-                Pos2::new(left + tab_w - 4.0, full.bottom()),
+                Pos2::new(left + tab_w, full.bottom()),
             )
         });
         let mut x = tabs_left;
@@ -1613,9 +1664,10 @@ impl App {
             } else {
                 ctx.animate_value_with_time(slide_id, x, slide)
             };
+            // Rectas, de toda la altura de la barra y pegadas unas a otras.
             let mut rect = Rect::from_min_size(
-                Pos2::new(shown_x, full.top() + 5.0),
-                Vec2::new(tab_w - 4.0, TAB_BAR_H - 9.0),
+                Pos2::new(shown_x, full.top()),
+                Vec2::new(tab_w, full.height()),
             );
             let slot_x = x;
             x += tab_w;
@@ -1635,14 +1687,8 @@ impl App {
                 _ => false,
             };
             let active = i == self.w.active;
-            // La activa baja hasta el borde de la barra: toda ella responde al ratón.
-            let hit = if active {
-                rect.with_max_y(full.bottom())
-            } else {
-                rect
-            };
             let resp = ui.interact(
-                hit,
+                rect,
                 ui.scope_id().with(("tab", s.id)),
                 Sense::click_and_drag(),
             );
@@ -1671,54 +1717,46 @@ impl App {
                 .and_then(|k| TAB_COLORS.get(k as usize))
                 .map(|c| c.1);
             if active {
-                // Unida a la terminal: baja hasta el borde de la barra con su mismo fondo y
-                // sin contorno por abajo. El color de la pestaña va en una raya arriba (en el
-                // relleno rompería la unión).
-                let body = rect.with_max_y(full.bottom());
-                active_body = Some(body);
-                let top_only = CornerRadius {
-                    nw: TAB_RADIUS as u8,
-                    ne: TAB_RADIUS as u8,
-                    sw: 0,
-                    se: 0,
-                };
-                p.rect_filled(body, top_only, fade(pal.bg, opacity));
-                p.add(egui::Shape::line(
-                    tab_outline(body, TAB_RADIUS),
-                    Stroke::new(1.0, pal.border),
-                ));
-                if let Some(c) = tint {
-                    let y = body.top() + 1.5;
+                // Unida a la terminal: su mismo fondo y sin línea por abajo; rayas finas a
+                // los lados. El color de la pestaña va en una raya arriba (en el relleno
+                // rompería la unión).
+                active_body = Some(rect);
+                p.rect_filled(rect, 0.0, fade(pal.bg, opacity));
+                for x in [rect.left() + 0.5, rect.right() - 0.5] {
                     p.line_segment(
-                        [
-                            Pos2::new(body.left() + TAB_RADIUS, y),
-                            Pos2::new(body.right() - TAB_RADIUS, y),
-                        ],
+                        [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                        Stroke::new(1.0, pal.border),
+                    );
+                }
+                if let Some(c) = tint {
+                    let y = rect.top() + 1.0;
+                    p.line_segment(
+                        [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
                         Stroke::new(2.0, c),
                     );
                 }
-            } else if let Some(c) = tint {
-                let strength = if hovered { 0.36 } else { 0.26 };
-                p.rect_filled(rect, CornerRadius::same(7), c.gamma_multiply(strength));
-                p.rect_stroke(
-                    rect,
-                    CornerRadius::same(7),
-                    Stroke::new(1.0, c.gamma_multiply(0.45)),
-                    StrokeKind::Inside,
-                );
-            } else if hovered {
-                p.rect_filled(rect, CornerRadius::same(7), pal.border);
-            }
-            // La raya de abajo es lo que deja ver el color de un vistazo.
-            if let Some(c) = tint.filter(|_| !active) {
-                let y = rect.bottom() - 2.0;
-                p.line_segment(
-                    [
-                        Pos2::new(rect.left() + 8.0, y),
-                        Pos2::new(rect.right() - 8.0, y),
-                    ],
-                    Stroke::new(2.0, c),
-                );
+            } else {
+                if let Some(c) = tint {
+                    let strength = if hovered { 0.22 } else { 0.14 };
+                    p.rect_filled(rect, 0.0, c.gamma_multiply(strength));
+                    // La raya de abajo es lo que deja ver el color de un vistazo.
+                    let y = rect.bottom() - 2.0;
+                    p.line_segment(
+                        [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                        Stroke::new(2.0, c),
+                    );
+                } else if hovered {
+                    p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.6));
+                }
+                // Separador corto a la derecha, salvo pegado a la activa.
+                if divider_after(i, self.w.active) && !dragging {
+                    let x = rect.right() - 0.5;
+                    let c = rect.center().y;
+                    p.line_segment(
+                        [Pos2::new(x, c - 8.0), Pos2::new(x, c + 8.0)],
+                        Stroke::new(1.0, pal.border),
+                    );
+                }
             }
 
             // Indicador a la izquierda: trabajando / terminó / agente en reposo.
@@ -1847,7 +1885,7 @@ impl App {
 
         ui.painter().set(
             bar_bg,
-            bar_background(full, active_body, TAB_RADIUS, fade(pal.tab_bar, opacity)),
+            bar_background(full, active_body, 0.0, fade(pal.tab_bar, opacity)),
         );
         let gap = active_body.map(|b| (b.left(), b.right()));
         for (x0, x1) in bottom_line(full.left(), full.right(), gap) {
@@ -1890,24 +1928,28 @@ impl App {
         let plus_clicked = plus_resp.clicked();
         plus_resp.on_hover_text("Nueva pestaña  ⌘T");
 
-        // Un botón por apartado; el de agentes lleva el contador de los que terminaron sin verlos.
-        let unseen = self.w.sessions.iter().filter(|s| s.unseen).count();
+        // Panel de agentes oculto: el botón que lo muestra va tras los semáforos.
+        if !self.show_agents {
+            let c = Pos2::new(
+                full.left() + TRAFFIC_LIGHTS_W + agents::TOGGLE_W / 2.0,
+                full.center().y,
+            );
+            self.toggle_button(ui, c);
+        }
+
+        // Un botón por apartado.
         let cy = full.center().y;
         let ports_btn =
             Rect::from_center_size(Pos2::new(full.right() - 26.0, cy), Vec2::new(30.0, 24.0));
-        let agents_btn =
-            Rect::from_center_size(Pos2::new(full.right() - 62.0, cy), Vec2::new(30.0, 24.0));
         let procs_btn =
-            Rect::from_center_size(Pos2::new(full.right() - 98.0, cy), Vec2::new(30.0, 24.0));
+            Rect::from_center_size(Pos2::new(full.right() - 62.0, cy), Vec2::new(30.0, 24.0));
         let toggle = procs_btn;
         for (rect, section, hint) in [
             (procs_btn, Section::Processes, "Procesos  ⌘⇧M"),
-            (agents_btn, Section::Agents, "Agentes  ⌘⇧A"),
             (ports_btn, Section::Ports, "Puertos  ⌘⇧P"),
         ] {
             let resp = ui.interact(rect, ui.scope_id().with(("section", hint)), Sense::click());
             let on = match section {
-                Section::Agents => self.show_agents,
                 Section::Ports => self.show_ports,
                 Section::Processes => self.show_procs,
             };
@@ -1925,24 +1967,11 @@ impl App {
             );
             if resp.clicked() {
                 match section {
-                    Section::Agents => self.show_agents = !on,
                     Section::Ports => self.show_ports = !on,
                     Section::Processes => self.show_procs = !on,
                 }
             }
             resp.on_hover_text(hint);
-        }
-        if unseen > 0 {
-            let c = Pos2::new(toggle.left() - 12.0, cy);
-            let p = ui.painter();
-            p.circle_filled(c, 8.0, pal.done);
-            p.text(
-                c,
-                Align2::CENTER_CENTER,
-                unseen.to_string(),
-                FontId::proportional(10.5),
-                Color32::BLACK,
-            );
         }
 
         // Compilación nueva en disco: un clic reinicia y la toma.
@@ -2042,109 +2071,7 @@ impl App {
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let pal = self.pal.clone();
-        let title_font = FontId::proportional(13.0);
         let small = FontId::proportional(11.5);
-        let mut select = None;
-
-        if self.show_agents {
-            if section_header(
-                ui,
-                &pal,
-                Section::Agents,
-                "Agentes",
-                "⌥⌘↑↓ recorre · ⌘J terminó",
-                0.0,
-            ) {
-                self.show_agents = false;
-            }
-            let agents: Vec<usize> = (0..self.w.sessions.len())
-                .filter(|&i| self.w.sessions[i].agent.is_some())
-                .collect();
-            if agents.is_empty() {
-                hint(
-                    ui,
-                    &pal,
-                    "Sin agentes. Abre claude, codex, gemini… en una pestaña.",
-                );
-            }
-            for i in agents {
-                let s = &self.w.sessions[i];
-                let agent = s.agent.unwrap();
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 62.0), Sense::click());
-                let p = ui.painter();
-                if i == self.w.active {
-                    p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.7));
-                } else if resp.hovered() {
-                    p.rect_filled(rect, 0.0, pal.border.gamma_multiply(0.4));
-                }
-                if let Some((_, c)) = s.color.and_then(|k| TAB_COLORS.get(k as usize)) {
-                    let bar = Rect::from_min_max(
-                        rect.left_top(),
-                        Pos2::new(rect.left() + 3.0, rect.bottom()),
-                    );
-                    p.rect_filled(bar, 0.0, *c);
-                }
-                let left = rect.left() + 14.0;
-                let icon = Pos2::new(left + 6.0, rect.top() + 18.0);
-                let surface = pal.panel;
-                if s.busy {
-                    badged_icon(p, icon, 6.5, agent, Badge::Working(pal.fg), surface);
-                } else if s.unseen {
-                    badged_icon(p, icon, 6.5, agent, Badge::Done(pal.done), surface);
-                } else {
-                    agent_icon(p, icon, 6.5, agent);
-                }
-                let tx = left + 22.0;
-                let max_w = rect.right() - tx - 64.0;
-                let name = elided(ui.ctx(), &s.project(), &title_font, pal.fg, max_w);
-                p.galley(Pos2::new(tx, rect.top() + 9.0), name, pal.fg);
-                let desc = if s.clean_title().is_empty() {
-                    agent.label()
-                } else {
-                    s.clean_title()
-                };
-                let desc = elided(ui.ctx(), desc, &small, pal.muted, rect.right() - tx - 12.0);
-                p.galley(Pos2::new(tx, rect.top() + 26.0), desc, pal.muted);
-
-                let dot = Pos2::new(tx + 4.0, rect.top() + 49.0);
-                // Trabajando: los puntos ya giran en el icono de arriba; aquí basta el texto.
-                let (label, color) = if s.busy {
-                    ("Trabajando…".to_string(), pal.fg)
-                } else if s.unseen {
-                    p.circle_filled(dot, 3.5, pal.done);
-                    ("Terminó".to_string(), pal.done)
-                } else {
-                    p.circle_filled(dot, 3.0, pal.muted.gamma_multiply(0.6));
-                    ("Esperando tu mensaje".to_string(), pal.muted)
-                };
-                p.text(
-                    Pos2::new(if s.busy { tx } else { tx + 14.0 }, dot.y),
-                    Align2::LEFT_CENTER,
-                    label,
-                    small.clone(),
-                    color,
-                );
-                if let Some(t) = s.finished_at.filter(|_| !s.busy) {
-                    p.text(
-                        Pos2::new(rect.right() - 12.0, rect.top() + 16.0),
-                        Align2::RIGHT_CENTER,
-                        ago(t.elapsed()),
-                        small.clone(),
-                        pal.muted,
-                    );
-                }
-                p.line_segment(
-                    [rect.left_bottom(), rect.right_bottom()],
-                    Stroke::new(1.0, pal.border),
-                );
-                if resp.clicked() {
-                    select = Some(i);
-                }
-                resp.on_hover_text(proc::pretty_path(&s.cwd));
-            }
-            ui.add_space(14.0);
-        }
 
         if self.show_ports {
             let ports = self.ports.list.lock().unwrap().clone();
@@ -2221,10 +2148,6 @@ impl App {
             .is_some_and(|(_, t)| t.elapsed() > CONFIRM_WINDOW)
         {
             self.confirm_stop = None;
-        }
-
-        if let Some(i) = select {
-            self.select(i);
         }
     }
 }
@@ -2682,6 +2605,22 @@ impl shell::App for App {
                         repeat: false,
                         modifiers,
                     });
+                    // Una letra o cifra sin ⌘ ni ⌃ trae también su texto, como el teclado
+                    // de verdad (para probar a quién llega lo que se escribe).
+                    let name = key.name();
+                    if pressed
+                        && !modifiers.command
+                        && !modifiers.ctrl
+                        && name.chars().count() == 1
+                        && name.chars().all(|c| c.is_ascii_alphanumeric())
+                    {
+                        let text = if modifiers.shift {
+                            name.to_string()
+                        } else {
+                            name.to_lowercase()
+                        };
+                        raw.events.push(egui::Event::Text(text));
+                    }
                 }
             }
         }
@@ -2713,6 +2652,14 @@ impl shell::App for App {
         }
         self.check_update(ctx);
 
+        let panel_marks = |sessions: &[Session]| {
+            agents::marks(
+                sessions
+                    .iter()
+                    .map(|s| (s.id, s.agent, s.busy, s.unseen, s.clean_title())),
+            )
+        };
+        let listed = self.show_agents.then(|| panel_marks(&self.w.sessions));
         let mut notes = Vec::new();
         for (i, s) in self.w.sessions.iter_mut().enumerate() {
             s.drain(ctx, &self.pal);
@@ -2727,6 +2674,16 @@ impl shell::App for App {
                     format!("{} — clic o ⌘J para ir", s.project()),
                     s.id,
                 ));
+            }
+        }
+        // El panel de agentes de las otras ventanas enseña estas pestañas: si algo de lo
+        // que muestra cambió, que repinten una vez (si no, se quedaba viejo hasta mover el
+        // ratón sobre ellas).
+        if let Some(before) = listed
+            && before != panel_marks(&self.w.sessions)
+        {
+            for w in self.parked.values() {
+                w.ctx.request_repaint();
             }
         }
         if !notes.is_empty() {
@@ -2887,6 +2844,22 @@ impl shell::App for App {
         if self.w.blur_applied != Some(radius) && blur::set(radius) {
             self.w.blur_applied = Some(radius);
         }
+        // El panel de agentes se declara antes que la barra de pestañas: así ocupa toda la
+        // altura de la ventana y la barra empieza donde él acaba.
+        let agents_right = self.cfg.agents_on_right();
+        if self.show_agents {
+            let panel = if agents_right {
+                egui::Panel::right("agents")
+            } else {
+                egui::Panel::left("agents")
+            };
+            panel
+                .default_size(260.0)
+                .size_range(220.0..=420.0)
+                .resizable(true)
+                .frame(egui::Frame::new().fill(pal.panel))
+                .show(ui, |ui| self.agents_panel(ui));
+        }
         egui::Panel::top("tabs")
             .exact_size(TAB_BAR_H)
             .show_separator_line(false)
@@ -2897,8 +2870,14 @@ impl shell::App for App {
         if !self.show_procs {
             self.w.search_focus = false;
         }
-        if self.show_agents || self.show_ports || self.show_procs {
-            egui::Panel::right("side")
+        if self.show_ports || self.show_procs {
+            // Puertos y Procesos, bajo la barra, en el lado contrario al de los agentes.
+            let panel = if agents_right {
+                egui::Panel::left("side")
+            } else {
+                egui::Panel::right("side")
+            };
+            panel
                 .default_size(300.0)
                 .size_range(220.0..=520.0)
                 .resizable(true)
@@ -2915,13 +2894,17 @@ impl shell::App for App {
 
         let metrics = self.metrics(&ctx);
         let focused = self.w.focused;
-        if !self.w.search_focus && self.w.overlay == overlay::Overlay::None {
+        if !self.show_agents {
+            self.w.agents_search_focus = false;
+        }
+        let typing = self.w.search_focus || self.w.agents_search_focus;
+        if !typing && self.w.overlay == overlay::Overlay::None {
             self.suggest_key(&ctx);
             self.history_key(&ctx);
             self.complete_key(&ctx);
         }
         // Con las sugerencias abiertas se sigue escribiendo en el shell: la lista se filtra.
-        let keyboard = !self.w.search_focus
+        let keyboard = !typing
             && matches!(
                 self.w.overlay,
                 overlay::Overlay::None | overlay::Overlay::Complete { .. }
@@ -2989,8 +2972,15 @@ impl shell::App for App {
         // Con un agente trabajando, sus puntos giran (~15 cuadros/s); si solo trabaja otra cosa,
         // la luna avanza a saltos con un refresco pausado. `ui()` no corre con la ventana
         // minimizada, así que una ventana que no se ve no pide nada.
+        // El panel de agentes enseña también los de las otras ventanas: sus puntos giran aquí.
         let sessions = &self.w.sessions;
-        let agent_busy = sessions.iter().any(|s| s.busy && s.agent.is_some());
+        let elsewhere = self.show_agents
+            && self
+                .parked
+                .values()
+                .flat_map(|w| w.sessions.iter())
+                .any(|s| s.busy && s.agent.is_some());
+        let agent_busy = elsewhere || sessions.iter().any(|s| s.busy && s.agent.is_some());
         if let Some(t) = tick_for(agent_busy, sessions.iter().any(|s| s.busy)) {
             ctx.request_repaint_after(t);
         }
@@ -3211,15 +3201,29 @@ pub fn file_icon(p: &egui::Painter, c: Pos2, is_dir: bool, color: Color32) {
     }
 }
 
-/// Ancho para las pestañas: desde los semáforos hasta lo reservado a la derecha y, con el
+/// Ancho para las pestañas: desde lo reservado a la izquierda (semáforos y botón del panel
+/// de agentes, o nada si ese panel está a la izquierda) hasta lo reservado a la derecha y, con el
 /// panel lateral abierto, hasta donde acaba la terminal (la del cuadro anterior). Si no, la
 /// última pestaña quedaba encima del panel y, siendo la activa, se «unía» a él.
-fn tabs_avail(full: Rect, right_reserved: f32, term: Rect) -> f32 {
+fn tabs_avail(full: Rect, right_reserved: f32, term: Rect, left_reserved: f32) -> f32 {
     let mut right = full.right() - right_reserved;
     if term.is_positive() {
         right = right.min(term.right());
     }
-    right - full.left() - TRAFFIC_LIGHTS_W - 34.0
+    right - full.left() - left_reserved - 34.0
+}
+
+/// Lo reservado a la izquierda de las pestañas: nada con el panel de agentes a la izquierda
+/// (los semáforos van en él); los semáforos con él a la derecha; semáforos y el botón que lo
+/// muestra si está oculto. Nunca menos que lo que ocupe Puertos/Procesos a la izquierda
+/// (`side_left`).
+fn tabs_left_reserved(show_agents: bool, agents_right: bool, side_left: f32) -> f32 {
+    let base = match (show_agents, agents_right) {
+        (true, false) => 0.0,
+        (true, true) => TRAFFIC_LIGHTS_W,
+        (false, _) => TRAFFIC_LIGHTS_W + agents::TOGGLE_W,
+    };
+    base.max(side_left)
 }
 
 /// Lo que queda a la vista de `rect` con `cover` encima (solo cuenta en horizontal: todas
@@ -3240,23 +3244,10 @@ fn uncovered(rect: Rect, cover: Option<Rect>) -> Rect {
     }
 }
 
-/// Contorno de la pestaña activa: lados y arriba, con las esquinas superiores redondeadas;
-/// abierto por abajo, donde se une a la terminal.
-fn tab_outline(body: Rect, r: f32) -> Vec<Pos2> {
-    let (l, rt) = (body.left() + 0.5, body.right() - 0.5);
-    let (top, bottom) = (body.top() + 0.5, body.bottom());
-    let r = r.min(body.width() / 2.0);
-    let mut pts = vec![Pos2::new(l, bottom)];
-    let arc = |center: Pos2, from: f32, pts: &mut Vec<Pos2>| {
-        for k in 0..=8 {
-            let a = (from + 90.0 * k as f32 / 8.0).to_radians();
-            pts.push(center + Vec2::new(a.cos(), a.sin()) * r);
-        }
-    };
-    arc(Pos2::new(l + r, top + r), 180.0, &mut pts);
-    arc(Pos2::new(rt - r, top + r), 270.0, &mut pts);
-    pts.push(Pos2::new(rt, bottom));
-    pts
+/// Si va un separador a la derecha de la pestaña `i`: entre inactivas, no pegado a la
+/// activa (`active`), que ya se distingue por su fondo.
+fn divider_after(i: usize, active: usize) -> bool {
+    i != active && i + 1 != active
 }
 
 /// Tramos de la línea inferior de la barra de pestañas, sin el hueco de la activa (que se
@@ -3290,8 +3281,11 @@ fn bar_background(full: Rect, tab: Option<Rect>, r: f32, color: Color32) -> egui
     rect(full.min, Pos2::new(l, full.bottom()));
     rect(Pos2::new(rr, full.top()), full.max);
     rect(Pos2::new(l, full.top()), Pos2::new(rr, t.top()));
-    // Esquinas: abanico desde el vértice del rectángulo hasta el arco.
+    // Esquinas redondeadas (r > 0): abanico desde el vértice del rectángulo hasta el arco.
     let r = r.min(t.width() / 2.0).min(t.height());
+    if r <= 0.0 {
+        return m;
+    }
     let corners = [
         (
             Pos2::new(t.left(), t.top()),
@@ -3624,7 +3618,6 @@ fn tab_tooltip(ui: &mut egui::Ui, s: &Session, pal: &Palette) {
 
 #[derive(Clone, Copy)]
 enum Section {
-    Agents,
     Ports,
     Processes,
 }
@@ -3632,18 +3625,6 @@ enum Section {
 fn section_icon(p: &egui::Painter, c: Pos2, section: Section, color: Color32) {
     let stroke = Stroke::new(1.3, color);
     match section {
-        Section::Agents => {
-            // Robot: cabeza, ojos y antena.
-            let head = Rect::from_center_size(c + Vec2::new(0.0, 1.5), Vec2::new(14.0, 10.0));
-            p.rect_stroke(head, CornerRadius::same(3), stroke, StrokeKind::Inside);
-            p.circle_filled(head.center() + Vec2::new(-3.0, 0.0), 1.3, color);
-            p.circle_filled(head.center() + Vec2::new(3.0, 0.0), 1.3, color);
-            p.line_segment(
-                [Pos2::new(c.x, head.top()), Pos2::new(c.x, head.top() - 3.0)],
-                stroke,
-            );
-            p.circle_filled(Pos2::new(c.x, head.top() - 3.5), 1.2, color);
-        }
         Section::Processes => {
             // Pulso.
             let x = [-7.0, -3.5, -1.5, 1.5, 3.5, 7.0];
@@ -3942,17 +3923,56 @@ mod tests {
     #[test]
     fn pestanas_no_pasan_sobre_el_panel() {
         let full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1180.0, 38.0));
+        let lights = TRAFFIC_LIGHTS_W;
         // Sin panel (la terminal llega al borde) manda lo reservado a la derecha.
         let term = Rect::from_min_max(Pos2::new(0.0, 38.0), Pos2::new(1180.0, 760.0));
-        assert_eq!(tabs_avail(full, 158.0, term), 1180.0 - 78.0 - 158.0 - 34.0);
+        assert_eq!(
+            tabs_avail(full, 122.0, term, lights),
+            1180.0 - 78.0 - 122.0 - 34.0
+        );
         // Con panel, las pestañas (y el «+») acaban donde acaba la terminal.
         let term = Rect::from_min_max(Pos2::new(0.0, 38.0), Pos2::new(880.0, 760.0));
-        assert_eq!(tabs_avail(full, 158.0, term), 880.0 - 78.0 - 34.0);
+        assert_eq!(tabs_avail(full, 122.0, term, lights), 880.0 - 78.0 - 34.0);
         // Primer cuadro, sin terminal medida aún.
         assert_eq!(
-            tabs_avail(full, 158.0, Rect::NOTHING),
-            1180.0 - 78.0 - 158.0 - 34.0
+            tabs_avail(full, 122.0, Rect::NOTHING, lights),
+            1180.0 - 78.0 - 122.0 - 34.0
         );
+        // Panel de agentes a la izquierda: los semáforos van en él y la barra no los reserva.
+        assert_eq!(tabs_avail(full, 122.0, term, 0.0), term.right() - 34.0);
+        let bar = Rect::from_min_max(Pos2::new(260.0, 0.0), Pos2::new(1180.0, 38.0));
+        let term = Rect::from_min_max(Pos2::new(260.0, 38.0), Pos2::new(1180.0, 760.0));
+        assert_eq!(
+            tabs_avail(bar, 122.0, term, 0.0),
+            1180.0 - 260.0 - 122.0 - 34.0
+        );
+    }
+
+    #[test]
+    fn hueco_a_la_izquierda_de_las_pestanas() {
+        let lights = TRAFFIC_LIGHTS_W;
+        let toggle = agents::TOGGLE_W;
+        // Panel de agentes a la izquierda: los semáforos van en él.
+        assert_eq!(tabs_left_reserved(true, false, 0.0), 0.0);
+        // A la derecha: semáforos en la barra; con Puertos/Procesos a la izquierda (300 pt
+        // bajo la barra), las pestañas empiezan donde acaba ese panel.
+        assert_eq!(tabs_left_reserved(true, true, 0.0), lights);
+        assert_eq!(tabs_left_reserved(true, true, 300.0), 300.0);
+        // Oculto: semáforos + el botón que lo muestra.
+        assert_eq!(tabs_left_reserved(false, false, 0.0), lights + toggle);
+    }
+
+    #[test]
+    fn separadores_entre_pestanas() {
+        // Cuatro pestañas, la activa es la 1: no hay raya pegada a ella (ni a su izquierda,
+        // tras la 0, ni a su derecha); sí tras la 2 y tras la última.
+        assert!(!divider_after(0, 1));
+        assert!(!divider_after(1, 1));
+        assert!(divider_after(2, 1));
+        assert!(divider_after(3, 1));
+        // Activa la primera: la raya empieza tras la segunda.
+        assert!(!divider_after(0, 0));
+        assert!(divider_after(1, 0));
     }
 
     #[test]

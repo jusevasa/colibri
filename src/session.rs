@@ -554,7 +554,7 @@ impl Dimensions for TermSize {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Agent {
     Claude,
     Codex,
@@ -619,6 +619,35 @@ impl Agent {
     }
 }
 
+/// Qué hacer con la orden pendiente de una pestaña nueva (`Session::run_when_ready`).
+#[derive(Debug, PartialEq)]
+enum PendingStep {
+    Run,
+    /// Volver a mirar dentro de tanto.
+    Wait(Duration),
+    /// Abandonarla.
+    Drop,
+}
+
+/// `age`: desde que se pidió; `typed`: tecleaste en la pestaña desde entonces; `ready`: el
+/// shell ya escribió algo y está en su prompt; `quiet`: desde la última salida. Se ejecuta
+/// tras 300 ms sin salida (el prompt ya pintado); se abandona si tecleaste (`insert_command`
+/// borraría lo tuyo) o si en 10 s no hubo prompt (no se queda sondeando ni arranca el
+/// agente mucho después, al salir de lo que hubiera encima).
+fn pending_step(age: Duration, typed: bool, ready: bool, quiet: Duration) -> PendingStep {
+    const QUIET: Duration = Duration::from_millis(300);
+    const GIVE_UP: Duration = Duration::from_secs(10);
+    if typed || age > GIVE_UP {
+        PendingStep::Drop
+    } else if !ready {
+        PendingStep::Wait(QUIET)
+    } else if quiet < QUIET {
+        PendingStep::Wait(QUIET - quiet)
+    } else {
+        PendingStep::Run
+    }
+}
+
 /// Tras salida nueva (o moverse por el historial), cuánto se espera para comprimirlo.
 const COMPACT_EVERY: Duration = Duration::from_secs(2);
 
@@ -669,6 +698,9 @@ pub struct Session {
     /// Hay algo corriendo: un agente trabajando o un comando en primer plano.
     pub busy: bool,
     busy_since: Instant,
+    /// Desde cuándo está en su estado actual (para el panel de agentes): al abrir la
+    /// pestaña, al cambiar el agente y en cada cambio de `busy`.
+    pub state_since: Instant,
     last_input: Instant,
     last_active_output: Instant,
     streak_start: Instant,
@@ -703,6 +735,12 @@ pub struct Session {
     /// un agente). No está escrito en el shell: se acepta con Tab/→ o se ejecuta con
     /// Enter; cualquier otra tecla lo descarta.
     pub suggestion: Option<String>,
+    /// Orden que se ejecutará en cuanto el shell esté en su prompt (`run_when_ready`) y
+    /// cuándo se pidió.
+    pending: Option<(String, Instant)>,
+    /// Cuándo escribió algo el programa por última vez (para saber si el shell ya pintó
+    /// su prompt y se quedó quieto).
+    last_output: Instant,
     /// Lo tecleado en el prompt desde el último Enter. None = se perdió la pista
     /// (hubo teclas de edición: flechas, tabulador…).
     line: Option<String>,
@@ -829,6 +867,7 @@ impl Session {
             claude: None,
             busy: false,
             busy_since: now,
+            state_since: now,
             last_input: old,
             last_active_output: old,
             streak_start: old,
@@ -847,6 +886,8 @@ impl Session {
             tag_cache: None,
             last_chips: None,
             suggestion: None,
+            pending: None,
+            last_output: old,
             line: Some(String::new()),
             typed: Vec::new(),
             activity: 0,
@@ -1385,6 +1426,37 @@ impl Session {
         self.line = Some(cmd.to_string());
     }
 
+    /// Ejecuta `cmd` en cuanto el shell esté listo: en su prompt, tras haberlo pintado y
+    /// sin escribir nada durante un momento. Escribir antes de que el shell arranque
+    /// descuadraba el prompt.
+    pub fn run_when_ready(&mut self, cmd: String) {
+        self.pending = Some((cmd, Instant::now()));
+    }
+
+    /// Escribe y ejecuta la orden pendiente si el shell ya está listo; si aún no, pide un
+    /// cuadro para volver a mirar.
+    fn run_pending(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some((_, queued)) = &self.pending else {
+            return;
+        };
+        let step = pending_step(
+            now.duration_since(*queued),
+            self.last_input > *queued,
+            self.activity > 0 && self.at_prompt(),
+            now.duration_since(self.last_output),
+        );
+        match step {
+            PendingStep::Wait(d) => ctx.request_repaint_after(d),
+            PendingStep::Drop => self.pending = None,
+            PendingStep::Run => {
+                if let Some((cmd, _)) = self.pending.take() {
+                    self.insert_command(&cmd);
+                    self.input(b"\r".to_vec());
+                }
+            }
+        }
+    }
+
     /// Tiempo desde la última tecla (el cursor no parpadea mientras se escribe).
     pub fn since_input(&self) -> Duration {
         self.last_input.elapsed()
@@ -1441,6 +1513,7 @@ impl Session {
             match event {
                 Event::Wakeup => {
                     self.activity += 1;
+                    self.last_output = now;
                     // Salida que no es eco de lo que tecleas = actividad real.
                     if now.duration_since(self.last_input) > Duration::from_millis(350) {
                         if now.duration_since(self.last_active_output) > Duration::from_millis(1500)
@@ -1534,6 +1607,7 @@ impl Session {
     pub fn poll(&mut self, ctx: &egui::Context, watching: bool) -> bool {
         let now = Instant::now();
         self.compact_history(ctx, now);
+        self.run_pending(ctx, now);
         let before = (self.fg_pid, self.busy);
         let mut moved = false;
         let interval = if self.dirty { 200 } else { 1000 };
@@ -1580,11 +1654,15 @@ impl Session {
                     };
                     (pid, hops) = (parent, hops + 1);
                 }
-                self.agent = if fg == self.shell_pid {
+                let agent = if fg == self.shell_pid {
                     None
                 } else {
                     Agent::detect(fg, &self.fg_name)
                 };
+                if agent != self.agent {
+                    self.state_since = now;
+                }
+                self.agent = agent;
             }
             if let Some(dir) = proc::cwd(fg).or_else(|| proc::cwd(self.shell_pid)) {
                 moved = dir != self.cwd;
@@ -1613,6 +1691,7 @@ impl Session {
         let mut notify = false;
         if busy && !self.busy {
             self.busy_since = now;
+            self.state_since = now;
             // Un «terminó» que aún no viste sobrevive a un parpadeo de actividad: si se
             // borrara aquí y la ráfaga nueva fuera corta, la pestaña quedaría marcada como
             // terminada pero sin fecha, y ⌘J no la encontraría.
@@ -1620,6 +1699,7 @@ impl Session {
                 self.finished_at = None;
             }
         } else if !busy && self.busy {
+            self.state_since = now;
             let ran = now.duration_since(self.busy_since);
             let min = if self.agent.is_some() { 2 } else { 8 };
             if ran >= Duration::from_secs(min) {
@@ -1714,6 +1794,43 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn orden_pendiente_cuando_toca() {
+        use super::{PendingStep, pending_step};
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // Shell listo y quieto 300 ms: se ejecuta.
+        assert_eq!(
+            pending_step(ms(500), false, true, ms(300)),
+            PendingStep::Run
+        );
+        // Aún pintando el prompt: espera lo que falta.
+        assert_eq!(
+            pending_step(ms(500), false, true, ms(100)),
+            PendingStep::Wait(ms(200))
+        );
+        // Sin prompt todavía (o algo corriendo encima): vuelve a mirar en 300 ms.
+        assert_eq!(
+            pending_step(ms(500), false, false, ms(900)),
+            PendingStep::Wait(ms(300))
+        );
+        // Si tecleaste en la pestaña, la orden ya no se escribe (borraría lo tuyo).
+        assert_eq!(
+            pending_step(ms(500), true, true, ms(900)),
+            PendingStep::Drop
+        );
+        // Si el shell no llega a su prompt en 10 s, se abandona: ni sondeo sin fin ni el
+        // agente arrancando mucho después, al salir de lo que hubiera encima.
+        assert_eq!(
+            pending_step(ms(10_001), false, false, ms(900)),
+            PendingStep::Drop
+        );
+        assert_eq!(
+            pending_step(ms(10_001), false, true, ms(900)),
+            PendingStep::Drop
+        );
+    }
+
     use super::*;
 
     fn chars(s: &str) -> Vec<char> {

@@ -2,6 +2,7 @@
 //! Pasos (uno por línea): `type <texto>` (\n = Enter), `wait <ms>`, `tab`, `select <n>`,
 //! `move <de> <a>`, `agent next|prev`, `name <nombre>`, `shot <ruta.bmp>`, `procs`, `ports`, `hover`, `killport <puerto>`,
 //! `open palette|prefs|history|branches|dirs`, `key up|down|enter|esc|tab|paste`,
+//! `agents filter all|waiting|working`, `agents search <texto>`, `agents focus`, `agents folder`,
 //! `press <x> <y>`, `moveto <x> <y>`, `release <x> <y>`, `rclick <x> <y>`, `pref <id> <+1|-1>`, `cmd down|up`, `drop <ruta>`, `minimize`, `update`, `quit`.
 
 use std::collections::VecDeque;
@@ -17,6 +18,9 @@ pub enum Step {
     Procs,
     /// Muestra u oculta el apartado de puertos.
     Ports,
+    /// Panel de agentes: `agents filter all|waiting|working`, `agents search <texto>` o
+    /// `agents focus` (da el teclado al buscador), `agents folder` (botón de carpeta).
+    Agents(String),
     /// Dibuja los botones de las filas como si el puntero estuviera encima.
     Hover,
     /// Detiene el proceso que escucha en ese puerto (mismo camino que el botón).
@@ -81,6 +85,7 @@ impl Script {
                     "shot" => Step::Shot(arg.to_string()),
                     "procs" => Step::Procs,
                     "ports" => Step::Ports,
+                    "agents" => Step::Agents(arg.to_string()),
                     "hover" => Step::Hover,
                     "killport" => Step::KillPort(arg.parse().ok()?),
                     "open" => Step::Open(arg.to_string()),
