@@ -37,6 +37,8 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 const TAB_BAR_H: f32 = 38.0;
+/// Radio de las esquinas de las pestañas.
+const TAB_RADIUS: f32 = 7.0;
 /// Colores que se le pueden poner a una pestaña desde su menú (clic derecho).
 /// El nombre es el que se guarda en `session.toml`.
 const TAB_COLORS: [(&str, Color32); 7] = [
@@ -1550,9 +1552,14 @@ impl App {
         let n = self.w.sessions.len().max(1);
         let show_update = self.update_ready || self.force_update;
         let right_reserved = if show_update { 252.0 } else { 158.0 };
-        let avail = full.width() - TRAFFIC_LIGHTS_W - right_reserved - 34.0;
+        let avail = tabs_avail(full, right_reserved, self.w.term_rect);
         let tab_w = (avail / n as f32).clamp(64.0, 230.0);
         let ui_font = FontId::proportional(12.5);
+        let opacity = self.cfg.opacity.clamp(0.3, 1.0);
+        // El fondo de la barra se pinta al final (depende de dónde se ve la activa), pero en
+        // este hueco, debajo de todo lo demás.
+        let bar_bg = ui.painter().add(egui::Shape::Noop);
+        let mut active_body = None;
 
         let mut select = None;
         let mut close = None;
@@ -1572,6 +1579,23 @@ impl App {
             0.0
         };
         self.w.tab_layout = (tab_w, tabs_left);
+        let last = tabs_left + (self.w.sessions.len().max(1) - 1) as f32 * tab_w;
+        // Dónde se ve la activa (deslizándose o arrastrada): las demás se recortan por ahí. Con
+        // la ventana translúcida su fondo no es opaco y se verían a través de ella.
+        let active_cover = self.w.sessions.get(self.w.active).map(|s| {
+            let left = match (self.w.drag_tab, pointer_x) {
+                (Some((id, grab)), Some(px)) if id == s.id => (px - grab).clamp(tabs_left, last),
+                _ => ctx.animate_value_with_time(
+                    egui::Id::unique(("tab-x", s.id)),
+                    tabs_left + self.w.active as f32 * tab_w,
+                    slide,
+                ),
+            };
+            Rect::from_min_max(
+                Pos2::new(left, full.top()),
+                Pos2::new(left + tab_w - 4.0, full.bottom()),
+            )
+        });
         let mut x = tabs_left;
         for (i, s) in self.w.sessions.iter().enumerate() {
             let slide_id = egui::Id::unique(("tab-x", s.id));
@@ -1585,11 +1609,11 @@ impl App {
                 Pos2::new(shown_x, full.top() + 5.0),
                 Vec2::new(tab_w - 4.0, TAB_BAR_H - 9.0),
             );
+            let slot_x = x;
             x += tab_w;
             // La pestaña arrastrada sigue al puntero; al cruzar a otro hueco cambia de sitio.
             let dragging = match (self.w.drag_tab, pointer_x) {
                 (Some((id, grab)), Some(px)) if id == s.id => {
-                    let last = tabs_left + (self.w.sessions.len() - 1) as f32 * tab_w;
                     let left = (px - grab).clamp(tabs_left, last);
                     rect = rect.translate(Vec2::new(left - rect.left(), 0.0));
                     // Al soltarla se desliza desde donde quedó hasta su hueco.
@@ -1602,8 +1626,15 @@ impl App {
                 }
                 _ => false,
             };
+            let active = i == self.w.active;
+            // La activa baja hasta el borde de la barra: toda ella responde al ratón.
+            let hit = if active {
+                rect.with_max_y(full.bottom())
+            } else {
+                rect
+            };
             let resp = ui.interact(
-                rect,
+                hit,
                 ui.scope_id().with(("tab", s.id)),
                 Sense::click_and_drag(),
             );
@@ -1612,34 +1643,52 @@ impl App {
                     grabbed = Some((i, s.id, px - rect.left()));
                 }
             }
-            let active = i == self.w.active;
             let hovered = resp.hovered() && (self.w.drag_tab.is_none() || dragging);
             // Encima de las demás mientras se mueve (arrastrada, o la activa deslizándose).
             // `Middle` y no `Foreground`: los menús emergentes (clic derecho) van en
             // `Foreground` y esta capa, creada después, los tapaba.
-            let p = &if dragging || (active && shown_x != x) {
+            let p = &if dragging || (active && shown_x != slot_x) {
                 ui.painter().clone().with_layer_id(egui::LayerId::new(
                     egui::Order::Middle,
                     egui::Id::unique("tab-drag"),
                 ))
-            } else {
+            } else if active {
                 ui.painter().clone()
+            } else {
+                let bar = Rect::from_x_y_ranges(rect.x_range(), full.y_range());
+                ui.painter().with_clip_rect(uncovered(bar, active_cover))
             };
             let tint = s
                 .color
                 .and_then(|k| TAB_COLORS.get(k as usize))
                 .map(|c| c.1);
             if active {
-                p.rect_filled(rect, CornerRadius::same(7), pal.tab_active);
+                // Unida a la terminal: baja hasta el borde de la barra con su mismo fondo y
+                // sin contorno por abajo. El color de la pestaña va en una raya arriba (en el
+                // relleno rompería la unión).
+                let body = rect.with_max_y(full.bottom());
+                active_body = Some(body);
+                let top_only = CornerRadius {
+                    nw: TAB_RADIUS as u8,
+                    ne: TAB_RADIUS as u8,
+                    sw: 0,
+                    se: 0,
+                };
+                p.rect_filled(body, top_only, fade(pal.bg, opacity));
+                p.add(egui::Shape::line(
+                    tab_outline(body, TAB_RADIUS),
+                    Stroke::new(1.0, pal.border),
+                ));
                 if let Some(c) = tint {
-                    p.rect_filled(rect, CornerRadius::same(7), c.gamma_multiply(0.34));
+                    let y = body.top() + 1.5;
+                    p.line_segment(
+                        [
+                            Pos2::new(body.left() + TAB_RADIUS, y),
+                            Pos2::new(body.right() - TAB_RADIUS, y),
+                        ],
+                        Stroke::new(2.0, c),
+                    );
                 }
-                p.rect_stroke(
-                    rect,
-                    CornerRadius::same(7),
-                    Stroke::new(1.0, tint.map_or(pal.border, |c| c.gamma_multiply(0.7))),
-                    StrokeKind::Inside,
-                );
             } else if let Some(c) = tint {
                 let strength = if hovered { 0.36 } else { 0.26 };
                 p.rect_filled(rect, CornerRadius::same(7), c.gamma_multiply(strength));
@@ -1653,7 +1702,7 @@ impl App {
                 p.rect_filled(rect, CornerRadius::same(7), pal.border);
             }
             // La raya de abajo es lo que deja ver el color de un vistazo.
-            if let Some(c) = tint {
+            if let Some(c) = tint.filter(|_| !active) {
                 let y = rect.bottom() - 2.0;
                 p.line_segment(
                     [
@@ -1666,15 +1715,21 @@ impl App {
 
             // Indicador a la izquierda: trabajando / terminó / agente en reposo.
             let ind = Pos2::new(rect.left() + 14.0, rect.center().y);
-            if s.busy {
-                let color = s.agent.map(|a| a.color()).unwrap_or(pal.accent);
-                spinner(p, ind, 5.0, color);
-            } else if s.unseen {
-                p.circle_filled(ind, 4.0, pal.done);
-            } else if let Some(a) = s.agent {
-                agent_icon(p, ind, 5.5, a);
-            } else {
-                p.circle_filled(ind, 2.0, pal.muted.gamma_multiply(0.5));
+            // Con agente el icono se queda y el estado va en una insignia en su esquina.
+            let surface = fade(if active { pal.bg } else { pal.tab_bar }, opacity);
+            match (s.agent, s.busy, s.unseen) {
+                (Some(a), true, _) => badged_icon(p, ind, 5.5, a, Badge::Working(pal.fg), surface),
+                (Some(a), false, true) => {
+                    badged_icon(p, ind, 5.5, a, Badge::Done(pal.done), surface)
+                }
+                (Some(a), false, false) => agent_icon(p, ind, 5.5, a),
+                (None, true, _) => spinner(p, ind, 5.0, pal.accent),
+                (None, false, true) => {
+                    p.circle_filled(ind, 4.0, pal.done);
+                }
+                (None, false, false) => {
+                    p.circle_filled(ind, 2.0, pal.muted.gamma_multiply(0.5));
+                }
             }
 
             let text_color = if active { pal.fg } else { pal.muted };
@@ -1780,6 +1835,19 @@ impl App {
             if self.w.drag_tab.is_none() && !resp.context_menu_opened() {
                 resp.on_hover_ui(|ui| tab_tooltip(ui, s, &pal));
             }
+        }
+
+        ui.painter().set(
+            bar_bg,
+            bar_background(full, active_body, TAB_RADIUS, fade(pal.tab_bar, opacity)),
+        );
+        let gap = active_body.map(|b| (b.left(), b.right()));
+        for (x0, x1) in bottom_line(full.left(), full.right(), gap) {
+            let y = full.bottom() - 0.5;
+            ui.painter().line_segment(
+                [Pos2::new(x0, y), Pos2::new(x1, y)],
+                Stroke::new(1.0, pal.border),
+            );
         }
 
         // Sobre las pestañas el arrastre es nuestro (reordenar), no de macOS (mover la ventana).
@@ -2010,7 +2078,15 @@ impl App {
                     p.rect_filled(bar, 0.0, *c);
                 }
                 let left = rect.left() + 14.0;
-                agent_icon(p, Pos2::new(left + 6.0, rect.top() + 18.0), 6.5, agent);
+                let icon = Pos2::new(left + 6.0, rect.top() + 18.0);
+                let surface = pal.panel;
+                if s.busy {
+                    badged_icon(p, icon, 6.5, agent, Badge::Working(pal.fg), surface);
+                } else if s.unseen {
+                    badged_icon(p, icon, 6.5, agent, Badge::Done(pal.done), surface);
+                } else {
+                    agent_icon(p, icon, 6.5, agent);
+                }
                 let tx = left + 22.0;
                 let max_w = rect.right() - tx - 64.0;
                 let name = elided(ui.ctx(), &s.project(), &title_font, pal.fg, max_w);
@@ -2024,8 +2100,8 @@ impl App {
                 p.galley(Pos2::new(tx, rect.top() + 26.0), desc, pal.muted);
 
                 let dot = Pos2::new(tx + 4.0, rect.top() + 49.0);
+                // Trabajando: los puntos ya giran en el icono de arriba; aquí basta el texto.
                 let (label, color) = if s.busy {
-                    spinner(p, dot, 4.0, agent.color());
                     ("Trabajando…".to_string(), pal.fg)
                 } else if s.unseen {
                     p.circle_filled(dot, 3.5, pal.done);
@@ -2035,7 +2111,7 @@ impl App {
                     ("Esperando tu mensaje".to_string(), pal.muted)
                 };
                 p.text(
-                    Pos2::new(tx + 14.0, dot.y),
+                    Pos2::new(if s.busy { tx } else { tx + 14.0 }, dot.y),
                     Align2::LEFT_CENTER,
                     label,
                     small.clone(),
@@ -2806,7 +2882,8 @@ impl shell::App for App {
         egui::Panel::top("tabs")
             .exact_size(TAB_BAR_H)
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(fade(pal.tab_bar, opacity)))
+            // Sin relleno: el fondo lo pinta `tab_bar`, con el hueco de la pestaña activa.
+            .frame(egui::Frame::new())
             .show(ui, |ui| self.tab_bar(ui));
 
         if !self.show_procs {
@@ -2901,10 +2978,13 @@ impl shell::App for App {
             self.open_picker(&ctx, chip, rect.left_bottom());
         }
 
-        // El indicador de «trabajando» no se anima; basta un refresco pausado para notar
-        // cuándo termina la tarea.
-        if self.w.sessions.iter().any(|s| s.busy) {
-            ctx.request_repaint_after(Duration::from_millis(250));
+        // Con un agente trabajando, sus puntos giran (~15 cuadros/s); si solo trabaja otra cosa,
+        // la luna avanza a saltos con un refresco pausado. `ui()` no corre con la ventana
+        // minimizada, así que una ventana que no se ve no pide nada.
+        let sessions = &self.w.sessions;
+        let agent_busy = sessions.iter().any(|s| s.busy && s.agent.is_some());
+        if let Some(t) = tick_for(agent_busy, sessions.iter().any(|s| s.busy)) {
+            ctx.request_repaint_after(t);
         }
     }
 }
@@ -3107,6 +3187,114 @@ pub fn file_icon(p: &egui::Painter, c: Pos2, is_dir: bool, color: Color32) {
     }
 }
 
+/// Ancho para las pestañas: desde los semáforos hasta lo reservado a la derecha y, con el
+/// panel lateral abierto, hasta donde acaba la terminal (la del cuadro anterior). Si no, la
+/// última pestaña quedaba encima del panel y, siendo la activa, se «unía» a él.
+fn tabs_avail(full: Rect, right_reserved: f32, term: Rect) -> f32 {
+    let mut right = full.right() - right_reserved;
+    if term.is_positive() {
+        right = right.min(term.right());
+    }
+    right - full.left() - TRAFFIC_LIGHTS_W - 34.0
+}
+
+/// Lo que queda a la vista de `rect` con `cover` encima (solo cuenta en horizontal: todas
+/// las pestañas van a la misma altura). Tapada del todo, un rectángulo vacío.
+fn uncovered(rect: Rect, cover: Option<Rect>) -> Rect {
+    let Some(c) = cover.filter(|c| c.left() < rect.right() && c.right() > rect.left()) else {
+        return rect;
+    };
+    let (l, r) = if c.left() > rect.left() {
+        (rect.left(), c.left())
+    } else {
+        (c.right(), rect.right())
+    };
+    if r > l {
+        Rect::from_x_y_ranges(l..=r, rect.y_range())
+    } else {
+        Rect::NOTHING
+    }
+}
+
+/// Contorno de la pestaña activa: lados y arriba, con las esquinas superiores redondeadas;
+/// abierto por abajo, donde se une a la terminal.
+fn tab_outline(body: Rect, r: f32) -> Vec<Pos2> {
+    let (l, rt) = (body.left() + 0.5, body.right() - 0.5);
+    let (top, bottom) = (body.top() + 0.5, body.bottom());
+    let r = r.min(body.width() / 2.0);
+    let mut pts = vec![Pos2::new(l, bottom)];
+    let arc = |center: Pos2, from: f32, pts: &mut Vec<Pos2>| {
+        for k in 0..=8 {
+            let a = (from + 90.0 * k as f32 / 8.0).to_radians();
+            pts.push(center + Vec2::new(a.cos(), a.sin()) * r);
+        }
+    };
+    arc(Pos2::new(l + r, top + r), 180.0, &mut pts);
+    arc(Pos2::new(rt - r, top + r), 270.0, &mut pts);
+    pts.push(Pos2::new(rt, bottom));
+    pts
+}
+
+/// Tramos de la línea inferior de la barra de pestañas, sin el hueco de la activa (que se
+/// une a la terminal).
+fn bottom_line(left: f32, right: f32, gap: Option<(f32, f32)>) -> Vec<(f32, f32)> {
+    let Some((a, b)) = gap else {
+        return vec![(left, right)];
+    };
+    [(left, a.min(right)), (b.max(left), right)]
+        .into_iter()
+        .filter(|(x0, x1)| x1 > x0)
+        .collect()
+}
+
+/// Fondo de la barra de pestañas salvo la forma de la pestaña activa (esquinas superiores
+/// redondeadas de radio `r`). La activa lleva el fondo de la terminal y no puede ir encima
+/// del de la barra: con la ventana translúcida las dos capas sumadas se verían más opacas
+/// que la terminal y se notaría la costura.
+fn bar_background(full: Rect, tab: Option<Rect>, r: f32, color: Color32) -> egui::Mesh {
+    let mut m = egui::Mesh::default();
+    let mut rect = |min: Pos2, max: Pos2| {
+        if max.x > min.x && max.y > min.y {
+            m.add_colored_rect(Rect::from_min_max(min, max), color);
+        }
+    };
+    let Some(t) = tab else {
+        rect(full.min, full.max);
+        return m;
+    };
+    let (l, rr) = (t.left().max(full.left()), t.right().min(full.right()));
+    rect(full.min, Pos2::new(l, full.bottom()));
+    rect(Pos2::new(rr, full.top()), full.max);
+    rect(Pos2::new(l, full.top()), Pos2::new(rr, t.top()));
+    // Esquinas: abanico desde el vértice del rectángulo hasta el arco.
+    let r = r.min(t.width() / 2.0).min(t.height());
+    let corners = [
+        (
+            Pos2::new(t.left(), t.top()),
+            Pos2::new(t.left() + r, t.top() + r),
+            180.0_f32,
+        ),
+        (
+            Pos2::new(t.right(), t.top()),
+            Pos2::new(t.right() - r, t.top() + r),
+            270.0,
+        ),
+    ];
+    const STEPS: u32 = 8;
+    for (vertex, center, from) in corners {
+        let tip = m.vertices.len() as u32;
+        m.colored_vertex(vertex, color);
+        for k in 0..=STEPS {
+            let a = (from + 90.0 * k as f32 / STEPS as f32).to_radians();
+            m.colored_vertex(center + Vec2::new(a.cos(), a.sin()) * r, color);
+        }
+        for k in 0..STEPS {
+            m.add_triangle(tip, tip + 1 + k, tip + 2 + k);
+        }
+    }
+    m
+}
+
 /// Color con la opacidad indicada (1.0 = sólido).
 fn fade(c: Color32, opacity: f32) -> Color32 {
     if opacity >= 0.999 {
@@ -3254,6 +3442,84 @@ fn spinner(p: &egui::Painter, center: Pos2, r: f32, color: Color32) {
         .collect();
     p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
     p.circle_stroke(center, r - 0.6, Stroke::new(1.2, color));
+}
+
+/// Una vuelta de los puntos de «trabajando» en la insignia del icono de un agente.
+const RING_PERIOD: f64 = 1.0;
+/// Refresco mientras algún agente trabaja (~15 cuadros/s): basta para que los puntos giren
+/// fluidos. Sin agente trabajando no hay puntos y vale el refresco pausado.
+const RING_TICK: Duration = Duration::from_millis(66);
+/// Refresco pausado mientras algo trabaja sin agente: la luna avanza a saltos de 300 ms.
+const IDLE_TICK: Duration = Duration::from_millis(250);
+
+/// Ángulo de la cabeza del indicador (radianes, en `[0, 2π)`) para el reloj de egui `t`.
+fn ring_angle(t: f64) -> f32 {
+    (std::f64::consts::TAU * (t.rem_euclid(RING_PERIOD) / RING_PERIOD)) as f32
+}
+
+/// Cada cuánto repintar: rápido si un agente trabaja (los puntos giran), pausado si solo
+/// trabaja otra cosa (un servidor en primer plano cuenta como trabajando sin fin y no debe
+/// tener la app a 15 cuadros/s), nada en reposo.
+fn tick_for(agent_busy: bool, any_busy: bool) -> Option<Duration> {
+    if agent_busy {
+        Some(RING_TICK)
+    } else if any_busy {
+        Some(IDLE_TICK)
+    } else {
+        None
+    }
+}
+
+/// Insignia en la esquina superior derecha del icono de un agente.
+#[derive(Clone, Copy)]
+enum Badge {
+    /// Trabajando: puntos que giran, del color dado.
+    Working(Color32),
+    /// Terminó y no se ha mirado: punto de ese color (verde).
+    Done(Color32),
+}
+
+/// Puntos del indicador de «trabajando».
+const BADGE_DOTS: usize = 8;
+
+/// Brillo (0,3–1) del punto `k` de `n` con la cabeza en el ángulo `head`: la cabeza brilla
+/// del todo y los que la siguen se apagan poco a poco, como el indicador de actividad de
+/// macOS. Los ángulos crecen en el sentido de las agujas del reloj (la y va hacia abajo).
+fn dot_alpha(k: usize, n: usize, head: f32) -> f32 {
+    use std::f32::consts::TAU;
+    let at = TAU * k as f32 / n as f32;
+    let behind = (head - at).rem_euclid(TAU);
+    1.0 - 0.8 * behind / TAU
+}
+
+/// Icono del agente con una insignia arriba a la derecha. `surface` es el color de lo que hay
+/// debajo: el disco de la insignia lo usa para separarse del icono.
+fn badged_icon(
+    p: &egui::Painter,
+    c: Pos2,
+    r: f32,
+    agent: session::Agent,
+    badge: Badge,
+    surface: Color32,
+) {
+    agent_icon(p, c, r, agent);
+    let br = r * 0.8;
+    let b = c + Vec2::new(r * 0.85, -r * 0.85);
+    p.circle_filled(b, br + 1.0, surface);
+    match badge {
+        Badge::Working(ink) => {
+            let head = ring_angle(p.ctx().input(|i| i.time));
+            for k in 0..BADGE_DOTS {
+                let a = std::f32::consts::TAU * k as f32 / BADGE_DOTS as f32;
+                let at = b + Vec2::new(a.cos(), a.sin()) * (br * 0.62);
+                let alpha = dot_alpha(k, BADGE_DOTS, head);
+                p.circle_filled(at, br * 0.18, ink.gamma_multiply(alpha));
+            }
+        }
+        Badge::Done(color) => {
+            p.circle_filled(b, br * 0.72, color);
+        }
+    }
 }
 
 /// Iconos dibujados a mano: no dependen de qué glifos tenga la fuente.
@@ -3629,5 +3895,109 @@ fn spawn_detached(program: &str, args: &[String]) {
         std::thread::spawn(move || {
             let _ = child.wait();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Algún triángulo de la malla contiene `p`.
+    fn cubre(m: &egui::Mesh, p: Pos2) -> bool {
+        m.indices.chunks(3).any(|t| {
+            let [a, b, c] = [0, 1, 2].map(|k| m.vertices[t[k] as usize].pos);
+            let cross =
+                |o: Pos2, u: Pos2, v: Pos2| (u.x - o.x) * (v.y - o.y) - (u.y - o.y) * (v.x - o.x);
+            let (d1, d2, d3) = (cross(a, b, p), cross(b, c, p), cross(c, a, p));
+            let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+            let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+            !(neg && pos)
+        })
+    }
+
+    #[test]
+    fn pestanas_no_pasan_sobre_el_panel() {
+        let full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1180.0, 38.0));
+        // Sin panel (la terminal llega al borde) manda lo reservado a la derecha.
+        let term = Rect::from_min_max(Pos2::new(0.0, 38.0), Pos2::new(1180.0, 760.0));
+        assert_eq!(tabs_avail(full, 158.0, term), 1180.0 - 78.0 - 158.0 - 34.0);
+        // Con panel, las pestañas (y el «+») acaban donde acaba la terminal.
+        let term = Rect::from_min_max(Pos2::new(0.0, 38.0), Pos2::new(880.0, 760.0));
+        assert_eq!(tabs_avail(full, 158.0, term), 880.0 - 78.0 - 34.0);
+        // Primer cuadro, sin terminal medida aún.
+        assert_eq!(
+            tabs_avail(full, 158.0, Rect::NOTHING),
+            1180.0 - 78.0 - 158.0 - 34.0
+        );
+    }
+
+    #[test]
+    fn pestana_tapada_se_recorta() {
+        let r = |l: f32, rr: f32| Rect::from_min_max(Pos2::new(l, 5.0), Pos2::new(rr, 34.0));
+        let tab = r(100.0, 200.0);
+        // Nada encima, o la activa lejos: entera.
+        assert_eq!(uncovered(tab, None), tab);
+        assert_eq!(uncovered(tab, Some(r(300.0, 400.0))), tab);
+        // La activa la tapa por la derecha o por la izquierda: queda el resto.
+        assert_eq!(uncovered(tab, Some(r(150.0, 250.0))), r(100.0, 150.0));
+        assert_eq!(uncovered(tab, Some(r(50.0, 130.0))), r(130.0, 200.0));
+        // Tapada del todo: vacía.
+        assert!(!uncovered(tab, Some(r(100.0, 200.0))).is_positive());
+    }
+
+    #[test]
+    fn arco_da_una_vuelta_por_segundo() {
+        assert_eq!(ring_angle(0.0), 0.0);
+        assert!((ring_angle(0.25) - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((ring_angle(1.25) - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!(ring_angle(0.999) < std::f32::consts::TAU);
+    }
+
+    #[test]
+    fn puntos_del_indicador_se_apagan_tras_la_cabeza() {
+        use std::f32::consts::FRAC_PI_4;
+        // La cabeza (ángulo 0) brilla del todo; justo delante de ella, el más apagado; los
+        // que la siguen se van apagando poco a poco.
+        assert_eq!(dot_alpha(0, 8, 0.0), 1.0);
+        assert!((dot_alpha(7, 8, 0.0) - 0.9).abs() < 1e-4);
+        assert!((dot_alpha(1, 8, 0.0) - 0.3).abs() < 1e-4);
+        // Al girar un octavo, la cabeza pasa al siguiente punto.
+        assert!((dot_alpha(1, 8, FRAC_PI_4) - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ritmo_de_repintado() {
+        assert_eq!(tick_for(true, true), Some(Duration::from_millis(66)));
+        assert_eq!(tick_for(false, true), Some(Duration::from_millis(250)));
+        assert_eq!(tick_for(false, false), None);
+    }
+
+    #[test]
+    fn barra_sin_hueco_bajo_la_pestana() {
+        assert_eq!(bottom_line(0.0, 100.0, None), vec![(0.0, 100.0)]);
+        assert_eq!(
+            bottom_line(0.0, 100.0, Some((20.0, 60.0))),
+            vec![(0.0, 20.0), (60.0, 100.0)]
+        );
+        assert_eq!(
+            bottom_line(0.0, 100.0, Some((0.0, 40.0))),
+            vec![(40.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn fondo_de_barra_no_tapa_la_pestana() {
+        let full = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(300.0, 38.0));
+        let tab = Rect::from_min_max(Pos2::new(100.0, 5.0), Pos2::new(200.0, 38.0));
+        let m = bar_background(full, Some(tab), 7.0, Color32::WHITE);
+        assert!(!cubre(&m, Pos2::new(150.0, 20.0))); // dentro de la pestaña
+        assert!(!cubre(&m, Pos2::new(108.0, 8.0))); // dentro, cerca de la esquina redondeada
+        assert!(cubre(&m, Pos2::new(101.0, 5.5))); // fuera del arco de la esquina
+        assert!(cubre(&m, Pos2::new(50.0, 20.0)));
+        assert!(cubre(&m, Pos2::new(150.0, 2.0))); // encima de la pestaña
+        assert!(cubre(&m, Pos2::new(250.0, 30.0)));
+        // Sin pestaña activa (ninguna) cubre todo.
+        let m = bar_background(full, None, 7.0, Color32::WHITE);
+        assert!(cubre(&m, Pos2::new(150.0, 20.0)));
     }
 }

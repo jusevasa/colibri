@@ -61,6 +61,8 @@ pub struct Theme {
     pub selection: String,
     pub accent: String,
     pub tab_bar: String,
+    /// Ya no se usa: la pestaña activa lleva el fondo de la terminal, a la que se une.
+    /// Se conserva para que los temas guardados sigan cargando igual.
     pub tab_active: String,
     pub panel: String,
     pub muted: String,
@@ -504,7 +506,6 @@ pub struct Palette {
     pub selection: Color32,
     pub accent: Color32,
     pub tab_bar: Color32,
-    pub tab_active: Color32,
     pub panel: Color32,
     pub muted: Color32,
     pub border: Color32,
@@ -527,7 +528,6 @@ impl Palette {
             selection: hex(&t.selection, Color32::DARK_BLUE),
             accent: hex(&t.accent, Color32::LIGHT_BLUE),
             tab_bar: hex(&t.tab_bar, Color32::BLACK),
-            tab_active: hex(&t.tab_active, Color32::BLACK),
             panel: hex(&t.panel, Color32::BLACK),
             muted: hex(&t.muted, Color32::GRAY),
             border: hex(&t.border, Color32::DARK_GRAY),
