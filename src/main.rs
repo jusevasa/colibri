@@ -2965,9 +2965,9 @@ impl shell::App for App {
             self.open_picker(&ctx, chip, rect.left_bottom());
         }
 
-        // Con un agente trabajando, sus puntos giran (~15 cuadros/s); si solo trabaja otra cosa,
-        // la luna avanza a saltos con un refresco pausado. `ui()` no corre con la ventana
-        // minimizada, así que una ventana que no se ve no pide nada.
+        // Con un agente trabajando, sus puntos giran a saltos (8 cuadros/s; 4 sin el foco);
+        // si solo trabaja otra cosa, la luna avanza a saltos con un refresco pausado. `ui()`
+        // no corre con la ventana minimizada, así que una ventana que no se ve no pide nada.
         // El panel de agentes enseña también los de las otras ventanas: sus puntos giran aquí.
         let sessions = &self.w.sessions;
         let elsewhere = self.show_agents
@@ -2977,7 +2977,9 @@ impl shell::App for App {
                 .flat_map(|w| w.sessions.iter())
                 .any(|s| s.busy && s.agent.is_some());
         let agent_busy = elsewhere || sessions.iter().any(|s| s.busy && s.agent.is_some());
-        if let Some(t) = tick_for(agent_busy, sessions.iter().any(|s| s.busy)) {
+        let now = ctx.input(|i| i.time);
+        let period = ring_period(self.w.focused);
+        if let Some(t) = tick_for(agent_busy, sessions.iter().any(|s| s.busy), now, period) {
             ctx.request_repaint_after(t);
         }
     }
@@ -3458,25 +3460,32 @@ fn spinner(p: &egui::Painter, center: Pos2, r: f32, color: Color32) {
     p.circle_stroke(center, r - 0.6, Stroke::new(1.2, color));
 }
 
-/// Una vuelta de los puntos de «trabajando» en la insignia del icono de un agente.
-const RING_PERIOD: f64 = 1.0;
-/// Refresco mientras algún agente trabaja (~15 cuadros/s): basta para que los puntos giren
-/// fluidos. Sin agente trabajando no hay puntos y vale el refresco pausado.
-const RING_TICK: Duration = Duration::from_millis(66);
+/// Segundos por vuelta de los puntos de «trabajando» en la insignia del icono de un agente:
+/// uno con la ventana al frente; sin el foco, dos (la mitad de cuadros, y se sigue viendo que
+/// trabaja). Mismo foco que `Win::focused` (`viewport().focused`).
+fn ring_period(focused: bool) -> f64 {
+    if focused { 1.0 } else { 2.0 }
+}
 /// Refresco pausado mientras algo trabaja sin agente: la luna avanza a saltos de 300 ms.
 const IDLE_TICK: Duration = Duration::from_millis(250);
 
 /// Ángulo de la cabeza del indicador (radianes, en `[0, 2π)`) para el reloj de egui `t`.
-fn ring_angle(t: f64) -> f32 {
-    (std::f64::consts::TAU * (t.rem_euclid(RING_PERIOD) / RING_PERIOD)) as f32
+/// Salta de punto en punto, `BADGE_DOTS` saltos por vuelta, como el indicador de actividad
+/// de macOS: basta un cuadro por salto (antes giraba continuo y pedía ~15 cuadros/s).
+fn ring_angle(t: f64, period: f64) -> f32 {
+    let steps = BADGE_DOTS as f64;
+    let step = (t.rem_euclid(period) / period * steps).floor();
+    (std::f64::consts::TAU * step / steps) as f32
 }
 
-/// Cada cuánto repintar: rápido si un agente trabaja (los puntos giran), pausado si solo
-/// trabaja otra cosa (un servidor en primer plano cuenta como trabajando sin fin y no debe
-/// tener la app a 15 cuadros/s), nada en reposo.
-fn tick_for(agent_busy: bool, any_busy: bool) -> Option<Duration> {
+/// Cada cuánto repintar: si un agente trabaja, justo después del próximo salto de sus puntos
+/// (más 1 ms, para que el reloj de esa pasada ya lo haya cruzado); pausado si solo trabaja
+/// otra cosa (un servidor en primer plano cuenta como trabajando sin fin y no debe tener la
+/// app a 8 cuadros/s); nada en reposo.
+fn tick_for(agent_busy: bool, any_busy: bool, t: f64, period: f64) -> Option<Duration> {
     if agent_busy {
-        Some(RING_TICK)
+        let step = period / BADGE_DOTS as f64;
+        Some(Duration::from_secs_f64(step - t.rem_euclid(step) + 0.001))
     } else if any_busy {
         Some(IDLE_TICK)
     } else {
@@ -3522,7 +3531,10 @@ fn badged_icon(
     p.circle_filled(b, br + 1.0, surface);
     match badge {
         Badge::Working(ink) => {
-            let head = ring_angle(p.ctx().input(|i| i.time));
+            let (t, focused) = p
+                .ctx()
+                .input(|i| (i.time, i.viewport().focused.unwrap_or(true)));
+            let head = ring_angle(t, ring_period(focused));
             for k in 0..BADGE_DOTS {
                 let a = std::f32::consts::TAU * k as f32 / BADGE_DOTS as f32;
                 let at = b + Vec2::new(a.cos(), a.sin()) * (br * 0.62);
@@ -3985,12 +3997,21 @@ mod tests {
         assert!(!uncovered(tab, Some(r(100.0, 200.0))).is_positive());
     }
 
+    /// La cabeza salta de punto en punto (como el indicador de actividad de macOS), así que
+    /// basta un cuadro por salto: 8 por vuelta. Una vuelta por segundo con la ventana al
+    /// frente; sin el foco, una cada dos (la mitad de cuadros).
     #[test]
-    fn arco_da_una_vuelta_por_segundo() {
-        assert_eq!(ring_angle(0.0), 0.0);
-        assert!((ring_angle(0.25) - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
-        assert!((ring_angle(1.25) - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
-        assert!(ring_angle(0.999) < std::f32::consts::TAU);
+    fn la_cabeza_del_indicador_salta_de_punto_en_punto() {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, TAU};
+        let (al_frente, sin_foco) = (ring_period(true), ring_period(false));
+        assert_eq!((al_frente, sin_foco), (1.0, 2.0));
+        assert_eq!(ring_angle(0.0, al_frente), 0.0);
+        assert_eq!(ring_angle(0.1, al_frente), 0.0, "entre saltos no se mueve");
+        assert!((ring_angle(0.13, al_frente) - FRAC_PI_4).abs() < 1e-4);
+        assert!((ring_angle(1.26, al_frente) - FRAC_PI_2).abs() < 1e-4);
+        assert!(ring_angle(0.999, al_frente) < TAU);
+        assert_eq!(ring_angle(0.2, sin_foco), 0.0);
+        assert!((ring_angle(0.26, sin_foco) - FRAC_PI_4).abs() < 1e-4);
     }
 
     #[test]
@@ -4007,9 +4028,19 @@ mod tests {
 
     #[test]
     fn ritmo_de_repintado() {
-        assert_eq!(tick_for(true, true), Some(Duration::from_millis(66)));
-        assert_eq!(tick_for(false, true), Some(Duration::from_millis(250)));
-        assert_eq!(tick_for(false, false), None);
+        let cerca =
+            |d: Option<Duration>, s: f64| d.is_some_and(|d| (d.as_secs_f64() - s).abs() < 1e-6);
+        // Con un agente trabajando, el cuadro siguiente justo después del próximo salto (más
+        // 1 ms, para que el reloj de esa pasada ya lo haya cruzado).
+        let t = tick_for(true, true, 0.05, 1.0);
+        assert!(cerca(t, 0.076), "{t:?}");
+        let t = tick_for(true, true, 0.05, 2.0);
+        assert!(cerca(t, 0.201), "{t:?}");
+        assert_eq!(
+            tick_for(false, true, 0.05, 1.0),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(tick_for(false, false, 0.05, 1.0), None);
     }
 
     #[test]
