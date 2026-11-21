@@ -44,7 +44,7 @@ scripts/bundle.sh          # compila en release y arma target/Colibri.app
 open target/Colibri.app
 ```
 
-Sin un certificado de Apple propio, `bundle.sh` firma la app «ad-hoc» y macOS volverá a pedir los permisos (carpetas, notificaciones) tras cada compilación. Para firmar con el tuyo: `COLIBRI_SIGN_ID="<hash o nombre del certificado>" scripts/bundle.sh`. Las notificaciones con clic solo funcionan desde `Colibri.app`, no con `cargo run`.
+`bundle.sh` firma con tu certificado de Apple si tienes uno en el llavero (Developer ID o Apple Development; `COLIBRI_SIGN_ID` elige otro). Sin ninguno firma «ad-hoc», y macOS volverá a pedir los permisos (carpetas, notificaciones) tras cada compilación. Las notificaciones con clic solo funcionan desde `Colibri.app`, no con `cargo run`.
 
 Cuando el ejecutable cambia en disco (al recompilar), aparece en la barra de pestañas el botón **Actualizar**, que reinicia Colibrí con la versión nueva y reabre las pestañas.
 

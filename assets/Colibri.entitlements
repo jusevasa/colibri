@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Derechos de Colibri.app (los pone scripts/bundle.sh al firmar). Con hardened runtime, que
+     exige la notarización, la app solo puede pedir lo que declara aquí, y ante macOS los
+     programas que corren en sus pestañas cuentan como ella: sin estos derechos, `osascript`,
+     una grabación de voz o una videollamada lanzados desde la terminal ni siquiera podrían
+     pedir permiso. Cada uno lleva su texto en el Info.plist (NS…UsageDescription). -->
+<plist version="1.0"><dict>
+  <key>com.apple.security.automation.apple-events</key><true/>
+  <key>com.apple.security.device.audio-input</key><true/>
+  <key>com.apple.security.device.camera</key><true/>
+</dict></plist>

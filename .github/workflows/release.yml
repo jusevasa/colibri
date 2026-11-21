@@ -1,0 +1,102 @@
+# Publica una versión al empujar una etiqueta v<versión de Cargo.toml>: binario universal
+# firmado con Developer ID, notarizado y grapado (scripts/release.sh), Release en GitHub con
+# el zip y cask actualizado en jusevasa/homebrew-colibri.
+#
+# Los secretos viven en el entorno «release», que solo admite etiquetas v*: ni un PR ni una
+# rama pueden leerlos.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    name: Publicar
+    runs-on: macos-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # bundle.sh numera la compilación con `git rev-list --count HEAD`.
+          fetch-depth: 0
+
+      - name: La etiqueta coincide con Cargo.toml
+        run: |
+          VERSION=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::La etiqueta $GITHUB_REF_NAME no coincide con la versión de Cargo.toml ($VERSION)"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Certificado en un llavero temporal
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/firma.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Compilar, firmar y notarizar
+        id: build
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: 48FPYMR7Z4
+        run: scripts/release.sh
+
+      - name: Publicar el Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+          ZIP: ${{ steps.build.outputs.zip }}
+        run: |
+          # Una versión con guion (0.3.0-beta.1) sale como prerelease.
+          PRERELEASE=""
+          case "$VERSION" in *-*) PRERELEASE="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" "$ZIP" --verify-tag --generate-notes \
+            --title "Colibrí $VERSION" $PRERELEASE
+
+      - name: Actualizar el cask en jusevasa/homebrew-colibri
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+          VERSION: ${{ steps.build.outputs.version }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+        run: |
+          KEY="$RUNNER_TEMP/tap_key"
+          (umask 077; printf '%s\n' "$TAP_DEPLOY_KEY" > "$KEY")
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone git@github.com:jusevasa/homebrew-colibri.git "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Casks"
+          scripts/cask.sh "$VERSION" "$SHA256" > "$RUNNER_TEMP/tap/Casks/colibri.rb"
+          cd "$RUNNER_TEMP/tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/colibri.rb
+          git commit -m "colibri $VERSION"
+          git push
+          rm "$KEY"
+
+      - name: Borrar el llavero temporal
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/firma.keychain-db" || true
