@@ -103,6 +103,8 @@ pub struct Keys {
     /// Muestra u oculta los dos apartados a la vez.
     pub toggle_panel: String,
     pub toggle_agents: String,
+    /// Abre el panel de agentes (si está oculto) y da el teclado a su buscador.
+    pub search_agents: String,
     pub toggle_ports: String,
     pub toggle_processes: String,
     pub font_bigger: String,
@@ -196,6 +198,7 @@ impl Default for Keys {
             global_focus: "ctrl+alt+cmd+space".into(),
             toggle_panel: "cmd+b".into(),
             toggle_agents: "cmd+shift+a".into(),
+            search_agents: "cmd+shift+f".into(),
             toggle_ports: "cmd+shift+p".into(),
             toggle_processes: "cmd+shift+m".into(),
             font_bigger: "cmd+=".into(),

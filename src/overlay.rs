@@ -1086,6 +1086,7 @@ impl App {
             (o.jump_finished, Cmd::JumpFinished),
             (o.prefs, Cmd::Prefs),
             (o.agents_panel, Cmd::ToggleAgents),
+            (o.search_agents, Cmd::SearchAgents),
             (o.ports_panel, Cmd::TogglePorts),
             (o.procs_panel, Cmd::ToggleProcs),
             (o.toggle_panel, Cmd::TogglePanel),

@@ -144,6 +144,20 @@ pub fn groups(rows: &[Row], visible: impl Fn(&Row) -> bool) -> Vec<Group> {
     out
 }
 
+/// La fila elegida desde el buscador tras moverse `step` puestos por `order` (los ids
+/// visibles, en el orden en que se ven), dando la vuelta como la paleta. Si la elegida ya
+/// no se ve (o no había) se parte de la primera.
+pub fn step_pick(order: &[u64], pick: Option<u64>, step: i32) -> Option<u64> {
+    if order.is_empty() {
+        return None;
+    }
+    let at = pick
+        .and_then(|id| order.iter().position(|&o| o == id))
+        .unwrap_or(0);
+    let n = order.len() as i64;
+    Some(order[(at as i64 + step as i64).rem_euclid(n) as usize])
+}
+
 /// Lo que la lista enseña de una pestaña con agente: id, agente, trabajando, terminó sin
 /// verse y título.
 pub type Mark = (u64, Agent, bool, bool, String);
@@ -361,7 +375,20 @@ impl App {
         resp.on_hover_text(tx.new_session_in_folder);
         y = new.bottom() + 8.0;
 
-        // Buscador: solo recibe teclas tras un clic; Esc lo vacía y devuelve el teclado.
+        // Buscador: recibe teclas tras un clic o con su atajo (`Cmd::SearchAgents`); Esc lo
+        // vacía y devuelve el teclado. ↑/↓ eligen fila y Enter va a ella: se consumen antes
+        // del `TextEdit`, que con ellas movería su cursor.
+        let mut step = 0;
+        if ctx.memory(|m| m.has_focus(search_id())) {
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                    step += 1;
+                }
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                    step -= 1;
+                }
+            });
+        }
         let field = Rect::from_min_max(Pos2::new(left, y), Pos2::new(right, y + 28.0));
         let p = ui.painter();
         p.rect_filled(field, CornerRadius::same(6), pal.bg);
@@ -396,9 +423,24 @@ impl App {
         // buscador: sin `lost_focus` llegaría a la terminal y Enter ejecutaría lo escrito.
         let focused = ui.ctx().memory(|m| m.has_focus(edit.id));
         self.w.agents_search_focus = focused || edit.lost_focus();
+        if edit.changed() {
+            self.w.agents_pick = None;
+        }
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         if self.w.agents_search_focus && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.agents_query.clear();
+            self.w.agents_pick = None;
             edit.surrender_focus();
+        }
+        // Su atajo, a la vista mientras no se usa, como el de «Nueva sesión».
+        if !focused && self.agents_query.is_empty() {
+            ui.painter().text(
+                Pos2::new(field.right() - 8.0, field.center().y),
+                Align2::RIGHT_CENTER,
+                self.keys.label(Cmd::SearchAgents),
+                small.clone(),
+                pal.muted,
+            );
         }
         y = field.bottom() + 8.0;
 
@@ -484,6 +526,18 @@ impl App {
         let (filter, query) = (self.agents_filter, self.agents_query.clone());
         let visible = |r: &Row| filter.admits(r.state) && matches(r, &query);
         let grouped = groups(&rows, visible);
+        // La fila elegida solo existe mientras el buscador tiene el teclado (y en el cuadro
+        // en que Enter lo suelta, para ir a ella).
+        let order: Vec<u64> = grouped
+            .iter()
+            .flat_map(|g| g.rows.iter().map(|&k| rows[k].id))
+            .collect();
+        self.w.agents_pick = if focused || enter {
+            step_pick(&order, self.w.agents_pick, step)
+        } else {
+            None
+        };
+        let picked = self.w.agents_pick.filter(|_| focused);
         let mut go = None;
         ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
             egui::ScrollArea::vertical()
@@ -526,7 +580,8 @@ impl App {
                             pal.muted,
                         );
                         for &k in &g.rows {
-                            if self.agent_row(ui, &rows[k]) {
+                            let pick = picked == Some(rows[k].id);
+                            if self.agent_row(ui, &rows[k], pick, pick && step != 0) {
                                 go = Some(rows[k].id);
                             }
                         }
@@ -534,6 +589,13 @@ impl App {
                 });
         });
 
+        // Al saltar se vacía la búsqueda: la lista vuelve a enseñarlos todos.
+        if enter {
+            go = self.w.agents_pick.take();
+            if go.is_some() {
+                self.agents_query.clear();
+            }
+        }
         let cwd = self.w.sessions.get(self.w.active).map(|s| s.cwd.clone());
         if let Some(id) = go {
             self.focus_session(id);
@@ -552,8 +614,10 @@ impl App {
         }
     }
 
-    /// Una fila de la lista. Devuelve si se hizo clic en ella.
-    fn agent_row(&self, ui: &mut egui::Ui, row: &Row) -> bool {
+    /// Una fila de la lista. Devuelve si se hizo clic en ella. `picked`: es la elegida desde
+    /// el buscador (lleva contorno); `reveal`: se acaba de elegir con las flechas y la lista
+    /// se desplaza hasta ella.
+    fn agent_row(&self, ui: &mut egui::Ui, row: &Row, picked: bool, reveal: bool) -> bool {
         let pal = &self.pal;
         let (rect, resp) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
@@ -563,6 +627,17 @@ impl App {
             p.rect_filled(rect, CornerRadius::same(6), pal.border.gamma_multiply(0.8));
         } else if resp.hovered() {
             p.rect_filled(rect, CornerRadius::same(6), pal.border.gamma_multiply(0.45));
+        }
+        if picked {
+            p.rect_stroke(
+                rect,
+                CornerRadius::same(6),
+                Stroke::new(1.0, pal.accent),
+                StrokeKind::Inside,
+            );
+        }
+        if reveal {
+            resp.scroll_to_me(None);
         }
         let surface = if row.current {
             pal.panel.lerp_to_gamma(pal.border, 0.8)
@@ -780,6 +855,19 @@ mod tests {
             since: Duration::ZERO,
             current: false,
         }
+    }
+
+    #[test]
+    fn elegir_fila_con_flechas() {
+        let o = [10, 20, 30];
+        assert_eq!(step_pick(&o, None, 0), Some(10));
+        assert_eq!(step_pick(&o, Some(99), 0), Some(10)); // ya no se ve
+        assert_eq!(step_pick(&o, Some(20), 0), Some(20));
+        assert_eq!(step_pick(&o, Some(10), 1), Some(20));
+        assert_eq!(step_pick(&o, Some(30), 1), Some(10)); // da la vuelta
+        assert_eq!(step_pick(&o, Some(10), -1), Some(30));
+        assert_eq!(step_pick(&o, None, 1), Some(20)); // desde la primera
+        assert_eq!(step_pick(&[], Some(10), 1), None);
     }
 
     #[test]

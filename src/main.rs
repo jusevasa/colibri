@@ -120,6 +120,7 @@ pub enum Cmd {
     JumpFinished,
     TogglePanel,
     ToggleAgents,
+    SearchAgents,
     TogglePorts,
     ToggleProcs,
     FontBigger,
@@ -160,6 +161,7 @@ impl Keys {
             (Cmd::TogglePanel, &k.toggle_panel),
             (Cmd::ToggleProcs, &k.toggle_processes),
             (Cmd::ToggleAgents, &k.toggle_agents),
+            (Cmd::SearchAgents, &k.search_agents),
             (Cmd::TogglePorts, &k.toggle_ports),
             (Cmd::FontBigger, &k.font_bigger),
             (Cmd::FontSmaller, &k.font_smaller),
@@ -275,6 +277,10 @@ pub struct Win {
     search_focus: bool,
     /// El buscador del panel de agentes tiene el teclado (la terminal no lo recibe).
     agents_search_focus: bool,
+    /// Fila elegida con ↑/↓ mientras ese buscador tiene el teclado (id de la pestaña);
+    /// `None` = la primera que se ve. Enter va a ella. Es de cada ventana: la búsqueda se
+    /// comparte, pero el teclado solo lo tiene una, y las demás la borrarían al repintar.
+    agents_pick: Option<u64>,
     overlay: overlay::Overlay,
     /// Pestaña que se está arrastrando: su id y a qué distancia de su borde se agarró.
     drag_tab: Option<(u64, f32)>,
@@ -360,6 +366,7 @@ impl Win {
             blur_applied: None,
             search_focus: false,
             agents_search_focus: false,
+            agents_pick: None,
             overlay: overlay::Overlay::None,
             drag_tab: None,
             detached: false,
@@ -609,6 +616,7 @@ impl App {
                     Entry::Separator,
                     cmd(m.toggle_panel, Cmd::TogglePanel),
                     cmd(m.agents_panel, Cmd::ToggleAgents),
+                    cmd(m.search_agents, Cmd::SearchAgents),
                     cmd(m.ports_panel, Cmd::TogglePorts),
                     cmd(m.procs_panel, Cmd::ToggleProcs),
                     Entry::Separator,
@@ -1353,6 +1361,17 @@ impl App {
             }
             Cmd::ToggleProcs => self.show_procs = !self.show_procs,
             Cmd::ToggleAgents => self.show_agents = !self.show_agents,
+            Cmd::SearchAgents => {
+                self.show_agents = true;
+                self.w.agents_pick = None;
+                let id = agents::search_id();
+                ctx.memory_mut(|m| m.request_focus(id));
+                // Lo que ya hubiera escrito queda seleccionado: lo que se teclee lo sustituye.
+                let mut edit = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+                let all = egui::text::CCursorRange::select_all_str(&self.agents_query);
+                edit.cursor.set_char_range(Some(all));
+                edit.store(ctx, id);
+            }
             Cmd::TogglePorts => self.show_ports = !self.show_ports,
             Cmd::FontBigger => self.zoom = (self.zoom + 1.0).min(24.0),
             Cmd::FontSmaller => self.zoom = (self.zoom - 1.0).max(6.0 - self.cfg.font_size),
