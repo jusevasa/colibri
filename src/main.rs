@@ -8,6 +8,8 @@ mod clip;
 mod complete;
 mod config;
 mod debug;
+#[allow(dead_code)] // se usa al despegar pestañas desde la barra (siguiente paso)
+mod drag;
 mod git;
 mod grid;
 mod history;
@@ -1623,6 +1625,10 @@ impl App {
                 // Unida a la terminal: su mismo fondo y sin línea por abajo; rayas finas a
                 // los lados. El color de la pestaña va en una raya arriba (en el relleno
                 // rompería la unión).
+                // Redondeada a píxeles como la redondea `rect_filled`: el hueco del fondo de
+                // la barra tiene que coincidir con ella. Si no, con el borde en fracción de
+                // píxel quedaba una columna sin pintar y se veía lo de detrás de la ventana.
+                let rect = egui::emath::GuiRounding::round_to_pixels(rect, ctx.pixels_per_point());
                 active_body = Some(rect);
                 p.rect_filled(rect, 0.0, fade(pal.bg, opacity));
                 for x in [rect.left() + 0.5, rect.right() - 0.5] {
