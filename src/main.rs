@@ -1686,7 +1686,8 @@ impl App {
         let full = ui.max_rect();
         let n = self.w.sessions.len().max(1);
         let show_update = self.update_ready || self.force_update;
-        let right_reserved = if show_update { 216.0 } else { 122.0 };
+        // Con «Actualizar», un botón más de 30 pt a 6 pt de Procesos.
+        let right_reserved = if show_update { 158.0 } else { 122.0 };
         // Puertos/Procesos a la izquierda (agentes a la derecha) van bajo la barra: las
         // pestañas empiezan donde acaba ese panel (el del cuadro anterior), o la primera,
         // siendo la activa, se «uniría» a él en vez de a la terminal.
@@ -2135,42 +2136,35 @@ impl App {
         let mut right_edge = toggle.left() - 24.0;
         let mut restart = false;
         if show_update {
-            // Como las cajas del prompt: fondo de panel y borde fino, con un punto de acento
-            // que avisa de que hay algo nuevo. Sin relleno de color, que desentonaba.
-            let pill = Rect::from_min_max(
-                Pos2::new(right_edge - 92.0, cy - 11.0),
-                Pos2::new(right_edge, cy + 11.0),
+            // Un botón más junto a Procesos y Puertos, del mismo tamaño y a la misma distancia:
+            // flecha circular gris y un punto de acento que avisa de que hay algo nuevo. Qué
+            // hace lo dice el aviso al pasar el puntero.
+            let btn = Rect::from_center_size(
+                Pos2::new(procs_btn.center().x - 36.0, cy),
+                Vec2::new(30.0, 24.0),
             );
-            let resp = ui.interact(pill, ui.scope_id().with("update"), Sense::click());
+            let resp = ui.interact(btn, ui.scope_id().with("update"), Sense::click());
             let over = resp.hovered();
-            let (fill, border, text) = if over {
-                (
-                    pal.panel.lerp_to_gamma(pal.fg, 0.09),
-                    pal.accent.gamma_multiply(0.7),
-                    pal.fg,
-                )
-            } else {
-                (pal.panel, pal.border, pal.fg.gamma_multiply(0.8))
-            };
             let p = ui.painter();
-            p.rect_filled(pill, CornerRadius::same(6), fill);
-            p.rect_stroke(
-                pill,
-                CornerRadius::same(6),
-                Stroke::new(1.0, border),
-                StrokeKind::Inside,
-            );
-            p.circle_filled(Pos2::new(pill.left() + 13.0, cy), 3.0, pal.accent);
-            p.text(
-                Pos2::new(pill.left() + 23.0, cy),
-                Align2::LEFT_CENTER,
-                i18n::t().chrome.update,
-                FontId::proportional(11.5),
-                text,
-            );
+            let surface = if over {
+                p.rect_filled(btn, CornerRadius::same(6), pal.border);
+                pal.border
+            } else {
+                fade(pal.tab_bar, opacity)
+            };
+            update_icon(p, btn.center(), if over { pal.fg } else { pal.muted });
+            // La insignia lleva un aro del color de debajo, como la de las pestañas.
+            // Arriba a la derecha, sin tapar la punta de la flecha.
+            let dot = btn.center() + Vec2::new(8.0, -7.0);
+            p.circle_filled(dot, 4.0, surface);
+            p.circle_filled(dot, 2.75, pal.accent);
             restart = resp.clicked();
-            resp.on_hover_text(i18n::t().chrome.update_hint);
-            right_edge = pill.left() - 8.0;
+            let t = &i18n::t().chrome;
+            resp.on_hover_ui(|ui| {
+                ui.strong(t.update);
+                ui.label(t.update_hint);
+            });
+            right_edge = btn.left() - 24.0;
         }
 
         // El resto de la barra arrastra la ventana.
@@ -3819,6 +3813,24 @@ fn section_icon(p: &egui::Painter, c: Pos2, section: Section, color: Color32) {
             p.add(egui::Shape::closed_line(meridian, stroke));
         }
     }
+}
+
+/// Flecha circular del botón «Actualizar» (reinicia con la compilación nueva).
+fn update_icon(p: &egui::Painter, c: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    // Desde la derecha, en el sentido de las agujas del reloj, hasta arriba a la derecha.
+    let (r, end, steps) = (5.2, 314f32.to_radians(), 28);
+    let arc: Vec<Pos2> = (0..=steps)
+        .map(|i| {
+            let a = end * i as f32 / steps as f32;
+            c + Vec2::new(a.cos(), a.sin()) * r
+        })
+        .collect();
+    p.add(egui::Shape::line(arc, stroke));
+    // La punta: un ángulo recto que señala hacia donde sigue el giro.
+    let tip = [(4.2, -6.1), (4.2, -3.5), (1.6, -3.5)];
+    let tip: Vec<Pos2> = tip.iter().map(|&(x, y)| c + Vec2::new(x, y)).collect();
+    p.add(egui::Shape::line(tip, stroke));
 }
 
 /// Encabezado de apartado. Devuelve true si se pulsó la × para ocultarlo.
