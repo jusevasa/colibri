@@ -54,6 +54,10 @@ pub struct Tab {
     pub color: String,
     /// Agente que corría en la pestaña ("claude"), o vacío.
     pub agent: String,
+    /// Con Claude Code: su sesión (`sessionId`) y la tarea en segundo plano que lleva o que
+    /// aparcó (`jobId`/`parkedJobId`), para retomar esa conversación (`claude.rs`).
+    pub claude_session: String,
+    pub claude_job: String,
 }
 
 /// Con un guion de depuración activo no se toca la sesión real del usuario,

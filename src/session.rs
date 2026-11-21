@@ -662,6 +662,9 @@ pub struct Session {
     /// A dónde apunta ese ssh, por sus argumentos (por si el servidor no dice su nombre).
     remote_target: Option<String>,
     pub agent: Option<Agent>,
+    /// La sesión de Claude Code de la pestaña (`~/.claude/sessions/<pid>.json`), la última
+    /// que se vio: al restaurar se retoma esa y no «la más reciente de la carpeta».
+    pub claude: Option<crate::claude::Running>,
 
     /// Hay algo corriendo: un agente trabajando o un comando en primer plano.
     pub busy: bool,
@@ -823,6 +826,7 @@ impl Session {
             remote: false,
             remote_target: None,
             agent: None,
+            claude: None,
             busy: false,
             busy_since: now,
             last_input: old,
@@ -1585,6 +1589,12 @@ impl Session {
             if let Some(dir) = proc::cwd(fg).or_else(|| proc::cwd(self.shell_pid)) {
                 moved = dir != self.cwd;
                 self.cwd = dir;
+            }
+            // Un archivo pequeño, como mucho una vez por segundo y solo con actividad.
+            if matches!(self.agent, Some(Agent::Claude))
+                && let Some(r) = crate::claude::of_pid(fg)
+            {
+                self.claude = Some(r);
             }
         }
 

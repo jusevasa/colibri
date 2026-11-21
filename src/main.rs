@@ -2,6 +2,7 @@
 //! Sin telemetría: la app no abre ninguna conexión de red propia.
 
 mod blur;
+mod claude;
 mod clip;
 mod complete;
 mod config;
@@ -728,9 +729,11 @@ impl App {
     }
 
     /// Abre en la ventana en curso una pestaña guardada, en su carpeta y con su nombre y su
-    /// color. Donde corría Claude Code deja `claude --continue` como sugerencia en gris (no
-    /// lo escribe en el shell): Enter retoma esa conversación, Tab o → lo deja escrito para
-    /// editarlo. Devuelve false si la carpeta ya no existe.
+    /// color. Donde corría Claude Code deja la orden para retomar *su* conversación como
+    /// sugerencia en gris (`claude::resume_command`: `claude attach` si sigue viva en
+    /// segundo plano, `claude --resume <sesión>` si no, `--continue` si no se supo cuál). No
+    /// la escribe en el shell: Enter la ejecuta, Tab o → la deja escrita para editarla.
+    /// Devuelve false si la carpeta ya no existe.
     fn open_saved_tab(&mut self, ctx: &egui::Context, tab: &state::Tab) -> bool {
         let dir = std::path::PathBuf::from(&tab.cwd);
         if !dir.is_dir() {
@@ -748,7 +751,12 @@ impl App {
                 .position(|(name, _)| *name == tab.color)
                 .map(|k| k as u8);
             if tab.agent == "claude" {
-                s.suggestion = Some("claude --continue".into());
+                let live = claude::running();
+                s.suggestion = Some(claude::resume_command(
+                    &tab.claude_session,
+                    &tab.claude_job,
+                    &live,
+                ));
             }
         }
         true
@@ -3003,6 +3011,22 @@ fn tab_record(s: &Session) -> state::Tab {
             Some(session::Agent::Claude) => "claude".into(),
             _ => String::new(),
         },
+        ..claude_ids(s)
+    }
+}
+
+/// La sesión de Claude Code de la pestaña para guardarla: se relee al guardar (la tarea
+/// aparcada puede aparecer con la pestaña en reposo, sin sondeos) y, si ya no está, vale la
+/// última que vio `Session::poll`.
+fn claude_ids(s: &Session) -> state::Tab {
+    if !matches!(s.agent, Some(session::Agent::Claude)) {
+        return state::Tab::default();
+    }
+    let seen = claude::of_pid(s.fg_pid).or_else(|| s.claude.clone());
+    state::Tab {
+        claude_session: seen.as_ref().map(|r| r.session.clone()).unwrap_or_default(),
+        claude_job: seen.and_then(|r| r.job).unwrap_or_default(),
+        ..Default::default()
     }
 }
 
