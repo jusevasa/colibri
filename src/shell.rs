@@ -135,6 +135,24 @@ const DRAWABLE_TIMEOUT: Duration = Duration::from_millis(100);
 /// La espera evita soltarlo y volver a crearlo entre tecla y tecla.
 const RESERVE_IDLE: Duration = Duration::from_secs(5);
 
+/// Tras la última pasada que anima algo (`animating`), el pintor sigue en modo fluido este
+/// tiempo: los últimos cuadros aún están en vuelo y una animación suele venir detrás de otra
+/// (arrastrar, parar, seguir arrastrando).
+const SMOOTH_HOLD: Duration = Duration::from_millis(500);
+
+/// Marca de `animating` en la memoria de egui; el lanzador la lee y la borra tras cada pasada.
+fn animating_id() -> egui::Id {
+    egui::Id::unique("colibri-animating")
+}
+
+/// Algo de la interfaz se mueve en esta pasada y tiene que verse fluido (una pestaña que se
+/// desliza o se arrastra, un cuadro que aparece): el pintor pasa al modo fluido
+/// (`Painter::set_smooth`) mientras dure y un rato después (`SMOOTH_HOLD`). Pedir el
+/// siguiente cuadro sigue siendo cosa de quien anima.
+pub fn animating(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(animating_id(), true));
+}
+
 /// Cuándo toca soltar el drawable de reserva: `RESERVE_IDLE` después del último cuadro
 /// presentado, una vez por tanda (`released`) y nunca antes del primer cuadro.
 fn reserve_due(presented_at: Option<Instant>, released: bool) -> Option<Instant> {
@@ -292,6 +310,8 @@ struct Running {
     presented_at: Option<Instant>,
     /// El drawable de reserva ya se soltó (o se intentó) en esta tanda de reposo.
     reserve_released: bool,
+    /// Hasta cuándo sigue el modo fluido del pintor (`animating`).
+    smooth_until: Option<Instant>,
 
     window: Window,
 }
@@ -443,6 +463,7 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
                 shrunk: false,
                 presented_at: None,
                 reserve_released: false,
+                smooth_until: None,
                 window,
             },
         );
@@ -492,6 +513,13 @@ impl<F> Runner<F> {
 
         let now = Instant::now();
         for run in self.windows.values_mut() {
+            // Acabó el modo fluido: fuera el tercer drawable, aunque la ventana se quede
+            // quieta. Si sigue habiendo cuadros, lo intenta también cada pasada.
+            if run.smooth_until.is_some_and(|at| at <= now) {
+                run.smooth_until = None;
+                run.painter.set_smooth(false);
+                run.painter.trim();
+            }
             // A la vista pero quieta: fuera el drawable de reserva. Se apunta aunque el pintor
             // no lo suelte (un cuadro en vuelo), para no despertar en bucle.
             if run.reserve_due().is_some_and(|at| at <= now) {
@@ -544,10 +572,15 @@ impl<F> Runner<F> {
                     (Some(at), Some(until)) => Some(at.max(until)),
                     (at, _) => at,
                 };
-                [repaint, run.redraw_deadline, run.reserve_due()]
-                    .into_iter()
-                    .flatten()
-                    .min()
+                [
+                    repaint,
+                    run.redraw_deadline,
+                    run.reserve_due(),
+                    run.smooth_until,
+                ]
+                .into_iter()
+                .flatten()
+                .min()
             })
             .min();
         event_loop.set_control_flow(match wake_at {
@@ -654,6 +687,15 @@ impl Running {
             self.shrink_if_hidden_long();
         }
 
+        // Modo fluido (`animating`): tres drawables mientras dure; al acabar, fuera el que sobre.
+        if self.smooth_until.is_some_and(|at| at <= Instant::now()) {
+            self.smooth_until = None;
+        }
+        self.painter.set_smooth(self.smooth_until.is_some());
+        if self.smooth_until.is_none() {
+            self.painter.trim();
+        }
+
         // Sin drawable libre, la pasada de egui (interfaz y teselado) se tiraría entera, y con
         // el drawable a punto de liberarse `nextDrawable` pararía el hilo principal: solo
         // `logic()`, como con la ventana oculta, y el cuadro se pinta cuando el pintor avise
@@ -713,6 +755,12 @@ impl Running {
             app.ui(win, ui);
             debug::timing::add(&debug::timing::UI, t.elapsed());
         });
+        if self.ctx.data_mut(|d| d.remove_temp::<bool>(animating_id())) == Some(true) {
+            let until = Instant::now() + SMOOTH_HOLD;
+            self.smooth_until = Some(until);
+            // Este mismo cuadro ya puede usar el tercer drawable.
+            self.painter.set_smooth(true);
+        }
 
         self.info.events.clear();
         self.kept = Kept::from(&platform_output);

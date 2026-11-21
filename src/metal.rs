@@ -107,6 +107,19 @@ fn drawable_count() -> usize {
         .unwrap_or(2)
 }
 
+/// Drawables de la capa en modo fluido (`Painter::set_smooth`). Con 2, un cuadro no puede
+/// empezar hasta que el anterior llega a la pantalla y suelta el que estaba: tres refrescos
+/// por cuadro, o sea 20 cuadros/s a 60 Hz y 40 a 120 Hz (medido). Con 3, uno por refresco.
+/// `COLIBRI_NO_SMOOTH` lo desactiva para comparar.
+fn smooth_count() -> usize {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("COLIBRI_NO_SMOOTH").is_some()) {
+        drawable_count()
+    } else {
+        3
+    }
+}
+
 /// Cuántos drawables puede haber en vuelo antes de saltar cuadros. Por defecto uno menos
 /// que los de la capa; `COLIBRI_DRAWABLES=<n>` lo cambia para medir.
 fn drawable_limit(layer_max: usize) -> usize {
@@ -1071,6 +1084,8 @@ pub struct Painter {
     shown: Vec<u8>,
     /// La del cuadro en curso (se reutiliza la memoria).
     next: Vec<u8>,
+    /// La capa pasó por el modo fluido y puede quedarle un tercer drawable (`trim`).
+    extra: bool,
 }
 
 /// Capa de Metal de la ventana: transparente, en sRGB, sin esperar a ciegas un drawable.
@@ -1142,7 +1157,42 @@ impl Painter {
             transaction: false,
             shown: Vec::new(),
             next: Vec::new(),
+            extra: false,
         })
+    }
+
+    /// Modo fluido: mientras algo se anima (una pestaña que se desliza o se arrastra, un
+    /// cuadro que aparece), la capa admite un tercer drawable y los cuadros salen a la
+    /// frecuencia de la pantalla. Fuera de eso vuelve a 2. La capa solo crea el tercero
+    /// cuando de verdad hay dos cuadros en vuelo; al acabar lo suelta `trim`.
+    pub fn set_smooth(&mut self, on: bool) {
+        let want = if on { smooth_count() } else { drawable_count() };
+        if self.layer.maximumDrawableCount() != want {
+            self.layer.setMaximumDrawableCount(want);
+            self.extra |= want > drawable_count();
+        }
+    }
+
+    /// Fuera del modo fluido: suelta el tercer drawable si la capa llegó a crearlo. Volver a
+    /// 2 no basta: la capa se queda con los que ya tiene, y con algo trabajando (cuadros cada
+    /// 125–250 ms) la reserva nunca se soltaba (medido: 3,6 MB de más en una pantalla de
+    /// 60 Hz sin Retina, ~14 MB en una Retina). Mismo truco que `release_reserve`, que tira
+    /// los drawables libres; el siguiente cuadro crea uno a tamaño de ventana. Solo cuando
+    /// `gate` deja pedir drawable sin esperar (nada en vuelo y ya soltado el que estaba en
+    /// pantalla): si no, vuelve a probar en la pasada siguiente.
+    pub fn trim(&mut self) {
+        if !self.extra
+            || self.layer.maximumDrawableCount() > drawable_count()
+            || self.gate() != Gate::Free
+        {
+            return;
+        }
+        self.extra = false;
+        if self.size != [0, 0] {
+            self.layer.setDrawableSize(NSSize::new(1.0, 1.0));
+            autoreleasepool(|_| drop(self.layer.nextDrawable()));
+            self.size = [0, 0];
+        }
     }
 
     /// Lado máximo de una textura (para `RawInput::max_texture_side`).
@@ -1180,6 +1230,7 @@ impl Painter {
         self.layer.setDrawableSize(NSSize::new(1.0, 1.0));
         autoreleasepool(|_| drop(self.layer.nextDrawable()));
         self.size = [0, 0];
+        self.extra = false;
         true
     }
 
@@ -1275,6 +1326,7 @@ impl Painter {
         // Los drawables de la capa vieja ya no cuentan contra la nueva.
         self.flight.reset();
         self.size = [0, 0];
+        self.extra = false;
         self.transaction = false;
         // La capa nueva está vacía: el siguiente cuadro se presenta aunque sea igual.
         self.shown.clear();
