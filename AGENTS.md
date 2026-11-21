@@ -1,12 +1,33 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guía para los agentes de código (Claude Code, Codex, Cursor, Gemini, Copilot…) y para las personas que trabajan en este repositorio. Es la única fuente de reglas del proyecto: la leen los agentes al trabajar aquí y CodeRabbit la usa como criterio al revisar cada PR, así que un cambio que no las cumpla saldrá en la revisión.
+
+## Reglas del repositorio
+
+Valen para cualquier cambio, lo haga una persona o un agente. Si una tarea choca con alguna, para y pregunta antes de saltártela.
+
+1. **Español.** Código, comentarios, documentación y mensajes de commit van en español. Los textos de la interfaz, en español e inglés (`src/i18n/`, ver más abajo).
+2. **Privacidad.** La app no abre conexiones de red propias (la única excepción es la sonda HTTP a `127.0.0.1` para saber si un puerto es web) y ningún programa lee el portapapeles a través de ella (`ClipboardLoad` se ignora a propósito). No añadas telemetría, comprobaciones de versión ni dependencias que llamen a internet sin haberlo acordado antes en una issue.
+3. **Código ajeno.** Nada de código copiado de proyectos con licencias incompatibles con Apache-2.0. Warp (AGPL) sirvió solo como referencia de técnica, nunca de código. Si traes código con licencia compatible, conserva su aviso de copyright y dilo en el PR.
+4. **`vendor/alacritty_terminal`.** Todo cambio respecto al original va marcado con un comentario «Colibrí:»; sin la marca se pierde al actualizar la versión.
+5. **Repintado bajo demanda.** No añadas repintados continuos ni hilos que despierten en reposo. Lo que cambie en `logic()` y se dibuje en `ui()` pide su cuadro (ver «Repintado bajo demanda»).
+6. **Se mide antes de afirmar.** Una afirmación de rendimiento o memoria (en el código, en este archivo o en el PR) dice cómo se midió y qué salió, como hace el resto de este documento.
+7. **No pises los archivos del usuario.** Al ejecutar la app para probar, usa siempre `COLIBRI_CONFIG` (y `COLIBRI_STATE` si hace falta) con archivos temporales, y un `HISTFILE` falso si tocas el historial. No escribas en `~/.config/colibri`, `~/.claude` ni en el historial real.
+8. **Interfaz verificable.** Una función de interfaz nueva lleva su paso en el guion de depuración (`Step` en `debug.rs` + el `match` de `App::run_script`) y se comprueba con una captura (`shot`).
+9. **Antes de dar algo por terminado:** `cargo fmt`, `cargo clippy --all-targets` sin avisos nuevos y `cargo test` (más `cargo test --lib` en `vendor/alacritty_terminal` si lo tocaste). Di qué corriste y qué salió; si algo falla o no se pudo probar, dilo.
+10. **Este archivo va al día.** Si cambias algo que aquí se describe, actualiza su sección en el mismo PR.
+
+### Commits y PR
+
+- Mensajes al estilo Conventional Commits, en español: `feat: …`, `fix: …`, `docs: …`, `refactor: …`.
+- Si un agente ayudó, se declara con un trailer en el commit: `Co-Authored-By: <agente> <correo>` (el que ya pone Claude Code) o `Assisted-by: <agente>:<modelo>`.
+- Un agente nunca añade `Signed-off-by` ni aprueba un PR: del cambio responde la persona que lo envía, que tiene que haberlo leído y entendido.
+- Sin secretos, credenciales ni datos personales en commits, PR o issues.
+- Sin push forzado, sin reescribir historia publicada y sin publicar nada (releases, etiquetas, comentarios) si no te lo piden.
 
 ## Qué es
 
 Colibrí es una terminal para macOS escrita en Rust (edición 2024), pensada para correr varios agentes de código (Claude Code, Codex, Gemini…) en pestañas y saber cuál está trabajando y cuál terminó. Es un único binario: `egui` sobre `winit` con un pintor propio en Metal (sin eframe ni wgpu) para la interfaz y `alacritty_terminal` como emulador + PTY. Solo macOS: usa `libproc`, `lsof`, `ps`, `vm_stat`, `osascript`, `open` y APIs de Cocoa vía `objc2`.
-
-El código, los comentarios, los textos de la interfaz y los mensajes de commit están en español; mantén ese idioma.
 
 ## Comandos
 
