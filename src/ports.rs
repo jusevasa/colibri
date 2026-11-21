@@ -114,20 +114,6 @@ fn scan(web_cache: &mut HashMap<(i32, u16), bool>) -> Vec<Port> {
     ports
 }
 
-/// Procesos que escuchan en algún puerto TCP, sin más detalle (más rápido que `scan`).
-pub fn listening_pids() -> Vec<i32> {
-    let Ok(out) = Command::new("/usr/sbin/lsof")
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "p"])
-        .output()
-    else {
-        return vec![];
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix('p')?.parse().ok())
-        .collect()
-}
-
 fn is_http(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(150)) else {

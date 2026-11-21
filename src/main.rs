@@ -309,51 +309,26 @@ enum Fill {
     /// Las pestañas guardadas de la última vez.
     Saved(state::Window),
     /// Una ventana cerrada hace poco que se reabre.
-    Reopen(Vec<ClosedTab>, usize),
+    Reopen(Vec<state::Tab>, usize),
 }
 
-/// Una pestaña cerrada hace poco.
-struct ClosedTab {
-    saved: state::Tab,
-    /// La pestaña sigue viva durante `GRACE` (proceso, pantalla e historial) si en ella
-    /// corría un agente; si no, o pasado ese tiempo, solo queda lo guardado.
-    session: Option<Session>,
-    /// Llega `true` si algo de la pestaña escucha en un puerto: entonces se cierra ya, para
-    /// no dejar el puerto ocupado.
-    ports: Option<std::sync::mpsc::Receiver<bool>>,
-}
-
-/// Algo que se cerró hace poco: una pestaña (y de qué ventana y en qué puesto) o una ventana.
-struct Closed {
-    at: Instant,
-    what: ClosedWhat,
-}
-
-enum ClosedWhat {
+/// Algo que se cerró hace poco, para reabrirlo con ⌘⇧T: una pestaña (y de qué ventana y en
+/// qué puesto) o una ventana. Solo queda lo guardado: al cerrar, el proceso termina en el
+/// acto (como en Terminal, Ghostty o Warp) y al reabrir se abre una pestaña nueva en su
+/// carpeta, con la orden para retomar la conversación si corría Claude Code.
+enum Closed {
     Tab {
-        tab: ClosedTab,
+        tab: state::Tab,
         win: WindowId,
         index: usize,
     },
     Window {
-        tabs: Vec<ClosedTab>,
+        tabs: Vec<state::Tab>,
         active: usize,
         frame: Option<[f32; 4]>,
     },
 }
 
-impl Closed {
-    fn tabs_mut(&mut self) -> impl Iterator<Item = &mut ClosedTab> {
-        let (one, many) = match &mut self.what {
-            ClosedWhat::Tab { tab, .. } => (Some(tab), None),
-            ClosedWhat::Window { tabs, .. } => (None, Some(tabs.iter_mut())),
-        };
-        one.into_iter().chain(many.into_iter().flatten())
-    }
-}
-
-/// Cuánto sigue viva una pestaña con agente después de cerrarla.
-const GRACE: Duration = Duration::from_secs(30);
 /// Cuántas cosas cerradas se recuerdan.
 const CLOSED_MAX: usize = 10;
 
@@ -468,101 +443,21 @@ impl App {
         self.opening.push_back(Fill::Fresh(cwd));
     }
 
-    /// Lo que queda de una pestaña al cerrarla: si en ella corría un agente sigue viva
-    /// `GRACE` (por si fue sin querer), salvo que algo suyo escuche en un puerto (eso se
-    /// mira en un hilo, porque `lsof` tarda).
-    fn bury(&self, s: Session) -> ClosedTab {
-        let saved = tab_record(&s);
-        if s.agent.is_none() {
-            return ClosedTab {
-                saved,
-                session: None,
-                ports: None,
-            };
-        }
-        s.set_shown(false);
-        let shell = s.shell_pid();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("colibri-closing".into())
-            .spawn(move || {
-                let busy = ports::listening_pids()
-                    .into_iter()
-                    .any(|pid| descends(pid, shell));
-                let _ = tx.send(busy);
-                shell::wake_all();
-            })
-            .ok();
-        ClosedTab {
-            saved,
-            session: Some(s),
-            ports: Some(rx),
-        }
-    }
-
-    fn remember(&mut self, what: ClosedWhat) {
-        self.closed.push(Closed {
-            at: Instant::now(),
-            what,
-        });
+    fn remember(&mut self, what: Closed) {
+        self.closed.push(what);
         if self.closed.len() > CLOSED_MAX {
             self.closed.remove(0);
         }
     }
 
-    /// Mantiene lo cerrado: las pestañas vivas se siguen atendiendo (un programa puede
-    /// esperar respuesta de la terminal) hasta que vence su plazo o resulta que tienen un
-    /// puerto abierto; entonces se cierran y solo queda lo guardado.
-    fn tend_closed(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        let pal = &self.pal;
-        let mut next: Option<Duration> = None;
-        for closed in &mut self.closed {
-            let left = GRACE.saturating_sub(now - closed.at);
-            for tab in closed.tabs_mut() {
-                if let Some(rx) = &tab.ports {
-                    match rx.try_recv() {
-                        Ok(busy) => {
-                            tab.ports = None;
-                            if busy {
-                                tab.session = None;
-                            }
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => tab.ports = None,
-                    }
-                }
-                if left.is_zero() {
-                    tab.session = None;
-                }
-                if let Some(s) = &mut tab.session {
-                    s.drain(ctx, pal);
-                    next = Some(next.map_or(left, |n| n.min(left)));
-                }
-            }
+    /// Pone en la ventana en curso una pestaña nueva con lo guardado de una cerrada.
+    fn revive(&mut self, ctx: &egui::Context, tab: &state::Tab, at: Option<usize>) {
+        if !self.open_saved_tab(ctx, tab) {
+            return;
         }
-        if let Some(wait) = next {
-            ctx.request_repaint_after(wait);
-        }
-    }
-
-    /// Pone en la ventana en curso una pestaña cerrada: la misma si sigue viva, o una nueva
-    /// en su carpeta.
-    fn revive(&mut self, ctx: &egui::Context, tab: ClosedTab, at: Option<usize>) {
+        let s = self.w.sessions.pop().expect("recién abierta");
         let i = at.unwrap_or(usize::MAX).min(self.w.sessions.len());
-        match tab.session {
-            Some(s) => {
-                s.set_context(ctx);
-                self.w.sessions.insert(i, s);
-            }
-            None => {
-                if !self.open_saved_tab(ctx, &tab.saved) {
-                    return;
-                }
-                let s = self.w.sessions.pop().expect("recién abierta");
-                self.w.sessions.insert(i, s);
-            }
-        }
+        self.w.sessions.insert(i, s);
         self.w.active = i;
         ctx.request_repaint();
     }
@@ -573,21 +468,21 @@ impl App {
         let Some(closed) = self.closed.pop() else {
             return;
         };
-        match closed.what {
-            ClosedWhat::Tab { tab, win, index } => {
+        match closed {
+            Closed::Tab { tab, win, index } => {
                 let back = self.cur;
                 let home = self.order.contains(&win);
                 if home {
                     self.enter(win);
                 }
                 let ctx = self.w.ctx.clone();
-                self.revive(&ctx, tab, home.then_some(index));
+                self.revive(&ctx, &tab, home.then_some(index));
                 ctx.send_viewport_cmd(ViewportCommand::Focus);
                 if let Some(back) = back {
                     self.enter(back);
                 }
             }
-            ClosedWhat::Window {
+            Closed::Window {
                 tabs,
                 active,
                 frame,
@@ -1107,10 +1002,10 @@ impl App {
         if i >= self.w.sessions.len() {
             return;
         }
-        let s = self.w.sessions.remove(i);
-        let tab = self.bury(s);
+        // Se apunta para ⌘⇧T y se suelta: el proceso termina ya (`Pty::drop`).
+        let tab = tab_record(&self.w.sessions.remove(i));
         if let Some(win) = self.cur {
-            self.remember(ClosedWhat::Tab { tab, win, index: i });
+            self.remember(Closed::Tab { tab, win, index: i });
         }
         if self.w.active > i || self.w.active >= self.w.sessions.len() {
             self.w.active = self.w.active.saturating_sub(1);
@@ -2521,7 +2416,7 @@ impl shell::App for App {
             Fill::Fresh(dir) => self.new_tab(ctx, dir),
             Fill::Saved(saved) => self.open_saved_window(ctx, &saved),
             Fill::Reopen(tabs, active) => {
-                for tab in tabs {
+                for tab in &tabs {
                     self.revive(ctx, tab, None);
                 }
                 self.w.active = active.min(self.w.sessions.len().saturating_sub(1));
@@ -2553,27 +2448,17 @@ impl shell::App for App {
         if self.front == Some(win) {
             self.front = self.cur;
         }
-        // Sus pestañas quedan entre lo cerrado (⌘⇧T); las que siguen vivas piden sus
-        // cuadros a la ventana que queda. Si era la última, la aplicación sale y se sueltan.
+        // Sus pestañas quedan apuntadas para ⌘⇧T y sus procesos terminan al soltar `gone`.
+        // Si era la última, la aplicación sale.
         if let Some(gone) = gone
             && !gone.sessions.is_empty()
             && self.cur.is_some()
         {
-            let ctx = self.w.ctx.clone();
-            let tabs: Vec<ClosedTab> = gone
-                .sessions
-                .into_iter()
-                .map(|s| {
-                    s.set_context(&ctx);
-                    self.bury(s)
-                })
-                .collect();
-            self.remember(ClosedWhat::Window {
-                tabs,
+            self.remember(Closed::Window {
+                tabs: gone.sessions.iter().map(tab_record).collect(),
                 active: gone.active,
                 frame: gone.frame,
             });
-            ctx.request_repaint();
         }
     }
 
@@ -2708,7 +2593,6 @@ impl shell::App for App {
             self.run(ctx, cmd);
             ctx.request_repaint();
         }
-        self.tend_closed(ctx);
 
         // Carpetas que llegan de Finder («Abrir con», el icono del Dock, el servicio): una
         // pestaña en cada una (en la carpeta del archivo, si es un archivo).
@@ -3016,20 +2900,6 @@ fn claude_ids(s: &Session) -> state::Tab {
         claude_job: seen.and_then(|r| r.job).unwrap_or_default(),
         ..Default::default()
     }
-}
-
-/// Si `pid` es `ancestor` o desciende de él.
-fn descends(mut pid: i32, ancestor: i32) -> bool {
-    for _ in 0..16 {
-        if pid == ancestor {
-            return true;
-        }
-        match proc::parent(pid) {
-            Some(p) if p > 1 => pid = p,
-            _ => return false,
-        }
-    }
-    false
 }
 
 /// Una caja por dato (carpeta, rama de git, archivos con cambios) de una línea de cajas,
