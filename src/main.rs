@@ -27,6 +27,7 @@ mod session;
 mod shell;
 mod state;
 mod switch;
+mod updates;
 mod view;
 
 use config::{Config, Palette, Shortcut};
@@ -253,6 +254,14 @@ struct App {
     update_ready: bool,
     /// Solo para pruebas: muestra el botón «Actualizar» aunque no haya nada nuevo.
     force_update: bool,
+    /// «Buscar actualizaciones»: el hilo que mira el cask del tap (`updates.rs`).
+    updates: updates::Updates,
+    /// Versión publicada más nueva que la que corre, si la preferencia está encendida. El
+    /// botón de la barra la ofrece mientras no haya ya una compilación nueva en disco.
+    update_available: Option<String>,
+    /// Solo para pruebas: si el aviso de versión nueva actúa como con Homebrew (`Some(true)`)
+    /// o abre la página (`Some(false)`), en vez de mirarlo en el disco.
+    assume_brew: Option<bool>,
     /// Solo para pruebas: teclas del guion que entran como si se pulsaran de verdad.
     script_keys: Vec<(egui::Key, egui::Modifiers)>,
     /// Solo para pruebas: eventos de puntero del guion (`press`, `moveto`, `release`).
@@ -396,6 +405,8 @@ impl App {
         hotkey::set(hotkey::Global::Jump, &cfg.keys.global_jump);
         hotkey::set(hotkey::Global::Focus, &cfg.keys.global_focus);
         let script = debug::Script::from_env();
+        // Con el guion no hay hilo de actualizaciones: nunca se conecta (el aviso se simula).
+        let updates = updates::Updates::start(env!("CARGO_PKG_VERSION"), script.is_none());
         let mut app = Self {
             pal: Palette::new(&cfg.theme),
             keys: Keys::new(&cfg.keys),
@@ -438,6 +449,9 @@ impl App {
             exe_checked: Instant::now(),
             update_ready: false,
             force_update: false,
+            updates,
+            update_available: None,
+            assume_brew: None,
             script_keys: Vec::new(),
             script_pointer: Vec::new(),
             script_drops: Vec::new(),
@@ -979,6 +993,39 @@ impl App {
                     x,
                 };
                 ctx.request_repaint();
+            }
+        }
+    }
+
+    /// ¿El aviso de versión nueva instala con Homebrew? Si esta copia la instaló él.
+    fn upgrades_with_brew(&self) -> bool {
+        self.assume_brew
+            .unwrap_or_else(updates::installed_with_brew)
+    }
+
+    /// Clic en el aviso de versión nueva: con Homebrew, una pestaña nueva que ejecuta
+    /// `brew upgrade --cask colibri` en cuanto la shell está lista (se ve todo lo que hace);
+    /// al reemplazar el ejecutable aparece «Actualizar». Sin Homebrew, la página de la versión.
+    fn start_upgrade(&mut self, ctx: &egui::Context) {
+        let Some(version) = self.update_available.clone() else {
+            return;
+        };
+        if self.upgrades_with_brew() {
+            // Si la pestaña no se pudo abrir, la última es otra que ya estaba: nada de escribir
+            // la orden ahí.
+            let before = self.w.sessions.len();
+            self.new_tab(ctx, dirs::home_dir());
+            if self.w.sessions.len() > before
+                && let Some(s) = self.w.sessions.last_mut()
+            {
+                s.run_when_ready(updates::BREW_UPGRADE.to_string());
+            }
+        } else {
+            let url = updates::release_url(&version);
+            if self.script.is_some() {
+                eprintln!("enlace: {url}");
+            } else {
+                spawn_detached("/usr/bin/open", &[url]);
             }
         }
     }
@@ -1611,6 +1658,10 @@ impl App {
                 }
             }
             Some(debug::Step::Update) => self.force_update = !self.force_update,
+            Some(debug::Step::UpdateAvailable(version, brew)) => {
+                self.updates.set_available(version);
+                self.assume_brew = Some(brew);
+            }
             Some(debug::Step::Menu(title)) => {
                 if !menu::perform(&title) {
                     eprintln!("menú: no hay ninguna entrada «{title}»");
@@ -1685,7 +1736,7 @@ impl App {
         let pal = self.pal.clone();
         let full = ui.max_rect();
         let n = self.w.sessions.len().max(1);
-        let show_update = self.update_ready || self.force_update;
+        let show_update = self.update_ready || self.force_update || self.update_available.is_some();
         // Con «Actualizar», un botón más de 30 pt a 6 pt de Procesos.
         let right_reserved = if show_update { 158.0 } else { 122.0 };
         // Puertos/Procesos a la izquierda (agentes a la derecha) van bajo la barra: las
@@ -2132,13 +2183,20 @@ impl App {
             resp.on_hover_text(hint);
         }
 
-        // Compilación nueva en disco: un clic reinicia y la toma.
+        // Compilación nueva en disco: un clic reinicia y la toma. Si no, pero hay una versión
+        // publicada más nueva («Buscar actualizaciones»), el clic la instala con Homebrew en
+        // una pestaña (o abre su página); al reemplazar brew el ejecutable, el botón pasa a
+        // reiniciar.
         let mut right_edge = toggle.left() - 24.0;
         let mut restart = false;
+        let mut upgrade = false;
         if show_update {
+            let available = (!self.update_ready && !self.force_update)
+                .then(|| self.update_available.clone())
+                .flatten();
             // Un botón más junto a Procesos y Puertos, del mismo tamaño y a la misma distancia:
-            // flecha circular gris y un punto de acento que avisa de que hay algo nuevo. Qué
-            // hace lo dice el aviso al pasar el puntero.
+            // flecha circular (reiniciar) o hacia abajo (descargar) y un punto de acento que
+            // avisa de que hay algo nuevo. Qué hace lo dice el aviso al pasar el puntero.
             let btn = Rect::from_center_size(
                 Pos2::new(procs_btn.center().x - 36.0, cy),
                 Vec2::new(30.0, 24.0),
@@ -2152,18 +2210,39 @@ impl App {
             } else {
                 fade(pal.tab_bar, opacity)
             };
-            update_icon(p, btn.center(), if over { pal.fg } else { pal.muted });
+            let icon_color = if over { pal.fg } else { pal.muted };
+            if available.is_some() {
+                download_icon(p, btn.center(), icon_color);
+            } else {
+                update_icon(p, btn.center(), icon_color);
+            }
             // La insignia lleva un aro del color de debajo, como la de las pestañas.
             // Arriba a la derecha, sin tapar la punta de la flecha.
             let dot = btn.center() + Vec2::new(8.0, -7.0);
             p.circle_filled(dot, 4.0, surface);
             p.circle_filled(dot, 2.75, pal.accent);
-            restart = resp.clicked();
             let t = &i18n::t().chrome;
-            resp.on_hover_ui(|ui| {
-                ui.strong(t.update);
-                ui.label(t.update_hint);
-            });
+            match available {
+                Some(version) => {
+                    upgrade = resp.clicked();
+                    let hint = if self.upgrades_with_brew() {
+                        t.update_available_brew
+                    } else {
+                        t.update_available_web
+                    };
+                    resp.on_hover_ui(|ui| {
+                        ui.strong((t.update_available)(&version));
+                        ui.label(hint);
+                    });
+                }
+                None => {
+                    restart = resp.clicked();
+                    resp.on_hover_ui(|ui| {
+                        ui.strong(t.update);
+                        ui.label(t.update_hint);
+                    });
+                }
+            }
             right_edge = btn.left() - 24.0;
         }
 
@@ -2218,6 +2297,9 @@ impl App {
         }
         if restart {
             self.restart();
+        }
+        if upgrade {
+            self.start_upgrade(&ctx);
         }
     }
 
@@ -2945,6 +3027,18 @@ impl shell::App for App {
 
         self.ports.switch.set(self.show_ports || self.show_procs);
         self.monitor.switch.set(self.show_procs);
+        // «Buscar actualizaciones»: apagada, el hilo no mira y el aviso desaparece. El hilo
+        // despierta todas las ventanas cuando encuentra algo; aquí solo se recoge.
+        self.updates.switch.set(self.cfg.check_updates);
+        let available = self
+            .cfg
+            .check_updates
+            .then(|| self.updates.available())
+            .flatten();
+        if available != self.update_available {
+            self.update_available = available;
+            ctx.request_repaint();
+        }
         // Solo hay trabajo periódico mientras algo corre; en reposo no se repinta nada.
         if self.w.sessions.iter().any(|s| s.wants_ticks()) {
             ctx.request_repaint_after(Duration::from_millis(250));
@@ -3831,6 +3925,18 @@ fn update_icon(p: &egui::Painter, c: Pos2, color: Color32) {
     let tip = [(4.2, -6.1), (4.2, -3.5), (1.6, -3.5)];
     let tip: Vec<Pos2> = tip.iter().map(|&(x, y)| c + Vec2::new(x, y)).collect();
     p.add(egui::Shape::line(tip, stroke));
+}
+
+/// Flecha hacia abajo sobre una bandeja: hay una versión publicada para descargar.
+fn download_icon(p: &egui::Painter, c: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.3, color);
+    p.line_segment([c + Vec2::new(0.0, -5.5), c + Vec2::new(0.0, 2.2)], stroke);
+    let head = [(-3.2, -1.0), (0.0, 2.2), (3.2, -1.0)];
+    let head: Vec<Pos2> = head.iter().map(|&(x, y)| c + Vec2::new(x, y)).collect();
+    p.add(egui::Shape::line(head, stroke));
+    let tray = [(-5.0, 2.6), (-5.0, 5.2), (5.0, 5.2), (5.0, 2.6)];
+    let tray: Vec<Pos2> = tray.iter().map(|&(x, y)| c + Vec2::new(x, y)).collect();
+    p.add(egui::Shape::line(tray, stroke));
 }
 
 /// Encabezado de apartado. Devuelve true si se pulsó la × para ocultarlo.

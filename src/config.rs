@@ -44,6 +44,9 @@ pub struct Config {
     /// Entrada segura de teclado: con Colibrí al frente, ninguna otra aplicación puede
     /// leer lo que tecleas (como «Secure Keyboard Entry» de Terminal.app).
     pub secure_input: bool,
+    /// Mirar una vez al día si hay una versión nueva (`updates.rs`): la única conexión a
+    /// internet de Colibrí. Activada por defecto; apagada no se conecta a nada.
+    pub check_updates: bool,
     /// Qué apartados del panel lateral están visibles al abrir.
     pub show_agents: bool,
     /// Lado del panel de agentes: `"izquierda"` (por defecto) o `"derecha"`. Puertos y
@@ -139,6 +142,7 @@ impl Default for Config {
             shell_integration: true,
             editor: String::new(),
             secure_input: false,
+            check_updates: true,
             show_agents: true,
             agents_side: "izquierda".into(),
             show_ports: false,
