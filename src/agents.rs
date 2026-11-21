@@ -607,8 +607,13 @@ impl App {
             self.open_dir_picker(&ctx, folder.left_bottom() + Vec2::new(0.0, 4.0));
         }
         if let Some(agent) = launch {
+            // Si la pestaña no se pudo abrir, la última es otra que ya estaba: nada de escribir
+            // la orden del agente ahí.
+            let before = self.w.sessions.len();
             self.new_tab(&ctx, cwd);
-            if let Some(s) = self.w.sessions.last_mut() {
+            if self.w.sessions.len() > before
+                && let Some(s) = self.w.sessions.last_mut()
+            {
                 s.run_when_ready(command(agent).to_string());
             }
         }
