@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{AllocAnyThread, class, define_class, msg_send, sel};
-use objc2_foundation::NSString;
+use objc2_foundation::{NSPoint, NSRect, NSString};
 
 static OPENED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
@@ -185,4 +185,50 @@ pub fn hidden() -> bool {
         let state: usize = msg_send![app, occlusionState];
         state & VISIBLE == 0
     }
+}
+
+/// Altura de la pantalla principal (la primera de `NSScreen.screens`, la de la barra de
+/// menús, no `mainScreen`): es la que fija el origen de las coordenadas de Cocoa.
+fn primary_height() -> Option<f64> {
+    unsafe {
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        if screens.is_null() {
+            return None;
+        }
+        let count: usize = msg_send![screens, count];
+        if count == 0 {
+            return None;
+        }
+        let first: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+        let frame: NSRect = msg_send![first, frame];
+        Some(frame.size.height)
+    }
+}
+
+/// Dónde está el puntero en la pantalla, en puntos con origen arriba a la izquierda de la
+/// pantalla principal (como `outer_position` de winit y `Win::frame`). Hilo principal.
+#[allow(dead_code)] // se usa al soltar una pestaña despegada (siguiente paso)
+pub fn pointer_on_screen() -> Option<egui::Pos2> {
+    let height = primary_height()?;
+    let at: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
+    Some(egui::pos2(
+        at.x as f32,
+        crate::drag::flip_y(at.y, height) as f32,
+    ))
+}
+
+/// Número de la ventana que se ve en ese punto (de cualquier aplicación: respeta qué ventana
+/// tapa a cuál), o nada si no hay ninguna. Punto como el de `pointer_on_screen`.
+#[allow(dead_code)] // se usa al soltar una pestaña despegada (siguiente paso)
+pub fn window_number_at(p: egui::Pos2) -> Option<isize> {
+    let height = primary_height()?;
+    let at = NSPoint::new(p.x as f64, crate::drag::flip_y(p.y as f64, height));
+    let number: isize = unsafe {
+        msg_send![
+            class!(NSWindow),
+            windowNumberAtPoint: at,
+            belowWindowWithWindowNumber: 0isize
+        ]
+    };
+    (number > 0).then_some(number)
 }

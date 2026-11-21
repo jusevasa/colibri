@@ -75,6 +75,36 @@ pub fn wake_all() {
     }
 }
 
+/// El `NSWindow` de cada ventana (su dirección), para saber cuál es la que macOS dice que
+/// hay bajo el puntero (`window_with_number`). Se da de alta al crearla y de baja al
+/// cerrarla; mientras tanto la ventana de winit la mantiene viva.
+static NS_WINDOWS: Mutex<Vec<(WindowId, usize)>> = Mutex::new(Vec::new());
+
+/// La ventana de Colibrí con ese número de ventana de macOS (`windowNumber`). El número se
+/// consulta ahora y no al crearla: una ventana aún sin mostrar no tiene. Hilo principal.
+#[allow(dead_code)] // se usa al soltar una pestaña despegada (siguiente paso)
+pub fn window_with_number(number: isize) -> Option<WindowId> {
+    let windows = NS_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    windows.iter().find_map(|&(id, ns)| {
+        let ns = ns as *mut objc2::runtime::AnyObject;
+        let n: isize = unsafe { objc2::msg_send![ns, windowNumber] };
+        (n == number).then_some(id)
+    })
+}
+
+/// El `NSWindow` de una ventana de winit, como dirección (o nada si no es de AppKit).
+fn ns_window_of(window: &Window) -> Option<usize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    let view = handle.ns_view.as_ptr().cast::<objc2::runtime::AnyObject>();
+    // SAFETY: winit garantiza que es su `NSView`, viva mientras la ventana.
+    let ns: *mut objc2::runtime::AnyObject = unsafe { objc2::msg_send![view, window] };
+    (!ns.is_null()).then_some(ns as usize)
+}
+
 /// Con la ventana oculta (minimizada o tapada) un repintado pedido «ya» espera esto: sin
 /// pintar no hay nada que frene las pasadas y un `request_repaint()` por pasada ocuparía
 /// un núcleo entero. Los repintados con un plazo mayor (el sondeo de 250 ms) no cambian.
@@ -319,6 +349,12 @@ impl<F: FnOnce() -> Box<dyn App>> Runner<F> {
         let window = egui_winit::create_window(&ctx, event_loop, &viewport)
             .map_err(|e| format!("no se pudo crear la ventana: {e}"))?;
         let id = window.id();
+        if let Some(ns) = ns_window_of(&window) {
+            NS_WINDOWS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((id, ns));
+        }
 
         let wake_sent = Arc::new(AtomicBool::new(false));
         let wake: Arc<dyn Fn() + Send + Sync> = {
@@ -523,6 +559,10 @@ impl<F> Runner<F> {
             if let Some(app) = &mut self.app {
                 app.window_closed(id);
             }
+            NS_WINDOWS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|(w, _)| *w != id);
             if let Some(run) = self.windows.remove(&id) {
                 run.ctx.on_exit();
             }
