@@ -31,7 +31,11 @@ Requiere macOS 12 o posterior.
 
 ### Homebrew
 
-Próximamente, con la primera versión firmada y notarizada.
+```sh
+brew install --cask jusevasa/colibri/colibri
+```
+
+La app va firmada y notarizada por Apple, para Apple silicon e Intel. Para actualizar, `brew upgrade --cask colibri`: Colibrí lo nota y enseña el botón **Actualizar**, que la reinicia con la versión nueva (ver abajo qué pasa con las pestañas).
 
 ### Desde el código
 
@@ -46,7 +50,9 @@ open target/Colibri.app
 
 `bundle.sh` firma con tu certificado de Apple si tienes uno en el llavero (Developer ID o Apple Development; `COLIBRI_SIGN_ID` elige otro). Sin ninguno firma «ad-hoc», y macOS volverá a pedir los permisos (carpetas, notificaciones) tras cada compilación. Las notificaciones con clic solo funcionan desde `Colibri.app`, no con `cargo run`.
 
-Cuando el ejecutable cambia en disco (al recompilar), aparece en la barra de pestañas el botón **Actualizar**, que reinicia Colibrí con la versión nueva y reabre las pestañas.
+### Actualizar
+
+Cuando el ejecutable cambia en disco (tras `brew upgrade` o al recompilar), aparece en la barra de pestañas el botón **Actualizar**, que reinicia Colibrí con la versión nueva. Lo que esté corriendo en las pestañas se detiene, así que espera a que terminen tus agentes y comandos antes de pulsarlo. Las pestañas se reabren en sus carpetas si está activada la preferencia «Recuperar pestañas al abrir» (lo está por defecto), y donde corría Claude Code te ofrece retomar la conversación.
 
 ## Uso
 
