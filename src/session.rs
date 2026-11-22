@@ -1046,6 +1046,12 @@ impl Session {
         self.input(bytes);
     }
 
+    /// El programa de la pestaña está pidiendo una contraseña (ver `proc::password_mode`).
+    /// Se mira en el momento, sin guardar nada: es un `tcgetattr`.
+    pub fn password_prompt(&self) -> bool {
+        proc::password_mode(self.master_fd)
+    }
+
     /// El shell espera un comando: no corre nada encima ni hay un programa a pantalla completa.
     pub fn at_prompt(&self) -> bool {
         use alacritty_terminal::term::TermMode;
