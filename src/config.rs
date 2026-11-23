@@ -41,9 +41,14 @@ pub struct Config {
     /// Con qué se abre un archivo al hacer ⌘+clic en su ruta: `code`, `cursor`, `zed`…
     /// (admite argumentos). Vacío = la aplicación que macOS tenga para ese archivo.
     pub editor: String,
-    /// Entrada segura de teclado: con Colibrí al frente, ninguna otra aplicación puede
-    /// leer lo que tecleas (como «Secure Keyboard Entry» de Terminal.app).
+    /// Entrada segura de teclado siempre: con Colibrí al frente, ninguna otra aplicación
+    /// puede leer lo que tecleas (como «Secure Keyboard Entry» de Terminal.app). Ojo: macOS
+    /// tampoco deja entonces que lo que se abre desde una pestaña (`open`) pase al frente.
     pub secure_input: bool,
+    /// Entrada segura solo mientras la pestaña activa pide una contraseña (`sudo`, `ssh`…;
+    /// ver `proc::password_mode`), como la automática de Ghostty. Sin efecto si
+    /// `secure_input` ya la tiene siempre encendida.
+    pub secure_input_passwords: bool,
     /// Mirar una vez al día si hay una versión nueva (`updates.rs`): la única conexión a
     /// internet de Colibrí. Activada por defecto; apagada no se conecta a nada.
     pub check_updates: bool,
@@ -142,6 +147,7 @@ impl Default for Config {
             shell_integration: true,
             editor: String::new(),
             secure_input: false,
+            secure_input_passwords: true,
             check_updates: true,
             show_agents: true,
             agents_side: "izquierda".into(),
@@ -153,10 +159,44 @@ impl Default for Config {
     }
 }
 
+/// Los tres modos de la entrada segura que enseña Preferencias, guardados en dos campos
+/// (`secure_input` ya existía como sí/no y los archivos antiguos tienen que seguir valiendo).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SecureInput {
+    Off,
+    Passwords,
+    Always,
+}
+
 impl Config {
     /// El panel de agentes va a la derecha (cualquier otro valor: a la izquierda).
     pub fn agents_on_right(&self) -> bool {
         matches!(self.agents_side.trim(), "derecha" | "right")
+    }
+
+    pub fn secure_mode(&self) -> SecureInput {
+        if self.secure_input {
+            SecureInput::Always
+        } else if self.secure_input_passwords {
+            SecureInput::Passwords
+        } else {
+            SecureInput::Off
+        }
+    }
+
+    pub fn set_secure_mode(&mut self, mode: SecureInput) {
+        self.secure_input = mode == SecureInput::Always;
+        self.secure_input_passwords = mode != SecureInput::Off;
+    }
+
+    /// Si la ventana al frente debe tener la entrada segura. `password` (si su pestaña activa
+    /// pide una contraseña) solo se consulta cuando hace falta: es una llamada al sistema.
+    pub fn secure_input_on(&self, password: impl FnOnce() -> bool) -> bool {
+        match self.secure_mode() {
+            SecureInput::Off => false,
+            SecureInput::Passwords => password(),
+            SecureInput::Always => true,
+        }
     }
 }
 
@@ -628,5 +668,46 @@ impl Shortcut {
             && m.ctrl == self.ctrl
             && m.shift == self.shift
             && m.alt == self.alt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, SecureInput};
+
+    #[test]
+    fn entrada_segura_de_archivos_antiguos() {
+        // Antes era sí/no: «sí» sigue siendo siempre; «no», sin el campo nuevo, pasa a
+        // encenderse solo con las contraseñas (lo que hace Ghostty por defecto).
+        let siempre: Config = toml::from_str("secure_input = true").unwrap();
+        assert_eq!(siempre.secure_mode(), SecureInput::Always);
+        let antiguo: Config = toml::from_str("secure_input = false").unwrap();
+        assert_eq!(antiguo.secure_mode(), SecureInput::Passwords);
+        let apagada: Config =
+            toml::from_str("secure_input = false\nsecure_input_passwords = false").unwrap();
+        assert_eq!(apagada.secure_mode(), SecureInput::Off);
+        assert_eq!(Config::default().secure_mode(), SecureInput::Passwords);
+    }
+
+    #[test]
+    fn entrada_segura_segun_el_modo() {
+        let mut c = Config::default();
+        for mode in [
+            SecureInput::Off,
+            SecureInput::Passwords,
+            SecureInput::Always,
+        ] {
+            c.set_secure_mode(mode);
+            assert_eq!(c.secure_mode(), mode);
+            let guardado: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+            assert_eq!(guardado.secure_mode(), mode);
+        }
+        c.set_secure_mode(SecureInput::Off);
+        assert!(!c.secure_input_on(|| panic!("apagada no mira la terminal")));
+        c.set_secure_mode(SecureInput::Always);
+        assert!(c.secure_input_on(|| panic!("siempre no mira la terminal")));
+        c.set_secure_mode(SecureInput::Passwords);
+        assert!(c.secure_input_on(|| true));
+        assert!(!c.secure_input_on(|| false));
     }
 }

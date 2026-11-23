@@ -79,6 +79,10 @@ pub struct T {
     pub editor_default: &'static str,
     pub side_right: &'static str,
     pub side_left: &'static str,
+    /// Entrada segura: apagada, solo con las contraseñas o siempre.
+    pub secure_off: &'static str,
+    pub secure_passwords: &'static str,
+    pub secure_always: &'static str,
     // Preferencias: pista del pie según la fila elegida.
     pub hint_font: &'static str,
     pub hint_opacity: &'static str,
@@ -87,6 +91,7 @@ pub struct T {
     pub hint_theme: &'static str,
     pub hint_panels: &'static str,
     pub hint_agents_side: &'static str,
+    pub hint_secure_input: &'static str,
     pub hint_default: &'static str,
 
     // Renombrar pestaña.
@@ -272,6 +277,9 @@ pub const ES: T = T {
     editor_default: "Lo que diga macOS",
     side_right: "Derecha",
     side_left: "Izquierda",
+    secure_off: "No",
+    secure_passwords: "En contraseñas",
+    secure_always: "Siempre",
     hint_font: "Menlo, Hack (incluida) y las monoespaciadas de tu Mac. Otras: font_path en el archivo.",
     hint_opacity: "Menos de 100 % deja ver lo que hay detrás de la ventana.",
     hint_blur: "Solo se nota con la opacidad por debajo de 100 %.",
@@ -279,6 +287,7 @@ pub const ES: T = T {
     hint_theme: "Colores a medida: sección [theme] del archivo.",
     hint_panels: "Qué apartados aparecen abiertos al iniciar Colibrí.",
     hint_agents_side: "Puertos y Procesos van en el lado contrario.",
+    hint_secure_input: "Siempre: lo que abras desde la terminal (open) no podrá pasar al frente.",
     hint_default: "Los cambios se guardan al momento.",
 
     rename_title: "Nombre de la pestaña",
@@ -374,6 +383,9 @@ pub const EN: T = T {
     editor_default: "macOS default",
     side_right: "Right",
     side_left: "Left",
+    secure_off: "Off",
+    secure_passwords: "For passwords",
+    secure_always: "Always",
     hint_font: "Menlo, Hack (built in) and your Mac's monospaced fonts. Others: font_path in the file.",
     hint_opacity: "Below 100% you can see what's behind the window.",
     hint_blur: "Only noticeable with opacity below 100%.",
@@ -381,6 +393,7 @@ pub const EN: T = T {
     hint_theme: "Custom colors: [theme] section of the file.",
     hint_panels: "Which panels are open when Colibrí starts.",
     hint_agents_side: "Ports and Processes go on the opposite side.",
+    hint_secure_input: "Always: apps you open from the terminal (open) can't come to the front.",
     hint_default: "Changes are saved right away.",
 
     rename_title: "Tab name",

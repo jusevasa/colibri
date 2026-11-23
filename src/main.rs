@@ -2994,12 +2994,25 @@ impl shell::App for App {
             self.badge = unseen;
             macos::set_badge(unseen);
         }
-        // La entrada segura es de todo el sistema: solo con Colibrí al frente.
-        let any_focused = self.windows().any(|w| w.focused);
-        let secure = self.cfg.secure_input && any_focused;
+        // La entrada segura es de todo el sistema: solo con Colibrí al frente y, en el modo
+        // de contraseñas, mientras la pestaña activa de esa ventana pide una. Se decide en
+        // cada pasada: el aviso de la contraseña («Password:») ya pide un cuadro, y con
+        // `sudo` o `ssh` en primer plano la pestaña refresca cada 250 ms (`wants_ticks`).
+        // Encendida siempre, macOS no deja que lo que se abre desde una pestaña (`open`)
+        // pase al frente; por eso no conviene tenerla así todo el rato.
+        let secure = self.windows().filter(|w| w.focused).any(|w| {
+            self.cfg.secure_input_on(|| {
+                w.sessions
+                    .get(w.active)
+                    .is_some_and(|s| s.password_prompt())
+            })
+        });
         if secure != self.secure {
             self.secure = secure;
             macos::secure_input(secure);
+            if self.script.is_some() {
+                eprintln!("entrada segura: {}", if secure { "sí" } else { "no" });
+            }
         }
         // Dónde está la ventana (para guardarla) y su título: el de la pestaña activa, que
         // es lo que enseñan el menú Ventana y Mission Control.

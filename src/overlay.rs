@@ -1,6 +1,6 @@
 //! Ventanas flotantes sobre la terminal: paleta de comandos, preferencias y renombrar pestaña.
 
-use crate::config::{self, Palette};
+use crate::config::{self, Palette, SecureInput};
 use crate::i18n;
 use crate::{App, Cmd, elided};
 use egui::{
@@ -1289,7 +1289,15 @@ impl App {
             "shell_integration" => (String::new(), Some(c.shell_integration)),
             "editor" if c.editor.is_empty() => (o.editor_default.to_string(), None),
             "editor" => (c.editor.clone(), None),
-            "secure_input" => (String::new(), Some(c.secure_input)),
+            "secure_input" => (
+                match c.secure_mode() {
+                    SecureInput::Off => o.secure_off,
+                    SecureInput::Passwords => o.secure_passwords,
+                    SecureInput::Always => o.secure_always,
+                }
+                .to_string(),
+                None,
+            ),
             "check_updates" => (String::new(), Some(c.check_updates)),
             "show_agents" => (String::new(), Some(c.show_agents)),
             "agents_side" if c.agents_on_right() => (o.side_right.to_string(), None),
@@ -1363,7 +1371,16 @@ impl App {
                 let i = cycle(editors.len(), editors.iter().position(|e| *e == c.editor));
                 c.editor = editors[i].to_string();
             }
-            "secure_input" => c.secure_input = !c.secure_input,
+            "secure_input" => {
+                let modes = [
+                    SecureInput::Off,
+                    SecureInput::Passwords,
+                    SecureInput::Always,
+                ];
+                let now = c.secure_mode();
+                let i = cycle(modes.len(), modes.iter().position(|m| *m == now));
+                c.set_secure_mode(modes[i]);
+            }
             "check_updates" => c.check_updates = !c.check_updates,
             "show_agents" => c.show_agents = !c.show_agents,
             "agents_side" => {
@@ -1553,6 +1570,7 @@ impl App {
                 "theme" => o.hint_theme,
                 "show_agents" | "show_ports" | "show_processes" => o.hint_panels,
                 "agents_side" => o.hint_agents_side,
+                "secure_input" => o.hint_secure_input,
                 _ => o.hint_default,
             };
             p.text(
