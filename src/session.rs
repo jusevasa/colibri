@@ -847,7 +847,7 @@ impl Session {
             cell_height: 16,
         };
         let pty = tty::new(&options, window_size, id)?;
-        let master_fd = unsafe { libc::dup(pty.file().as_raw_fd()) };
+        let master_fd = proc::dup_cloexec(pty.file().as_raw_fd());
         let shell_pid = pty.child().id() as i32;
 
         let term_cfg = TermConfig {

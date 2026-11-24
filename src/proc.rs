@@ -10,6 +10,15 @@ pub fn foreground_pid(master_fd: c_int) -> Option<i32> {
     (pid > 0).then_some(pid)
 }
 
+/// Copia de `fd` que no heredan los procesos que se lancen después (-1 si falla). Con
+/// `libc::dup` la copia del maestro de cada pestaña llegaba a los shells de las pestañas
+/// siguientes y a lo que lanzaban (agentes, procesos de p10k): mientras alguno viviera,
+/// cerrar esa pestaña no colgaba su terminal, su agente seguía vivo y el shell se quedaba
+/// sin poder salir.
+pub fn dup_cloexec(fd: c_int) -> c_int {
+    unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+}
+
 /// Si la terminal está pidiendo una contraseña: modo por líneas con el eco apagado, que es
 /// lo que ponen `sudo`, `ssh`, `passwd` o `read -s` mientras se escribe la clave (zle, vim o
 /// Claude Code apagan el eco pero leen tecla a tecla). El maestro ve el modo del esclavo.
@@ -141,7 +150,28 @@ pub fn base_name(p: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::password_mode;
+    use super::{dup_cloexec, password_mode};
+
+    /// La copia del maestro que guarda cada pestaña no debe llegar a lo que se lance después:
+    /// con ella abierta en el shell de otra pestaña, cerrar esta no colgaba su terminal y su
+    /// agente seguía vivo.
+    #[test]
+    fn copia_del_maestro_no_se_hereda() {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fd = dup_cloexec(file.as_raw_fd());
+        assert!(fd >= 0);
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let heredado = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("[ -e /dev/fd/{fd} ]"))
+            .status()
+            .unwrap()
+            .success();
+        unsafe { libc::close(fd) };
+        assert!(!heredado, "un proceso lanzado después heredó la copia");
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "la copia no lleva FD_CLOEXEC");
+    }
 
     /// Un PTY de verdad: el modo se cambia en el esclavo (lo que hacen `sudo` o `ssh`) y se
     /// lee desde el maestro, que es lo único que tiene Colibrí.
