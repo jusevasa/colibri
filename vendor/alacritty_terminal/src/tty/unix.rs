@@ -328,20 +328,49 @@ impl Drop for Pty {
 
         // Colibrí: y esperar con plazo. Un shell que siga vivo (ignora SIGHUP y espera a algo
         // que no toca la terminal) se mata.
-        let fin = Instant::now() + SHELL_EXIT_WAIT;
-        while Instant::now() < fin {
-            match self.child.try_wait() {
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                _ => return,
-            }
+        if wait_until(&mut self.child, SHELL_EXIT_WAIT) {
+            return;
         }
         let _ = self.child.kill();
-        let _ = self.child.wait();
+
+        // Colibrí: tampoco se espera sin plazo después del SIGKILL. Un proceso que ya está
+        // saliendo no recibe señales, y si otro proceso conserva abierto el maestro (lo heredó),
+        // el shell se queda esperando a que se vacíe la salida de la terminal: `wait` no
+        // volvería nunca y este hilo se quedaría con el `Term` de la pestaña. Si no termina en
+        // `KILL_WAIT`, lo recoge otro hilo cuando acabe, para que no quede como zombi.
+        if wait_until(&mut self.child, KILL_WAIT) {
+            return;
+        }
+        let pid = self.child.id() as libc::pid_t;
+        let _ = thread::Builder::new().name("PTY reaper".into()).spawn(move || {
+            loop {
+                let r = unsafe { libc::waitpid(pid, ptr::null_mut(), 0) };
+                if r != -1 || Error::last_os_error().kind() != ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        });
     }
+}
+
+/// Colibrí: espera a que `child` termine, como mucho `plazo`; cierto si terminó (o si ya no
+/// se puede esperar).
+fn wait_until(child: &mut Child, plazo: Duration) -> bool {
+    let fin = Instant::now() + plazo;
+    while Instant::now() < fin {
+        match child.try_wait() {
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// Colibrí: cuánto espera `Pty::drop` a que el shell salga antes de matarlo.
 const SHELL_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// Colibrí: cuánto espera `Pty::drop` tras matar al shell antes de dejarlo a otro hilo.
+const KILL_WAIT: Duration = Duration::from_secs(1);
 
 impl EventedReadWrite for Pty {
     type Reader = File;
@@ -569,5 +598,55 @@ mod colibri_tests {
 
         assert!(tardo.is_some(), "soltar la terminal esperó al shell sin plazo");
         assert!(!shell_vivo, "el shell siguió vivo");
+    }
+
+    /// Colibrí: si otro proceso conserva abierto el maestro (lo heredó), cerrarlo aquí no cuelga
+    /// la terminal: el shell se queda saliendo y no termina ni con SIGKILL. Soltar no debe
+    /// esperarlo sin plazo, y cuando por fin termine no debe quedar como zombi.
+    #[test]
+    fn colibri_soltar_con_el_maestro_abierto_en_otro_proceso() {
+        use std::os::unix::process::CommandExt;
+
+        let pty = abrir("/bin/zsh", &["-f", "-i", "-c", "sh -c 'trap \"\" HUP; exec yes'; :"]);
+        let shell = pty.child().id() as i32;
+        let maestro = pty.file().as_raw_fd();
+        let mut grupo = 0;
+        let en_primer_plano = esperar(Duration::from_secs(5), || {
+            grupo = unsafe { libc::tcgetpgrp(maestro) };
+            grupo > 0 && grupo != shell
+        });
+        assert!(en_primer_plano, "el programa no llegó a primer plano en su propio grupo");
+        // Que `yes` llene la salida de la terminal y se quede bloqueado escribiendo.
+        thread::sleep(Duration::from_millis(300));
+        // Otro proceso se queda con el maestro, como los shells de otras pestañas. En el hijo se
+        // le quita `FD_CLOEXEC`, así sobrevive al `exec` sea cual sea su número; este proceso
+        // nunca tiene una copia heredable que pudieran llevarse las pruebas que corren a la vez.
+        let mut otro = unsafe {
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .pre_exec(move || {
+                    if libc::fcntl(maestro, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+                .expect("lanzar el proceso que retiene el maestro")
+        };
+
+        let tardo = soltar(pty, Duration::from_secs(8));
+        // Con el maestro retenido el shell no ha podido terminar. Si ya no está, el escenario no
+        // se reprodujo y lo demás no probaría nada.
+        let retenido = vivo(shell);
+        let _ = otro.kill();
+        let _ = otro.wait();
+        let termino = esperar(Duration::from_secs(5), || !vivo(-grupo) && !vivo(shell));
+        if !termino {
+            unsafe { libc::killpg(grupo, libc::SIGKILL) };
+        }
+
+        assert!(retenido, "el escenario no se reprodujo: el shell terminó sin esperar al maestro");
+        assert!(tardo.is_some(), "soltar la terminal esperó sin plazo al shell");
+        assert!(termino, "al cerrarse el maestro quedó algo vivo o un zombi");
     }
 }
