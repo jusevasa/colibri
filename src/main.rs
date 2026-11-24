@@ -3729,30 +3729,40 @@ const IDLE_TICK: Duration = Duration::from_millis(250);
 /// hacía falta el tercero y subía a 9,1 %; a 60/s, a 15,2 %. Sin el foco no se mira: saltos.
 const SMOOTH_TICK: Duration = Duration::from_millis(50);
 
-/// Ángulo de la cabeza del indicador (radianes, en `[0, 2π)`) para el reloj de egui `t`. Con
-/// la ventana al frente gira sin saltos (se repinta cada `SMOOTH_TICK`); sin el foco salta de
-/// punto en punto, `BADGE_DOTS` saltos por vuelta, y basta un cuadro por salto.
+/// Duración de cada paso de la cabeza del indicador: `SMOOTH_TICK` con la ventana al frente
+/// (20 por vuelta, a la vista sin saltos) y, sin el foco, de punto en punto (`BADGE_DOTS` por
+/// vuelta, dos segundos por vuelta).
+fn ring_step(focused: bool) -> f64 {
+    if focused {
+        SMOOTH_TICK.as_secs_f64()
+    } else {
+        ring_period(false) / BADGE_DOTS as f64
+    }
+}
+
+/// Ángulo de la cabeza del indicador (radianes, en `[0, 2π)`) para el reloj de egui `t`.
+/// Avanza a pasos fijos del reloj (`ring_step`), no según cuándo toque la pasada: cualquier
+/// otra pasada entre medias (salida de la terminal, otra pestaña con un agente trabajando)
+/// pinta el mismo ángulo que la anterior, así que el giro no va a tirones. Antes giraba con
+/// el reloj de cada pasada y el refresco de 50 ms se contaba desde la última: con salida en
+/// las pestañas los cuadros del indicador salían a 33 y 50 ms mezclados.
 fn ring_angle(t: f64, focused: bool) -> f32 {
     let period = ring_period(focused);
+    let steps = (period / ring_step(focused)).round();
     let turn = t.rem_euclid(period) / period;
-    let turn = if focused {
-        turn
-    } else {
-        let steps = BADGE_DOTS as f64;
-        (turn * steps).floor() / steps
-    };
+    let turn = (turn * steps).floor() / steps;
     (std::f64::consts::TAU * turn) as f32
 }
 
-/// Cada cuánto repintar: si un agente trabaja, cada `SMOOTH_TICK` con la ventana al frente y,
-/// sin el foco, justo después del próximo salto de sus puntos (más 1 ms, para que el reloj de
-/// esa pasada ya lo haya cruzado); pausado si solo trabaja otra cosa (un servidor en primer
-/// plano cuenta como trabajando sin fin y no debe tener la app a 20 cuadros/s); nada en reposo.
+/// Cada cuánto repintar: si un agente trabaja, justo después del próximo paso de sus puntos
+/// (`ring_step`: cada `SMOOTH_TICK` con la ventana al frente, de punto en punto sin el foco;
+/// más 1 ms, para que el reloj de esa pasada ya lo haya cruzado). Se cuenta desde el reloj,
+/// no desde la pasada, para que las pasadas de más no corran los pasos. Pausado si solo
+/// trabaja otra cosa (un servidor en primer plano cuenta como trabajando sin fin y no debe
+/// tener la app a 20 cuadros/s); nada en reposo.
 fn tick_for(agent_busy: bool, any_busy: bool, t: f64, focused: bool) -> Option<Duration> {
-    if agent_busy && focused {
-        Some(SMOOTH_TICK)
-    } else if agent_busy {
-        let step = ring_period(false) / BADGE_DOTS as f64;
+    if agent_busy {
+        let step = ring_step(focused);
         Some(Duration::from_secs_f64(step - t.rem_euclid(step) + 0.001))
     } else if any_busy {
         Some(IDLE_TICK)
@@ -4299,8 +4309,9 @@ mod tests {
         assert!(!uncovered(tab, Some(r(100.0, 200.0))).is_positive());
     }
 
-    /// Con la ventana al frente la cabeza gira sin saltos, una vuelta por segundo. Sin el foco
-    /// salta de punto en punto (basta un cuadro por salto), una vuelta cada dos segundos.
+    /// Con la ventana al frente la cabeza gira una vuelta por segundo en 20 pasos (uno por
+    /// cuadro, a la vista sin saltos). Sin el foco salta de punto en punto (basta un cuadro
+    /// por salto), una vuelta cada dos segundos.
     #[test]
     fn la_cabeza_del_indicador_gira_al_frente_y_salta_sin_foco() {
         use std::f32::consts::{FRAC_PI_4, TAU};
@@ -4308,10 +4319,14 @@ mod tests {
         assert_eq!(ring_angle(0.0, true), 0.0);
         assert!(
             (ring_angle(0.1, true) - TAU * 0.1).abs() < 1e-4,
-            "al frente, sin saltos"
+            "al frente, un paso cada 50 ms"
         );
         assert!((ring_angle(1.25, true) - TAU * 0.25).abs() < 1e-4);
         assert!(ring_angle(0.999, true) < TAU);
+        // Una pasada de más entre dos pasos (salida de la terminal) pinta el mismo ángulo:
+        // el giro no depende de cuándo toquen las pasadas.
+        assert_eq!(ring_angle(0.112, true), ring_angle(0.149, true));
+        assert!(ring_angle(0.151, true) > ring_angle(0.149, true));
         assert_eq!(
             ring_angle(0.2, false),
             0.0,
@@ -4359,10 +4374,13 @@ mod tests {
     fn ritmo_de_repintado() {
         let cerca =
             |d: Option<Duration>, s: f64| d.is_some_and(|d| (d.as_secs_f64() - s).abs() < 1e-6);
-        // Con un agente trabajando y la ventana al frente, 20 cuadros/s; sin el foco, el
-        // cuadro siguiente justo después del próximo salto (más 1 ms, para que el reloj de
-        // esa pasada ya lo haya cruzado).
-        assert_eq!(tick_for(true, true, 0.05, true), Some(SMOOTH_TICK));
+        // Con un agente trabajando, el cuadro siguiente justo después del próximo paso (más
+        // 1 ms, para que el reloj de esa pasada ya lo haya cruzado): al frente, en la rejilla
+        // de 50 ms del reloj, aunque la pasada caiga a destiempo; sin el foco, el próximo salto.
+        let t = tick_for(true, true, 0.05, true);
+        assert!(cerca(t, 0.051), "{t:?}");
+        let t = tick_for(true, true, 0.12, true);
+        assert!(cerca(t, 0.031), "pasada a destiempo: {t:?}");
         let t = tick_for(true, true, 0.05, false);
         assert!(cerca(t, 0.201), "{t:?}");
         assert_eq!(
