@@ -600,8 +600,8 @@ mod colibri_tests {
         assert!(!shell_vivo, "el shell siguió vivo");
     }
 
-    /// Si otro proceso conserva abierto el maestro (lo heredó), cerrarlo aquí no cuelga la
-    /// terminal: el shell se queda saliendo y no termina ni con SIGKILL. Soltar no debe
+    /// Colibrí: si otro proceso conserva abierto el maestro (lo heredó), cerrarlo aquí no cuelga
+    /// la terminal: el shell se queda saliendo y no termina ni con SIGKILL. Soltar no debe
     /// esperarlo sin plazo, y cuando por fin termine no debe quedar como zombi.
     #[test]
     fn colibri_soltar_con_el_maestro_abierto_en_otro_proceso() {
@@ -618,14 +618,16 @@ mod colibri_tests {
         assert!(en_primer_plano, "el programa no llegó a primer plano en su propio grupo");
         // Que `yes` llene la salida de la terminal y se quede bloqueado escribiendo.
         thread::sleep(Duration::from_millis(300));
-        // Otro proceso se queda con una copia del maestro, como los shells de otras pestañas.
-        // La copia se hace en el hijo (`dup2` sin `CLOEXEC`): este proceso nunca tiene una que
-        // pudieran heredar las pruebas que corren a la vez.
+        // Otro proceso se queda con el maestro, como los shells de otras pestañas. En el hijo se
+        // le quita `FD_CLOEXEC`, así sobrevive al `exec` sea cual sea su número; este proceso
+        // nunca tiene una copia heredable que pudieran llevarse las pruebas que corren a la vez.
         let mut otro = unsafe {
             std::process::Command::new("/bin/sleep")
                 .arg("30")
                 .pre_exec(move || {
-                    libc::dup2(maestro, 10);
+                    if libc::fcntl(maestro, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     Ok(())
                 })
                 .spawn()
@@ -633,6 +635,9 @@ mod colibri_tests {
         };
 
         let tardo = soltar(pty, Duration::from_secs(8));
+        // Con el maestro retenido el shell no ha podido terminar. Si ya no está, el escenario no
+        // se reprodujo y lo demás no probaría nada.
+        let retenido = vivo(shell);
         let _ = otro.kill();
         let _ = otro.wait();
         let termino = esperar(Duration::from_secs(5), || !vivo(-grupo) && !vivo(shell));
@@ -640,6 +645,7 @@ mod colibri_tests {
             unsafe { libc::killpg(grupo, libc::SIGKILL) };
         }
 
+        assert!(retenido, "el escenario no se reprodujo: el shell terminó sin esperar al maestro");
         assert!(tardo.is_some(), "soltar la terminal esperó sin plazo al shell");
         assert!(termino, "al cerrarse el maestro quedó algo vivo o un zombi");
     }
