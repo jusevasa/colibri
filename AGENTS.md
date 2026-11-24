@@ -96,7 +96,7 @@ Al añadir una función a la interfaz que deba poder verificarse, añade tambié
 - **`hotkey.rs`**, **`menu.rs`** — FFI de macOS: atajos globales (Carbon) y la barra de menús.
 - **`macos.rs`** — carpetas que llegan de Finder, número del icono del Dock, entrada segura de teclado y saber si la ventana se ve.
 - **`state.rs`** — ventanas y pestañas abiertas persistidas en `session.toml` (carpeta, nombre, agente, posición de la ventana; no los procesos).
-- **`proc.rs`** — consultas puntuales por pid vía libc/libproc (cwd, argv, padre, nombre) y, con el maestro del PTY, el modo de la terminal (`password_mode`). **`procs.rs`** y **`ports.rs`** — hilos de fondo que ejecutan `ps`/`vm_stat` y `lsof` y publican en un `Arc<Mutex<…>>`. Los enciende y apaga un **`switch.rs`** (`Switch`, `Mutex` + `Condvar`): apagados duermen sin despertar y, al encenderlos o con `Ports::refresh`, miran al momento.
+- **`proc.rs`** — consultas puntuales por pid vía libc/libproc (cwd, argv, padre, nombre) y, con el maestro del PTY, el modo de la terminal (`password_mode`) y la copia que no heredan los procesos lanzados después (`dup_cloexec`). **`procs.rs`** y **`ports.rs`** — hilos de fondo que ejecutan `ps`/`vm_stat` y `lsof` y publican en un `Arc<Mutex<…>>`. Los enciende y apaga un **`switch.rs`** (`Switch`, `Mutex` + `Condvar`): apagados duermen sin despertar y, al encenderlos o con `Ports::refresh`, miran al momento.
 - **`updates.rs`** — «Buscar actualizaciones»: hilo que lee el cask del tap, comparación de versiones con sus pruebas y si esta copia la instaló Homebrew (ver abajo).
 - **`notify.rs`**, **`blur.rs`** — FFI de macOS (UNUserNotificationCenter; API privada de CoreGraphics para el desenfoque).
 

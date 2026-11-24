@@ -81,10 +81,11 @@ fn main() -> Result<(), String> {
         objc2_foundation::ns_string!("ApplePressAndHoldEnabled"),
     );
     // Con esa misma entrada de texto, AppKit lanza «AutoFill (Colibrí)»
-    // (`SafariPlatformSupport.Helper`: otro proceso de ~18 MB y 5 hilos) para ofrecer
-    // autorrelleno de contactos o contraseñas, que en una terminal no tiene dónde ir. Es un
-    // valor privado de AppKit (si desaparece, no tiene efecto) y va en el dominio de registro:
-    // no se guarda en las preferencias y `defaults write` puede volver a activarlo.
+    // (`SafariPlatformSupport.Helper`: otro proceso de 18 MB y 5 hilos, medidos con `footprint`
+    // y el Monitor de Actividad) para ofrecer autorrelleno de contactos o contraseñas, que en
+    // una terminal no tiene dónde ir. Es un valor privado de AppKit (si desaparece, no tiene
+    // efecto) y va en el dominio de registro: no se guarda en las preferencias y
+    // `defaults write` puede volver a activarlo.
     {
         use objc2::runtime::AnyObject;
         use objc2_foundation::{NSDictionary, NSNumber, NSString, ns_string};
