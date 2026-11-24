@@ -499,8 +499,9 @@ impl App {
         if !self.open_saved_tab(ctx, tab) {
             return;
         }
-        let s = self.w.sessions.pop().expect("recién abierta");
-        let i = at.unwrap_or(usize::MAX).min(self.w.sessions.len());
+        // Se abrió junto a la activa; sin puesto guardado se queda ahí.
+        let s = self.w.sessions.remove(self.w.active);
+        let i = at.unwrap_or(self.w.active).min(self.w.sessions.len());
         self.w.sessions.insert(i, s);
         self.w.active = i;
         ctx.request_repaint();
@@ -703,12 +704,10 @@ impl App {
         if !dir.is_dir() {
             return false;
         }
-        let before = self.w.sessions.len();
-        self.new_tab(ctx, Some(dir));
-        if self.w.sessions.len() == before {
+        if !self.new_tab(ctx, Some(dir)) {
             return false;
         }
-        if let Some(s) = self.w.sessions.last_mut() {
+        if let Some(s) = self.w.sessions.get_mut(self.w.active) {
             s.name = tab.name.clone();
             s.color = TAB_COLORS
                 .iter()
@@ -1011,12 +1010,10 @@ impl App {
             return;
         };
         if self.upgrades_with_brew() {
-            // Si la pestaña no se pudo abrir, la última es otra que ya estaba: nada de escribir
+            // Si la pestaña no se pudo abrir, la activa es otra que ya estaba: nada de escribir
             // la orden ahí.
-            let before = self.w.sessions.len();
-            self.new_tab(ctx, dirs::home_dir());
-            if self.w.sessions.len() > before
-                && let Some(s) = self.w.sessions.last_mut()
+            if self.new_tab(ctx, dirs::home_dir())
+                && let Some(s) = self.w.sessions.get_mut(self.w.active)
             {
                 s.run_when_ready(updates::BREW_UPGRADE.to_string());
             }
@@ -1071,14 +1068,25 @@ impl App {
         self.update_ready = settled;
     }
 
-    fn new_tab(&mut self, ctx: &egui::Context, cwd: Option<std::path::PathBuf>) {
+    /// Abre una pestaña a la derecha de la activa (al principio si no hay ninguna) y la deja
+    /// activa. Devuelve false si no se pudo abrir la terminal.
+    fn new_tab(&mut self, ctx: &egui::Context, cwd: Option<std::path::PathBuf>) -> bool {
         match Session::new(self.next_id, &self.cfg, cwd, ctx) {
             Ok(s) => {
                 self.next_id += 1;
-                self.w.sessions.push(s);
-                self.w.active = self.w.sessions.len() - 1;
+                let i = if self.w.sessions.is_empty() {
+                    0
+                } else {
+                    (self.w.active + 1).min(self.w.sessions.len())
+                };
+                self.w.sessions.insert(i, s);
+                self.w.active = i;
+                true
             }
-            Err(e) => eprintln!("colibri: no se pudo abrir la terminal: {e}"),
+            Err(e) => {
+                eprintln!("colibri: no se pudo abrir la terminal: {e}");
+                false
+            }
         }
     }
 
@@ -2743,7 +2751,9 @@ impl shell::App for App {
         self.enter(win);
         self.front = Some(win);
         match fill {
-            Fill::Fresh(dir) => self.new_tab(ctx, dir),
+            Fill::Fresh(dir) => {
+                self.new_tab(ctx, dir);
+            }
             Fill::Saved(saved) => self.open_saved_window(ctx, &saved),
             Fill::Move(s) => {
                 s.set_context(ctx);
