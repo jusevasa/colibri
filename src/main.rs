@@ -72,15 +72,29 @@ impl egui::DroppedFile for Dropped {
 
 fn main() -> Result<(), String> {
     i18n::init();
+    let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
     // Con la entrada de texto del sistema activa (hace falta para ver las teclas muertas),
     // macOS cambiaría la repetición de una tecla mantenida por su menú de acentos. En una
     // terminal mantener una tecla debe repetirla.
-    unsafe {
-        let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
-        defaults.setBool_forKey(
-            false,
-            objc2_foundation::ns_string!("ApplePressAndHoldEnabled"),
+    defaults.setBool_forKey(
+        false,
+        objc2_foundation::ns_string!("ApplePressAndHoldEnabled"),
+    );
+    // Con esa misma entrada de texto, AppKit lanza «AutoFill (Colibrí)»
+    // (`SafariPlatformSupport.Helper`: otro proceso de ~18 MB y 5 hilos) para ofrecer
+    // autorrelleno de contactos o contraseñas, que en una terminal no tiene dónde ir. Es un
+    // valor privado de AppKit (si desaparece, no tiene efecto) y va en el dominio de registro:
+    // no se guarda en las preferencias y `defaults write` puede volver a activarlo.
+    {
+        use objc2::runtime::AnyObject;
+        use objc2_foundation::{NSDictionary, NSNumber, NSString, ns_string};
+        let no = NSNumber::numberWithBool(false);
+        let autofill = NSDictionary::<NSString, AnyObject>::from_slices(
+            &[ns_string!("_NSEnableTextInputContextBasedAutoFill")],
+            &[&no],
         );
+        // SAFETY: claves `NSString` y valores `NSNumber`, tipos de lista de propiedades.
+        unsafe { defaults.registerDefaults(&autofill) };
     }
     // Sin icono propio: en el Dock va el del bundle (assets/Colibri.icns).
     let viewport = egui::ViewportBuilder::default()
