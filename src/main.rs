@@ -3121,6 +3121,9 @@ impl shell::App for App {
         };
         if self.w.blur_applied != Some(radius) && blur::set(radius) {
             self.w.blur_applied = Some(radius);
+        } else if radius > 0 {
+            // AppKit puede volver a poner el tinte del desenfoque (ver `blur.rs`).
+            blur::refresh(radius);
         }
         // El panel de agentes se declara antes que la barra de pestañas: así ocupa toda la
         // altura de la ventana y la barra empieza donde él acaba.
