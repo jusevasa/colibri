@@ -31,7 +31,8 @@ pub fn mounts() -> Vec<(PathBuf, bool)> {
         .collect()
 }
 
-/// `path` está en un disco de este Mac: el montaje más largo que lo contiene es local, y no
+/// `path` está en un disco de este Mac: el montaje más largo que lo contiene es local (si no
+/// hay ninguno, por ejemplo porque no se pudo leer la tabla, se da por no local), y no
 /// cuelga de `/net` ni de `/Network` (autofs montaría el recurso de red solo por mirarlo).
 /// Mirar una ruta en una unidad de red puede tardar segundos si el servidor no responde, y
 /// el color de las rutas se calcula en el hilo de la interfaz.
@@ -43,7 +44,8 @@ pub fn on_local_disk(path: &Path, mounts: &[(PathBuf, bool)]) -> bool {
         .iter()
         .filter(|(at, _)| path.starts_with(at))
         .max_by_key(|(at, _)| at.as_os_str().len())
-        .is_none_or(|(_, local)| *local)
+        // Sin montaje que la contenga (la tabla vino vacía) no se sabe si es local: no.
+        .is_some_and(|(_, local)| *local)
 }
 
 /// Llegar a `path` no pasa por ninguna unidad de red, ni siquiera a través de enlaces
@@ -119,6 +121,13 @@ mod tests {
                 .iter()
                 .any(|(at, local)| at == Path::new("/") && *local)
         );
+    }
+
+    #[test]
+    fn sin_tabla_de_montajes_no_se_mira_nada() {
+        // Si getmntinfo fallara no se puede saber qué es local: no se mira el disco.
+        assert!(!on_local_disk(Path::new("/Users/yo/src"), &[]));
+        assert!(!local_route(Path::new("/Users/yo/src"), &[]));
     }
 
     #[test]
