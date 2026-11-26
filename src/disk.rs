@@ -40,12 +40,18 @@ pub fn on_local_disk(path: &Path, mounts: &[(PathBuf, bool)]) -> bool {
     if under(path, Path::new("/net")) || under(path, Path::new("/Network")) {
         return false;
     }
-    mounts
+    // El montaje más profundo que la contiene; si hay varios igual de profundos (al no
+    // distinguir mayúsculas, `/Volumes/NAS` y `/Volumes/nas`), todos tienen que ser locales.
+    // Sin ninguno (la tabla vino vacía) no se sabe si es local: no.
+    let depth = |at: &PathBuf| at.components().count();
+    let matching: Vec<&(PathBuf, bool)> = mounts.iter().filter(|(at, _)| under(path, at)).collect();
+    let Some(deepest) = matching.iter().map(|(at, _)| depth(at)).max() else {
+        return false;
+    };
+    matching
         .iter()
-        .filter(|(at, _)| under(path, at))
-        .max_by_key(|(at, _)| at.as_os_str().len())
-        // Sin montaje que la contenga (la tabla vino vacía) no se sabe si es local: no.
-        .is_some_and(|(_, local)| *local)
+        .filter(|(at, _)| depth(at) == deepest)
+        .all(|(_, local)| *local)
 }
 
 /// `path` está dentro de `dir`, comparando tramo a tramo sin distinguir mayúsculas: el
@@ -149,6 +155,17 @@ mod tests {
         assert!(!on_local_disk(Path::new("/network/Servers/x"), &mounts));
         assert!(on_local_disk(Path::new("/volumes/nasx/a"), &mounts));
         assert!(on_local_disk(Path::new("/Users/yo"), &mounts));
+        // En un volumen que distingue mayúsculas pueden convivir `/Volumes/NAS` (red) y
+        // `/Volumes/nas` (local): ambos encajan y ninguno debe ganar por su orden en la tabla.
+        let red = (PathBuf::from("/Volumes/NAS"), false);
+        let local = (PathBuf::from("/Volumes/nas"), true);
+        let raiz = (PathBuf::from("/"), true);
+        for mounts in [
+            [raiz.clone(), red.clone(), local.clone()],
+            [raiz.clone(), local.clone(), red.clone()],
+        ] {
+            assert!(!on_local_disk(Path::new("/Volumes/nas/x"), &mounts));
+        }
     }
 
     #[test]
