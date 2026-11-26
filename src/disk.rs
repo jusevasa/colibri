@@ -37,15 +37,28 @@ pub fn mounts() -> Vec<(PathBuf, bool)> {
 /// Mirar una ruta en una unidad de red puede tardar segundos si el servidor no responde, y
 /// el color de las rutas se calcula en el hilo de la interfaz.
 pub fn on_local_disk(path: &Path, mounts: &[(PathBuf, bool)]) -> bool {
-    if path.starts_with("/net") || path.starts_with("/Network") {
+    if under(path, Path::new("/net")) || under(path, Path::new("/Network")) {
         return false;
     }
     mounts
         .iter()
-        .filter(|(at, _)| path.starts_with(at))
+        .filter(|(at, _)| under(path, at))
         .max_by_key(|(at, _)| at.as_os_str().len())
         // Sin montaje que la contenga (la tabla vino vacía) no se sabe si es local: no.
         .is_some_and(|(_, local)| *local)
+}
+
+/// `path` está dentro de `dir`, comparando tramo a tramo sin distinguir mayúsculas: el
+/// volumen de arranque APFS no las distingue, así que `/volumes/nas` llega a `/Volumes/NAS`.
+/// En un volumen que sí las distingue, el error va hacia el lado seguro (no mirar).
+fn under(path: &Path, dir: &Path) -> bool {
+    let mut parts = path.components();
+    dir.components().all(|d| {
+        parts.next().is_some_and(|p| {
+            p.as_os_str().to_string_lossy().to_lowercase()
+                == d.as_os_str().to_string_lossy().to_lowercase()
+        })
+    })
 }
 
 /// Llegar a `path` no pasa por ninguna unidad de red, ni siquiera a través de enlaces
@@ -122,6 +135,20 @@ mod tests {
                 .iter()
                 .any(|(at, local)| at == Path::new("/") && *local)
         );
+    }
+
+    #[test]
+    fn montajes_sin_distinguir_mayusculas() {
+        // El volumen de arranque APFS no distingue mayúsculas: `/volumes/nas` es `/Volumes/NAS`.
+        let mounts = [
+            (PathBuf::from("/"), true),
+            (PathBuf::from("/Volumes/NAS"), false),
+        ];
+        assert!(!on_local_disk(Path::new("/volumes/nas/x"), &mounts));
+        assert!(!on_local_disk(Path::new("/NET/servidor"), &mounts));
+        assert!(!on_local_disk(Path::new("/network/Servers/x"), &mounts));
+        assert!(on_local_disk(Path::new("/volumes/nasx/a"), &mounts));
+        assert!(on_local_disk(Path::new("/Users/yo"), &mounts));
     }
 
     #[test]
