@@ -10,6 +10,8 @@ pub struct T {
     pub duration: fn(u64) -> String,
     /// El comando falló: código de salida y duración ya formateada.
     pub failed: fn(i32, &str) -> String,
+    /// Recuadro de un enlace web bajo el puntero: qué hace un clic.
+    pub link_open: &'static str,
 }
 
 fn duration_es(ms: u64) -> String {
@@ -39,12 +41,14 @@ pub const ES: T = T {
     other_agent: "Agente",
     duration: duration_es,
     failed: failed_es,
+    link_open: "Clic para abrir",
 };
 
 pub const EN: T = T {
     other_agent: "Agent",
     duration: duration_en,
     failed: failed_en,
+    link_open: "Click to open",
 };
 
 #[cfg(test)]

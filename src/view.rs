@@ -136,6 +136,7 @@ fn show_grid(
     });
 
     let link = handle_input(ui, s, &resp, rect, origin, m, keyboard);
+    link_card(ui, s, link.as_ref(), rect, origin, pal, m);
 
     // Las líneas de cajas no se pintan como texto: en su sitio van las cajas, que dibuja
     // quien llama a partir de `s.chips_px`.
@@ -1134,6 +1135,95 @@ struct Link {
     span: Span,
 }
 
+/// Cuánto tiene que quedarse quieto el puntero sobre un enlace para que salga su recuadro.
+const LINK_CARD_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// El recuadro con la dirección completa del enlace web bajo el puntero (sin ⌘), cuando lleva
+/// `LINK_CARD_DELAY` encima: debajo de su fila o, si no cabe, encima. Antes de tiempo pide
+/// una sola pasada para entonces; quieto después, no repinta.
+fn link_card(
+    ui: &egui::Ui,
+    s: &Session,
+    link: Option<&Link>,
+    rect: Rect,
+    origin: Pos2,
+    pal: &Palette,
+    m: &Metrics,
+) {
+    let (Some(link), Some((span, since))) = (link, s.link_hover.as_ref()) else {
+        return;
+    };
+    let Target::Url(url) = &link.target else {
+        return;
+    };
+    if link.span != *span {
+        return;
+    }
+    let waited = since.elapsed();
+    if waited < LINK_CARD_DELAY {
+        ui.ctx().request_repaint_after(LINK_CARD_DELAY - waited);
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_hover_pos() else {
+        return;
+    };
+    let row = ((pointer.y - origin.y) / m.cell_h).floor();
+    let row_top = origin.y + row * m.cell_h;
+    const HEIGHT: f32 = 44.0;
+    let below = row_top + m.cell_h + 4.0;
+    let y = if below + HEIGHT <= rect.bottom() {
+        below
+    } else {
+        row_top - HEIGHT - 4.0
+    };
+    let text = middle_truncate(url, 80);
+    let mono = FontId::monospace(11.5);
+    let width = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap(text.clone(), mono.clone(), pal.fg))
+        .size()
+        .x
+        + 24.0;
+    let x = (pointer.x - 12.0)
+        .min(rect.right() - width - 4.0)
+        .max(rect.left() + 4.0);
+    egui::Area::new(egui::Id::unique("colibri-link-card"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(Pos2::new(x, y))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(pal.panel)
+                .stroke(Stroke::new(1.0, pal.border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                    ui.label(egui::RichText::new(text).font(mono).color(pal.fg));
+                    ui.label(
+                        egui::RichText::new(crate::i18n::t().term.link_open)
+                            .font(FontId::proportional(11.0))
+                            .color(pal.muted),
+                    );
+                });
+        });
+}
+
+/// `text` con como mucho `max` caracteres: si no cabe, se quita del medio (queda más del
+/// principio, que dice a dónde va el enlace) y en su lugar va «…».
+fn middle_truncate(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max || max < 2 {
+        return text.to_string();
+    }
+    let head = (max - 1) * 2 / 3;
+    let tail = max - 1 - head;
+    let mut out: String = text.chars().take(head).collect();
+    out.push('…');
+    out.extend(text.chars().skip(count - tail));
+    out
+}
+
 fn link_some(link: &Link) -> Option<Link> {
     Some(link.clone())
 }
@@ -1714,6 +1804,14 @@ fn report_mouse(
 mod tests {
     use super::{PointerEv, Target, Withheld, WithheldOut, opens_on_click, withheld_step};
     use super::{file_command, mouse_seq, path_span, split_position, url_span};
+
+    #[test]
+    fn direccion_cortada_por_el_medio() {
+        assert_eq!(super::middle_truncate("https://a.b/c", 40), "https://a.b/c");
+        let s = super::middle_truncate(&format!("https://example.com/{}", "x".repeat(100)), 30);
+        assert_eq!(s.chars().count(), 30);
+        assert!(s.starts_with("https://example") && s.contains('…') && s.ends_with("xxx"));
+    }
     use std::path::PathBuf;
 
     #[test]
