@@ -9,6 +9,7 @@ mod clip;
 mod complete;
 mod config;
 mod debug;
+mod disk;
 mod drag;
 mod git;
 mod grid;

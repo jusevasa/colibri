@@ -219,14 +219,28 @@ pub enum Detail {
 }
 
 /// El detalle de `item`. Mira el disco (una carpeta, un archivo), así que solo se pide para
-/// la fila que se describe. Una orden que no es alias ni tiene ruta es interna si se conocen
-/// las rutas (`paths` no vacío, la integración de zsh las escribió); si no, no se sabe.
+/// la fila que se describe, y solo en discos de este Mac (`disk::local_route`): se calcula en
+/// el hilo de la interfaz y una unidad de red que no responde lo dejaría parado. Una orden
+/// que no es alias ni tiene ruta es interna si se conocen las rutas (`paths` no vacío, la
+/// integración de zsh las escribió); si no, no se sabe.
 pub fn detail(
     cwd: &Path,
     t: &Target,
     item: &Item,
     aliases: &HashMap<String, String>,
     paths: &HashMap<String, String>,
+) -> Option<Detail> {
+    detail_in(cwd, t, item, aliases, paths, &crate::disk::mounts())
+}
+
+/// `detail` con la tabla de montajes dada.
+fn detail_in(
+    cwd: &Path,
+    t: &Target,
+    item: &Item,
+    aliases: &HashMap<String, String>,
+    paths: &HashMap<String, String>,
+    mounts: &[(PathBuf, bool)],
 ) -> Option<Detail> {
     let unix = |time: SystemTime| {
         time.duration_since(SystemTime::UNIX_EPOCH)
@@ -239,10 +253,17 @@ pub fn detail(
         }
         Kind::Dir => {
             let dir = base_dir(cwd, t)?.join(&item.name);
+            if !crate::disk::local_route(&dir, mounts) {
+                return None;
+            }
             Some(Detail::Entries(std::fs::read_dir(dir).ok()?.count()))
         }
         Kind::File => {
-            let meta = std::fs::metadata(base_dir(cwd, t)?.join(&item.name)).ok()?;
+            let file = base_dir(cwd, t)?.join(&item.name);
+            if !crate::disk::local_route(&file, mounts) {
+                return None;
+            }
+            let meta = std::fs::metadata(file).ok()?;
             Some(Detail::File {
                 bytes: meta.len(),
                 modified: meta.modified().map_or(0, unix),
@@ -837,6 +858,19 @@ mod tests {
         let vacio = HashMap::new();
         assert_eq!(
             detail(&dir, &t, &it("cd", Kind::Command), &vacio, &vacio),
+            None
+        );
+        // En una unidad de red no se mira nada (ni se cuenta ni se lee el tamaño).
+        let red = [
+            (PathBuf::from("/"), true),
+            (dir.canonicalize().unwrap(), false),
+        ];
+        assert_eq!(
+            detail_in(&dir, &t, &it("sub", Kind::Dir), &al, &pa, &red),
+            None
+        );
+        assert_eq!(
+            detail_in(&dir, &t, &it("a.bin", Kind::File), &al, &pa, &red),
             None
         );
         let rama = Item {
