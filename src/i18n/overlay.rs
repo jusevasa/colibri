@@ -116,6 +116,13 @@ pub struct T {
     pub kind_current_branch: &'static str,
     /// Rama de un remoto que aún no tiene rama local.
     pub kind_remote_branch: &'static str,
+    /// Panel de detalles de las sugerencias: «alias de git checkout».
+    pub detail_alias: fn(&str) -> String,
+    pub detail_builtin: &'static str,
+    /// Elementos de una carpeta.
+    pub detail_entries: fn(usize) -> String,
+    /// Tamaño y hace cuánto se modificó un archivo.
+    pub detail_file: fn(&str, &str) -> String,
     /// «12 opciones», sin nada elegido.
     pub options: fn(usize) -> String,
     pub complete_keys: &'static str,
@@ -309,6 +316,16 @@ pub const ES: T = T {
     kind_branch: "Rama",
     kind_current_branch: "Rama actual",
     kind_remote_branch: "Rama remota",
+    detail_alias: |v| format!("alias de {v}"),
+    detail_builtin: "Orden interna del shell",
+    detail_entries: |n| {
+        if n == 1 {
+            "1 elemento".to_string()
+        } else {
+            format!("{n} elementos")
+        }
+    },
+    detail_file: |size, ago| format!("{size} · modificado {ago}"),
     options: options_es,
     complete_keys: "⇥ ↑↓ elegir  ·  escribe para filtrar  ·  esc cerrar",
 
@@ -418,6 +435,16 @@ pub const EN: T = T {
     kind_branch: "Branch",
     kind_current_branch: "Current branch",
     kind_remote_branch: "Remote branch",
+    detail_alias: |v| format!("alias for {v}"),
+    detail_builtin: "Shell builtin",
+    detail_entries: |n| {
+        if n == 1 {
+            "1 item".to_string()
+        } else {
+            format!("{n} items")
+        }
+    },
+    detail_file: |size, ago| format!("{size} · modified {ago}"),
     options: options_en,
     complete_keys: "⇥ ↑↓ choose  ·  type to filter  ·  esc close",
 

@@ -1018,6 +1018,7 @@ impl App {
                     sel: None,
                     x,
                     git,
+                    detail: None,
                 };
                 ctx.request_repaint();
             }

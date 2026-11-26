@@ -137,17 +137,22 @@ pub fn candidates(cwd: &Path, t: &Target) -> Vec<Item> {
     items
 }
 
-fn entries(cwd: &Path, t: &Target, dirs_only: bool) -> Vec<Item> {
+/// La carpeta en la que se busca: la parte de carpeta de la palabra, sin escapes, relativa a
+/// `cwd` si no es absoluta ni empieza por `~/`.
+fn base_dir(cwd: &Path, t: &Target) -> Option<PathBuf> {
     let dir = unescape(&t.typed_dir);
-    let base: PathBuf = if let Some(rest) = dir.strip_prefix("~/") {
-        match dirs::home_dir() {
-            Some(home) => home.join(rest),
-            None => return Vec::new(),
-        }
+    Some(if let Some(rest) = dir.strip_prefix("~/") {
+        dirs::home_dir()?.join(rest)
     } else if dir.starts_with('/') {
         PathBuf::from(&dir)
     } else {
         cwd.join(&dir)
+    })
+}
+
+fn entries(cwd: &Path, t: &Target, dirs_only: bool) -> Vec<Item> {
+    let Some(base) = base_dir(cwd, t) else {
+        return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&base) else {
         return Vec::new();
@@ -194,6 +199,75 @@ pub fn replacement(t: &Target, item: &Item) -> String {
         _ => out.push(' '),
     }
     out
+}
+
+/// Lo que el panel de detalles cuenta de una sugerencia, además de su nombre y su tipo.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Detail {
+    /// El último commit de una rama: fecha (unix) y mensaje.
+    Commit { at: u64, subject: String },
+    /// Elementos de una carpeta.
+    Entries(usize),
+    /// Tamaño y fecha de modificación (unix) de un archivo.
+    File { bytes: u64, modified: u64 },
+    /// Un alias del shell y a qué equivale.
+    Alias(String),
+    /// Una orden interna del shell (`cd`, `export`…).
+    Builtin,
+    /// Dónde está el ejecutable de una orden.
+    Path(String),
+}
+
+/// El detalle de `item`. Mira el disco (una carpeta, un archivo), así que solo se pide para
+/// la fila que se describe. Una orden que no es alias ni tiene ruta es interna si se conocen
+/// las rutas (`paths` no vacío, la integración de zsh las escribió); si no, no se sabe.
+pub fn detail(
+    cwd: &Path,
+    t: &Target,
+    item: &Item,
+    aliases: &HashMap<String, String>,
+    paths: &HashMap<String, String>,
+) -> Option<Detail> {
+    let unix = |time: SystemTime| {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    };
+    match item.kind {
+        Kind::Branch | Kind::CurrentBranch | Kind::RemoteBranch => {
+            let (at, subject) = item.commit.clone()?;
+            Some(Detail::Commit { at, subject })
+        }
+        Kind::Dir => {
+            let dir = base_dir(cwd, t)?.join(&item.name);
+            Some(Detail::Entries(std::fs::read_dir(dir).ok()?.count()))
+        }
+        Kind::File => {
+            let meta = std::fs::metadata(base_dir(cwd, t)?.join(&item.name)).ok()?;
+            Some(Detail::File {
+                bytes: meta.len(),
+                modified: meta.modified().map_or(0, unix),
+            })
+        }
+        Kind::Command => {
+            if let Some(value) = aliases.get(&item.name) {
+                Some(Detail::Alias(value.clone()))
+            } else if let Some(path) = paths.get(&item.name) {
+                Some(Detail::Path(path.clone()))
+            } else {
+                (!paths.is_empty()).then_some(Detail::Builtin)
+            }
+        }
+    }
+}
+
+/// Tamaño en B, KB o MB, redondeado a entero.
+pub fn human_size(bytes: u64) -> String {
+    const K: u64 = 1024;
+    match bytes {
+        b if b < K => format!("{b} B"),
+        b if b < K * K => format!("{} KB", (b + K / 2) / K),
+        b => format!("{} MB", (b + K * K / 2) / (K * K)),
+    }
 }
 
 /// Las ramas que contienen `prefix` (sin distinguir mayúsculas) como sugerencias: las locales
@@ -717,6 +791,62 @@ mod tests {
             commit: None,
         };
         assert_eq!(replacement(&t, &item), "fix\\(ui\\) ");
+    }
+
+    #[test]
+    fn detalles_de_cada_tipo() {
+        let dir = temp_dir("detalles");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.join("sub").join(name), "").unwrap();
+        }
+        std::fs::write(dir.join("a.bin"), vec![0u8; 2048]).unwrap();
+        let al = HashMap::from([("gco".to_string(), "git checkout".to_string())]);
+        let pa = HashMap::from([("git".to_string(), "/usr/bin/git".to_string())]);
+        let t = target("ls ").unwrap();
+        let it = |name: &str, kind| Item::new(name.into(), kind);
+        assert_eq!(
+            detail(&dir, &t, &it("sub", Kind::Dir), &al, &pa),
+            Some(Detail::Entries(3))
+        );
+        assert!(matches!(
+            detail(&dir, &t, &it("a.bin", Kind::File), &al, &pa),
+            Some(Detail::File { bytes: 2048, .. })
+        ));
+        assert_eq!(
+            detail(&dir, &t, &it("gco", Kind::Command), &al, &pa),
+            Some(Detail::Alias("git checkout".into()))
+        );
+        assert_eq!(
+            detail(&dir, &t, &it("git", Kind::Command), &al, &pa),
+            Some(Detail::Path("/usr/bin/git".into()))
+        );
+        assert_eq!(
+            detail(&dir, &t, &it("cd", Kind::Command), &al, &pa),
+            Some(Detail::Builtin)
+        );
+        let vacio = HashMap::new();
+        assert_eq!(
+            detail(&dir, &t, &it("cd", Kind::Command), &vacio, &vacio),
+            None
+        );
+        let rama = Item {
+            name: "x".into(),
+            kind: Kind::Branch,
+            commit: Some((5, "m".into())),
+        };
+        assert_eq!(
+            detail(&dir, &t, &rama, &al, &pa),
+            Some(Detail::Commit {
+                at: 5,
+                subject: "m".into()
+            })
+        );
+        assert_eq!(
+            (human_size(512), human_size(2048), human_size(5 << 20)),
+            ("512 B".to_string(), "2 KB".to_string(), "5 MB".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
