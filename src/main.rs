@@ -971,7 +971,11 @@ impl App {
         if tab_down {
             s.resync_line();
         }
-        let Some(target) = s.prompt_line().and_then(complete::target) else {
+        let Some(line) = s
+            .prompt_line()
+            .filter(|l| complete::target(l).is_some())
+            .map(str::to_string)
+        else {
             return;
         };
         let tab = Shortcut {
@@ -984,8 +988,16 @@ impl App {
         if !take_shortcut(ctx, &tab) {
             return;
         }
-        let items = complete::candidates(&s.cwd, &target);
+        // Las ramas se leen de git aquí, una vez; con la lista abierta se reutilizan.
+        let mut git = complete::GitData::default();
+        let aliases = complete::shell_aliases();
+        let offer = complete::offer(&line, &s.cwd, &|n| aliases.get(n).cloned(), &mut git);
         let Some(s) = self.w.sessions.get_mut(self.w.active) else {
+            return;
+        };
+        let Some((target, items)) = offer else {
+            // Ahí no van ni ramas ni rutas (un nombre de rama nueva, un remoto): para el shell.
+            s.input(b"\t".to_vec());
             return;
         };
         match items.as_slice() {
@@ -1000,11 +1012,12 @@ impl App {
                     c.left() - target.token.chars().count() as f32 * c.width()
                 });
                 self.w.overlay = overlay::Overlay::Complete {
-                    line: s.prompt_line().unwrap_or("").to_string(),
+                    line,
                     target,
                     items,
                     sel: None,
                     x,
+                    git,
                 };
                 ctx.request_repaint();
             }
@@ -3402,20 +3415,7 @@ fn prompt_chips(
         let c = Pos2::new(rect.left() + 9.0 + 6.0, rect.center().y);
         match icon {
             Icon::Folder => file_icon(p, c, true, color),
-            Icon::Branch => {
-                // Dos commits en una línea y un tercero que se ramifica.
-                let stroke = Stroke::new(1.2, color);
-                let (a, b, d) = (
-                    c + Vec2::new(-3.0, -4.5),
-                    c + Vec2::new(-3.0, 4.5),
-                    c + Vec2::new(3.5, -2.0),
-                );
-                p.line_segment([a, b], stroke);
-                p.line_segment([d, c + Vec2::new(-3.0, 2.0)], stroke);
-                for dot in [a, b, d] {
-                    p.circle_filled(dot, 1.9, color);
-                }
-            }
+            Icon::Branch => branch_icon(p, c, color),
             Icon::Person => {
                 // Cabeza y hombros.
                 let stroke = Stroke::new(1.2, color);
@@ -3444,6 +3444,21 @@ fn prompt_chips(
 }
 
 /// Carpeta (con su pestaña) u hoja de archivo, dibujadas a mano.
+/// Icono de rama centrado en `c`: dos commits en una línea y un tercero que se ramifica.
+pub fn branch_icon(p: &egui::Painter, c: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.2, color);
+    let (a, b, d) = (
+        c + Vec2::new(-3.0, -4.5),
+        c + Vec2::new(-3.0, 4.5),
+        c + Vec2::new(3.5, -2.0),
+    );
+    p.line_segment([a, b], stroke);
+    p.line_segment([d, c + Vec2::new(-3.0, 2.0)], stroke);
+    for dot in [a, b, d] {
+        p.circle_filled(dot, 1.9, color);
+    }
+}
+
 pub fn file_icon(p: &egui::Painter, c: Pos2, is_dir: bool, color: Color32) {
     let stroke = Stroke::new(1.2, color);
     if is_dir {

@@ -112,6 +112,10 @@ pub struct T {
     pub kind_command: &'static str,
     pub kind_folder: &'static str,
     pub kind_file: &'static str,
+    pub kind_branch: &'static str,
+    pub kind_current_branch: &'static str,
+    /// Rama de un remoto que aún no tiene rama local.
+    pub kind_remote_branch: &'static str,
     /// «12 opciones», sin nada elegido.
     pub options: fn(usize) -> String,
     pub complete_keys: &'static str,
@@ -302,6 +306,9 @@ pub const ES: T = T {
     kind_command: "Comando",
     kind_folder: "Carpeta",
     kind_file: "Archivo",
+    kind_branch: "Rama",
+    kind_current_branch: "Rama actual",
+    kind_remote_branch: "Rama remota",
     options: options_es,
     complete_keys: "⇥ ↑↓ elegir  ·  escribe para filtrar  ·  esc cerrar",
 
@@ -408,6 +415,9 @@ pub const EN: T = T {
     kind_command: "Command",
     kind_folder: "Folder",
     kind_file: "File",
+    kind_branch: "Branch",
+    kind_current_branch: "Current branch",
+    kind_remote_branch: "Remote branch",
     options: options_en,
     complete_keys: "⇥ ↑↓ choose  ·  type to filter  ·  esc close",
 

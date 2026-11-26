@@ -251,7 +251,7 @@ pub fn branch_items(
 /// Lo que se lee de git para una lista de sugerencias: se carga la primera vez que hace
 /// falta y se reutiliza mientras la lista sigue abierta (al seguir escribiendo no se vuelve
 /// a llamar a git).
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, PartialEq, Debug)]
 pub struct GitData {
     pub refs: Option<Vec<crate::git::Ref>>,
     pub current: Option<String>,

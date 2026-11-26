@@ -102,17 +102,33 @@ pub enum Overlay {
         query: String,
         sel: usize,
     },
-    /// Carpetas y archivos que encajan con la palabra que se teclea en el prompt.
-    /// Sin elegir nada (`sel` None) la lista solo se muestra; al elegir, la opción queda
-    /// escrita en el prompt. `line` es la línea del prompt para la que vale la lista (si
-    /// cambia es que se siguió escribiendo y se rehace) y `x`, dónde se ancla.
+    /// Carpetas, archivos, comandos o ramas que encajan con la palabra que se teclea en el
+    /// prompt. Sin elegir nada (`sel` None) la lista solo se muestra; al elegir, la opción
+    /// queda escrita en el prompt. `line` es la línea del prompt para la que vale la lista
+    /// (si cambia es que se siguió escribiendo y se rehace), `x`, dónde se ancla, y `git`,
+    /// lo ya leído de git (al rehacerla no se vuelve a llamar).
     Complete {
         target: crate::complete::Target,
         items: Vec<crate::complete::Item>,
         sel: Option<usize>,
         line: String,
         x: f32,
+        git: crate::complete::GitData,
     },
+}
+
+/// Rótulo del tipo de una sugerencia de Tab, en el idioma de la interfaz.
+fn kind_label(kind: crate::complete::Kind) -> &'static str {
+    use crate::complete::Kind;
+    let o = &i18n::t().overlay;
+    match kind {
+        Kind::Dir => o.kind_folder,
+        Kind::File => o.kind_file,
+        Kind::Command => o.kind_command,
+        Kind::Branch => o.kind_branch,
+        Kind::CurrentBranch => o.kind_current_branch,
+        Kind::RemoteBranch => o.kind_remote_branch,
+    }
 }
 
 /// Filas de Preferencias, por id (el que usa el guion: `pref <id>`); la etiqueta sale de
@@ -338,7 +354,8 @@ impl App {
                 sel,
                 line,
                 x,
-            } => self.complete_ui(ctx, target, items, sel, line, x),
+                git,
+            } => self.complete_ui(ctx, target, items, sel, line, x, git),
         }
     }
 
@@ -825,6 +842,7 @@ impl App {
     /// sigue llegando al shell: escribir o borrar rehace la lista con lo nuevo. Tab y las
     /// flechas eligen, y lo elegido queda escrito en el prompt al momento; Enter lo acepta
     /// (sin nada elegido, Enter es del shell) y Esc devuelve la palabra original.
+    #[allow(clippy::too_many_arguments)]
     fn complete_ui(
         &mut self,
         ctx: &egui::Context,
@@ -833,6 +851,7 @@ impl App {
         mut sel: Option<usize>,
         mut line: String,
         x: f32,
+        mut git: crate::complete::GitData,
     ) {
         use crate::complete;
         let Some(s) = self.w.sessions.get(self.w.active) else {
@@ -840,10 +859,13 @@ impl App {
             return;
         };
         if s.prompt_line() != Some(line.as_str()) {
+            let aliases = complete::shell_aliases();
             let fresh = s
                 .prompt_line()
-                .and_then(|l| complete::target(l).map(|t| (l.to_string(), t)))
-                .map(|(l, t)| (complete::candidates(&s.cwd, &t), l, t))
+                .and_then(|l| {
+                    complete::offer(l, &s.cwd, &|n| aliases.get(n).cloned(), &mut git)
+                        .map(|(t, found)| (found, l.to_string(), t))
+                })
                 .filter(|(found, ..)| !found.is_empty());
             let Some((found, l, t)) = fresh else {
                 self.w.overlay = Overlay::None;
@@ -931,7 +953,9 @@ impl App {
                             }
                             let icon = Pos2::new(r.left() + 20.0, r.center().y);
                             let icon_color = if chosen { pal.fg } else { pal.muted };
-                            if item.kind == crate::complete::Kind::Command {
+                            if item.is_branch() {
+                                crate::branch_icon(p, icon, icon_color);
+                            } else if item.kind == crate::complete::Kind::Command {
                                 // «>_» de terminal.
                                 let st = Stroke::new(1.2, icon_color);
                                 let c = icon + Vec2::new(-3.0, 0.0);
@@ -980,12 +1004,15 @@ impl App {
                                 }
                                 None => add(&name, dim),
                             }
-                            let kind = match item.kind {
-                                crate::complete::Kind::Command => o.kind_command,
-                                crate::complete::Kind::Dir => o.kind_folder,
-                                _ => o.kind_file,
-                            };
-                            let kind_w = 64.0;
+                            let kind = kind_label(item.kind);
+                            let kind_w = ui
+                                .ctx()
+                                .fonts_mut(|f| {
+                                    f.layout_no_wrap(kind.to_string(), small.clone(), pal.muted)
+                                })
+                                .size()
+                                .x
+                                .max(64.0);
                             job.wrap = egui::text::TextWrapping::truncate_at_width(
                                 r.width() - 40.0 - kind_w - 12.0,
                             );
@@ -1064,6 +1091,7 @@ impl App {
                 sel,
                 line,
                 x,
+                git,
             };
         }
     }
