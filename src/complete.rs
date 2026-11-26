@@ -260,6 +260,15 @@ pub fn detail(
     }
 }
 
+/// Qué decide el detalle de una fila: la carpeta escrita, el nombre y el tipo. Con el
+/// nombre solo, la carpeta `test/` y la orden `test` (o `package.json` de dos carpetas)
+/// compartirían detalle.
+pub type DetailKey = (String, String, Kind);
+
+pub fn detail_key(t: &Target, item: &Item) -> DetailKey {
+    (t.typed_dir.clone(), item.name.clone(), item.kind)
+}
+
 /// Tamaño en B, KB o MB, redondeado a entero.
 pub fn human_size(bytes: u64) -> String {
     const K: u64 = 1024;
@@ -847,6 +856,21 @@ mod tests {
             ("512 B".to_string(), "2 KB".to_string(), "5 MB".to_string())
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clave_del_detalle_distingue_tipo_y_carpeta() {
+        // `te`+Tab: la carpeta `test/` y la orden `test` se llaman igual.
+        let t = target("te").unwrap();
+        let dir = Item::new("test".into(), Kind::Dir);
+        let cmd = Item::new("test".into(), Kind::Command);
+        assert_ne!(detail_key(&t, &dir), detail_key(&t, &cmd));
+        // El mismo nombre en dos carpetas escritas.
+        let a = target("cat packages/a/").unwrap();
+        let b = target("cat packages/b/").unwrap();
+        let file = Item::new("package.json".into(), Kind::File);
+        assert_ne!(detail_key(&a, &file), detail_key(&b, &file));
+        assert_eq!(detail_key(&a, &file), detail_key(&a, &file.clone()));
     }
 
     #[test]

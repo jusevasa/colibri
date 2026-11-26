@@ -117,9 +117,9 @@ pub enum Overlay {
         line: String,
         x: f32,
         git: crate::complete::GitData,
-        /// El detalle ya calculado de la fila que describe el panel, por su nombre (mira el
+        /// El detalle ya calculado de la fila que describe el panel, por carpeta, nombre y tipo (mira el
         /// disco: no se repite en cada cuadro).
-        detail: Option<(String, Option<crate::complete::Detail>)>,
+        detail: Option<(crate::complete::DetailKey, Option<crate::complete::Detail>)>,
     },
 }
 
@@ -861,7 +861,7 @@ impl App {
         mut line: String,
         x: f32,
         mut git: crate::complete::GitData,
-        mut detail: Option<(String, Option<crate::complete::Detail>)>,
+        mut detail: Option<(crate::complete::DetailKey, Option<crate::complete::Detail>)>,
     ) {
         use crate::complete;
         let Some(s) = self.w.sessions.get(self.w.active) else {
@@ -1084,7 +1084,8 @@ impl App {
         if let Some(item) = items.get(hovered.or(next).unwrap_or(first))
             && panel_x + DETAIL_W <= screen.right() - 8.0
         {
-            if detail.as_ref().is_none_or(|(name, _)| *name != item.name) {
+            let key = complete::detail_key(&target, item);
+            if detail.as_ref().is_none_or(|(seen, _)| *seen != key) {
                 let found = complete::detail(
                     &s.cwd,
                     &target,
@@ -1092,7 +1093,7 @@ impl App {
                     &complete::shell_aliases(),
                     &complete::command_paths(),
                 );
-                detail = Some((item.name.clone(), found));
+                detail = Some((key, found));
             }
             let info = detail.as_ref().and_then(|(_, d)| d.clone());
             self.complete_detail(ctx, item, info, Pos2::new(panel_x, y), DETAIL_W);
