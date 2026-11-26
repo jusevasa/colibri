@@ -15,7 +15,7 @@
 - **Panel de agentes** con todos los de todas las ventanas, filtro por estado y buscador (`⌘⇧F`), y botones para abrir los agentes que tengas instalados.
 - **Varias ventanas.** Arrastra pestañas entre ellas o fuera para abrir una nueva; `⌘⇧T` reabre lo último que cerraste.
 - **Retomar conversaciones.** Al reabrir Colibrí, donde corría Claude Code te ofrece retomar justo esa conversación.
-- **Integración con zsh.** Carpeta, rama y archivos cambiados en el prompt como botones, comandos que fallaron marcados con su código y su duración, selección con Shift dentro del comando, historial con `↑` y sugerencias de rutas con Tab.
+- **Integración con zsh.** Carpeta, rama y archivos cambiados en el prompt como botones, comandos que fallaron marcados con su código y su duración, selección con Shift dentro del comando, historial con `↑`, sugerencias de rutas y de ramas de git con Tab (con un panel de detalles), y las rutas del comando de otro color. Un clic abre los enlaces web.
 - **Puertos y procesos.** Paneles para ver qué escucha en cada puerto y qué consume memoria, y detenerlo.
 - **Enlaces y rutas** con `⌘` + clic (las rutas se abren en tu editor), carpetas desde Finder y archivos soltados sobre la ventana.
 - **Ligera.** Pintor propio en Metal, repinta solo cuando algo cambia y comprime el historial de cada pestaña.
