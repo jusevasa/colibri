@@ -28,6 +28,8 @@ pub struct Metrics {
     pub blink: bool,
     /// Con qué se abre un archivo al hacer ⌘+clic en su ruta (vacío = lo que diga macOS).
     pub editor: String,
+    /// Un clic normal abre los enlaces web (preferencia `link_click`); si no, solo con ⌘.
+    pub link_click: bool,
 }
 
 /// Glifos ya maquetados para la rejilla con instancias. Uno por `egui::Context` (por
@@ -134,10 +136,13 @@ fn show_grid(
     });
 
     let link = handle_input(ui, s, &resp, rect, origin, m, keyboard);
+    link_card(ui, s, link.as_ref(), rect, origin, pal, m);
 
     // Las líneas de cajas no se pintan como texto: en su sitio van las cajas, que dibuja
     // quien llama a partir de `s.chips_px`.
     let chip_rows = if chips { s.chip_rows() } else { Vec::new() };
+    // Las rutas que existen en el comando de cada prompt, de otro color (como en Warp).
+    let paths = s.path_tokens();
     // Un prompt remoto lleva sus cajas en la misma fila que el comando. Las cajas ocupan
     // más que el texto que sustituyen, así que el comando se pinta corrido a la derecha
     // lo que haga falta (en celdas enteras, para que siga en la rejilla).
@@ -239,6 +244,7 @@ fn show_grid(
                 origin,
                 link: link.as_ref(),
                 chip_rows: &chip_rows,
+                paths: &paths,
                 shifts: &shifts,
             };
             pass.run(&mut term, &mut s.grid, &mut glyphs, &ctx, no_grid_cache())
@@ -253,6 +259,7 @@ fn show_grid(
             selection: content.selection,
             link: link.as_ref(),
             chip_rows: &chip_rows,
+            paths: &paths,
             shifts: &shifts,
         };
         let cursor_row = content.cursor.point.line.0 + offset;
@@ -459,6 +466,9 @@ pub struct GridCache {
     batch: Option<std::sync::Arc<crate::grid::GridBatch>>,
     /// Filas rehechas en el último cuadro.
     rebuilt: usize,
+    /// Las rutas coloreadas en el último cuadro: una fila cuyas rutas cambian se rehace
+    /// aunque alacritty no la dé por dañada (un archivo que se creó, otro prompt).
+    paths: Vec<(i32, usize, usize, crate::session::Tok)>,
 }
 
 /// Lo que sale de la rejilla en un cuadro. Con instancias: el lote (fondos y letras) y, con
@@ -492,6 +502,8 @@ struct GridPass<'a> {
     origin: Pos2,
     link: Option<&'a Link>,
     chip_rows: &'a [crate::session::ChipRow],
+    /// Rutas del comando a colorear (`Session::path_tokens`).
+    paths: &'a [(i32, usize, usize, crate::session::Tok)],
     shifts: &'a [(i32, i32)],
 }
 
@@ -539,10 +551,28 @@ impl GridPass<'_> {
             || damaged.is_none()
             || cache.key.as_ref() != Some(&key)
             || cache.rows.len() != lines;
-        let rows: Vec<usize> = match &damaged {
+        let mut rows: Vec<usize> = match &damaged {
             Some(rows) if !full => rows.iter().copied().filter(|&r| r < lines).collect(),
             _ => (0..lines).collect(),
         };
+        if !full {
+            let of_row = |list: &[(i32, usize, usize, crate::session::Tok)], row: i32| {
+                list.iter()
+                    .filter(|t| t.0 == row)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            for row in cache.paths.iter().chain(self.paths).map(|t| t.0) {
+                let fresh = row >= 0
+                    && (row as usize) < lines
+                    && !rows.contains(&(row as usize))
+                    && of_row(&cache.paths, row) != of_row(self.paths, row);
+                if fresh {
+                    rows.push(row as usize);
+                }
+            }
+        }
+        cache.paths = self.paths.to_vec();
         if full {
             cache.rows.clear();
             cache.rows.resize_with(lines, RowOut::default);
@@ -554,6 +584,7 @@ impl GridPass<'_> {
             selection,
             link: self.link,
             chip_rows: self.chip_rows,
+            paths: self.paths,
             shifts: self.shifts,
         };
         let mut changed = full;
@@ -620,15 +651,18 @@ fn shift_of(shifts: &[(i32, i32)], row: i32) -> i32 {
         .map_or(0, |(_, n)| *n)
 }
 
-/// Color del comando que se escribe en una máquina remota (allí no hay resaltado).
+/// Color de un trozo de comando: el que se escribe en una máquina remota (allí no hay
+/// resaltado) o una ruta que existe en el comando de un prompt local.
 fn token_at(
     chip_rows: &[crate::session::ChipRow],
+    paths: &[(i32, usize, usize, crate::session::Tok)],
     row: i32,
     col: usize,
 ) -> Option<crate::session::Tok> {
     chip_rows
         .iter()
         .flat_map(|c| c.tokens.iter())
+        .chain(paths)
         .find(|(r, from, to, _)| *r == row && (*from..*to).contains(&col))
         .map(|(.., tok)| *tok)
 }
@@ -640,6 +674,7 @@ struct Look<'a> {
     selection: Option<alacritty_terminal::selection::SelectionRange>,
     link: Option<&'a Link>,
     chip_rows: &'a [crate::session::ChipRow],
+    paths: &'a [(i32, usize, usize, crate::session::Tok)],
     shifts: &'a [(i32, i32)],
 }
 
@@ -670,7 +705,7 @@ fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
         if look.chip_rows.iter().any(|c| c.row == row && col < c.end) {
             continue;
         }
-        let token = token_at(look.chip_rows, row, col);
+        let token = token_at(look.chip_rows, look.paths, row, col);
         let shifted = col as i32 - shift;
         if shifted < 0 {
             continue;
@@ -686,6 +721,7 @@ fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
             Some(crate::session::Tok::Command) => pal.ansi[2],
             Some(crate::session::Tok::Flag) => pal.ansi[4],
             Some(crate::session::Tok::Str) => pal.ansi[3],
+            Some(crate::session::Tok::Path) => pal.ansi[6],
             None => resolve(cell.fg, look.colors, pal),
         };
         let mut bg = resolve(cell.bg, look.colors, pal);
@@ -714,9 +750,12 @@ fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
                 }),
             }
         }
+        // Una ruta coloreada va sin el subrayado con que la marca zsh-syntax-highlighting.
+        let underline =
+            flags.intersects(Flags::ALL_UNDERLINES) && token != Some(crate::session::Tok::Path);
         if linked {
             out.deco.push((col, width, fg, false));
-        } else if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
+        } else if underline || flags.contains(Flags::STRIKEOUT) {
             out.deco
                 .push((col, width, fg, flags.contains(Flags::STRIKEOUT)));
         }
@@ -992,29 +1031,64 @@ fn handle_input(
     // arrastres y movimiento; si no, el ratón selecciona texto.
     // Con ⌘ pulsado, el enlace bajo el puntero se resalta y un clic lo abre. Va antes que
     // los informes de ratón: ese clic no es para el programa ni empieza una selección.
-    let link = (mods.command && hovered)
+    // Sin modificadores (preferencia `link_click`) pasa lo mismo, pero solo con enlaces web
+    // fuera del comando que se escribe (`opens_on_click`): las rutas siguen siendo del
+    // programa (Quick Peek) y un clic en el comando coloca el cursor.
+    let plain = m.link_click && mods.is_none();
+    let found = ((mods.command || plain) && hovered)
         .then(|| ctx.pointer_hover_pos())
         .flatten()
         .and_then(|pos| {
             let term = s.term.lock();
             let offset = term.grid().display_offset();
             let (point, _) = grid_point(pos, origin, m, s, offset);
-            // Las rutas son de esta máquina: dentro de una sesión ssh no se buscan.
-            let cwd = (!s.remote()).then_some(s.cwd.as_path());
-            link_at(&term, point, cwd)
+            // Las rutas son de esta máquina: dentro de una sesión ssh no se buscan. Sin ⌘
+            // tampoco: solo cuentan las direcciones web (y no se mira el disco al pasar).
+            let cwd = (mods.command && !s.remote()).then_some(s.cwd.as_path());
+            link_at(&term, point, cwd).map(|link| (link, point))
         });
-    if let Some(link) = link {
-        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-        if resp.clicked() {
-            open_link(&link.target, &m.editor);
+    let link = match found {
+        Some((link, _)) if mods.command => Some(link),
+        Some((link, point)) => {
+            let in_command = s
+                .input_cells()
+                .is_some_and(|(cells, _)| cells.contains(&point));
+            opens_on_click(&link.target, in_command).then_some(link)
         }
-        return Some(link);
+        None => None,
+    };
+    // El enlace bajo el puntero sin ⌘ y desde cuándo (para el recuadro con la dirección).
+    let hover_span = link
+        .as_ref()
+        .filter(|_| !mods.command)
+        .map(|l| l.span.clone());
+    s.link_hover = match (hover_span, s.link_hover.take()) {
+        (Some(span), Some((old, since))) if span == old => Some((old, since)),
+        (Some(span), _) => Some((span, std::time::Instant::now())),
+        (None, _) => None,
+    };
+    if let Some(link) = &link {
+        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+        if mods.command {
+            if resp.clicked() {
+                open_once(s, link, &m.editor);
+            }
+            return link_some(link);
+        }
     }
 
     let reporting = mode.intersects(TermMode::MOUSE_MODE) && !mods.shift;
     if reporting {
-        report_mouse(ui, s, rect, origin, m, mode, mods);
-        return None;
+        report_mouse(ui, s, rect, origin, m, mode, mods, link.as_ref());
+        return link;
+    }
+    s.link_press = None;
+    // Sin informes de ratón: un clic (sin arrastrar) sobre el enlace lo abre.
+    if let Some(link) = &link
+        && resp.clicked()
+    {
+        open_once(s, link, &m.editor);
+        return link_some(link);
     }
     s.mouse_cell = None;
     s.mouse_down = None;
@@ -1023,7 +1097,7 @@ fn handle_input(
         adopt_selection(s, app_cursor);
     }
     let Some(pos) = resp.interact_pointer_pos() else {
-        return None;
+        return link;
     };
     let mut term = s.term.lock();
     let offset = term.grid().display_offset();
@@ -1049,17 +1123,173 @@ fn handle_input(
     } else if let Some((point, side)) = place {
         place_cursor(s, point, side, app_cursor);
     }
-    None
+    link
 }
 
 /// Un enlace que se puede abrir: el de un hiperenlace OSC 8 (lo que emite Claude Code),
 /// una dirección escrita tal cual en la pantalla o la ruta de un archivo que existe.
+#[derive(Clone)]
 struct Link {
     target: Target,
     span: Span,
 }
 
-#[derive(Debug, PartialEq)]
+/// Cuánto tiene que quedarse quieto el puntero sobre un enlace para que salga su recuadro.
+const LINK_CARD_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// El recuadro con la dirección completa del enlace web bajo el puntero (sin ⌘), cuando lleva
+/// `LINK_CARD_DELAY` encima: debajo de su fila o, si no cabe, encima. Antes de tiempo pide
+/// una sola pasada para entonces; quieto después, no repinta.
+fn link_card(
+    ui: &egui::Ui,
+    s: &Session,
+    link: Option<&Link>,
+    rect: Rect,
+    origin: Pos2,
+    pal: &Palette,
+    m: &Metrics,
+) {
+    let (Some(link), Some((span, since))) = (link, s.link_hover.as_ref()) else {
+        return;
+    };
+    let Target::Url(url) = &link.target else {
+        return;
+    };
+    if link.span != *span {
+        return;
+    }
+    let waited = since.elapsed();
+    if waited < LINK_CARD_DELAY {
+        ui.ctx().request_repaint_after(LINK_CARD_DELAY - waited);
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_hover_pos() else {
+        return;
+    };
+    let row = ((pointer.y - origin.y) / m.cell_h).floor();
+    let row_top = origin.y + row * m.cell_h;
+    const HEIGHT: f32 = 44.0;
+    let below = row_top + m.cell_h + 4.0;
+    let y = if below + HEIGHT <= rect.bottom() {
+        below
+    } else {
+        row_top - HEIGHT - 4.0
+    };
+    let text = middle_truncate(url, 80);
+    let mono = FontId::monospace(11.5);
+    let width = ui
+        .ctx()
+        .fonts_mut(|f| f.layout_no_wrap(text.clone(), mono.clone(), pal.fg))
+        .size()
+        .x
+        + 24.0;
+    let x = (pointer.x - 12.0)
+        .min(rect.right() - width - 4.0)
+        .max(rect.left() + 4.0);
+    egui::Area::new(egui::Id::unique("colibri-link-card"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(Pos2::new(x, y))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(pal.panel)
+                .stroke(Stroke::new(1.0, pal.border))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
+                    ui.label(egui::RichText::new(text).font(mono).color(pal.fg));
+                    ui.label(
+                        egui::RichText::new(crate::i18n::t().term.link_open)
+                            .font(FontId::proportional(11.0))
+                            .color(pal.muted),
+                    );
+                });
+        });
+}
+
+/// `text` con como mucho `max` caracteres: si no cabe, se quita del medio (queda más del
+/// principio, que dice a dónde va el enlace) y en su lugar va «…».
+fn middle_truncate(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max || max < 2 {
+        return text.to_string();
+    }
+    let head = (max - 1) * 2 / 3;
+    let tail = max - 1 - head;
+    let mut out: String = text.chars().take(head).collect();
+    out.push('…');
+    out.extend(text.chars().skip(count - tail));
+    out
+}
+
+/// Tiempo en el que un segundo clic sobre el mismo enlace es el doble clic del primero.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Abrir `span` ahora repetiría lo que abrió el clic anterior: es el segundo clic de un doble
+/// clic sobre el mismo enlace (sin esto, el navegador abría dos pestañas).
+fn repeated_open(
+    last: Option<&(Span, std::time::Instant)>,
+    span: &Span,
+    now: std::time::Instant,
+) -> bool {
+    last.is_some_and(|(seen, at)| seen == span && now.duration_since(*at) < DOUBLE_CLICK)
+}
+
+/// Abre el enlace, salvo que sea el segundo clic de un doble clic sobre él.
+fn open_once(s: &mut Session, link: &Link, editor: &str) {
+    let now = std::time::Instant::now();
+    if !repeated_open(s.last_link_open.as_ref(), &link.span, now) {
+        open_link(&link.target, editor);
+    }
+    s.last_link_open = Some((link.span.clone(), now));
+}
+
+fn link_some(link: &Link) -> Option<Link> {
+    Some(link.clone())
+}
+
+/// Un clic normal (sin ⌘) abre el enlace: solo las direcciones web, y no dentro del comando
+/// que se escribe (ahí el clic coloca el cursor).
+fn opens_on_click(target: &Target, in_command: bool) -> bool {
+    matches!(target, Target::Url(_)) && !in_command
+}
+
+/// Pulsación sobre un enlace web en un programa que lee el ratón: se guarda hasta saber si
+/// es un clic (se abre el enlace y el programa no recibe nada) o el principio de un
+/// arrastre (se le manda y el arrastre sigue como siempre).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Withheld {
+    pub button: u8,
+    /// Celda de la pulsación (columna, fila), como en los informes de ratón.
+    pub cell: (usize, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PointerEv {
+    Move((usize, usize)),
+    Release,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum WithheldOut {
+    /// Sigue sin saberse.
+    Wait,
+    /// Es un arrastre: mandar al programa la pulsación guardada.
+    SendPress,
+    /// Es un clic: abrir el enlace.
+    Open,
+}
+
+fn withheld_step(w: Withheld, ev: PointerEv) -> (Option<Withheld>, WithheldOut) {
+    match ev {
+        PointerEv::Move(cell) if cell == w.cell => (Some(w), WithheldOut::Wait),
+        PointerEv::Move(_) => (None, WithheldOut::SendPress),
+        PointerEv::Release => (None, WithheldOut::Open),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum Target {
     Url(String),
     /// Archivo o carpeta de esta máquina, con la línea y la columna si el texto las decía
@@ -1068,8 +1298,8 @@ enum Target {
 }
 
 /// Qué celdas ocupa el enlace.
-#[derive(Clone, PartialEq)]
-enum Span {
+#[derive(Clone, PartialEq, Debug)]
+pub enum Span {
     /// Las del hiperenlace OSC 8 con esta dirección. Se compara la dirección y no el id:
     /// un enlace partido en varias líneas llega como varios hiperenlaces.
     Tag(String),
@@ -1497,6 +1727,7 @@ fn mouse_seq(code: u8, col: usize, row: usize, press: bool, sgr: bool) -> Option
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_mouse(
     ui: &egui::Ui,
     s: &mut Session,
@@ -1505,6 +1736,7 @@ fn report_mouse(
     m: &Metrics,
     mode: TermMode,
     mods: Modifiers,
+    link: Option<&Link>,
 ) {
     use egui::PointerButton::{Middle, Primary, Secondary};
     let buttons = [Primary, Middle, Secondary];
@@ -1527,9 +1759,28 @@ fn report_mouse(
 
     for (b, &is_pressed) in pressed.iter().enumerate() {
         if is_pressed && inside {
+            // Botón izquierdo sobre un enlace web: se guarda hasta saber si es un clic.
+            if b == 0 && link.is_some() {
+                s.link_press = Some(Withheld { button: 0, cell });
+                continue;
+            }
             s.mouse_down = Some(b as u8);
             out.extend(
                 mouse_seq(b as u8 + mod_bits, cell.0, cell.1, true, sgr).unwrap_or_default(),
+            );
+        }
+    }
+    if let Some(w) = s.link_press
+        && cell != w.cell
+    {
+        let (keep, step) = withheld_step(w, PointerEv::Move(cell));
+        s.link_press = keep;
+        if step == WithheldOut::SendPress {
+            // Era un arrastre: el programa recibe la pulsación donde fue y el arrastre sigue.
+            s.mouse_down = Some(w.button);
+            s.mouse_cell = Some(w.cell);
+            out.extend(
+                mouse_seq(w.button + mod_bits, w.cell.0, w.cell.1, true, sgr).unwrap_or_default(),
             );
         }
     }
@@ -1550,6 +1801,14 @@ fn report_mouse(
         s.mouse_cell = inside.then_some(cell).or(s.mouse_down.map(|_| cell));
     }
     for (b, &is_released) in released.iter().enumerate() {
+        if let Some(w) = s.link_press.filter(|w| is_released && w.button == b as u8) {
+            let (keep, step) = withheld_step(w, PointerEv::Release);
+            s.link_press = keep;
+            if let (WithheldOut::Open, Some(link)) = (step, link) {
+                open_once(s, link, &m.editor);
+            }
+            continue;
+        }
         if is_released && s.mouse_down == Some(b as u8) {
             s.mouse_down = None;
             out.extend(
@@ -1564,7 +1823,74 @@ fn report_mouse(
 
 #[cfg(test)]
 mod tests {
+    use super::{PointerEv, Target, Withheld, WithheldOut, opens_on_click, withheld_step};
     use super::{file_command, mouse_seq, path_span, split_position, url_span};
+
+    #[test]
+    fn direccion_cortada_por_el_medio() {
+        assert_eq!(super::middle_truncate("https://a.b/c", 40), "https://a.b/c");
+        let s = super::middle_truncate(&format!("https://example.com/{}", "x".repeat(100)), 30);
+        assert_eq!(s.chars().count(), 30);
+        assert!(s.starts_with("https://example") && s.contains('…') && s.ends_with("xxx"));
+    }
+    use std::path::PathBuf;
+
+    #[test]
+    fn clic_normal_solo_en_enlaces_web() {
+        let url = Target::Url("https://example.com/pr/13".into());
+        let file = Target::File(PathBuf::from("/tmp/x"), None, None);
+        assert!(opens_on_click(&url, false));
+        // Dentro del comando que se escribe, el clic coloca el cursor.
+        assert!(!opens_on_click(&url, true));
+        // Las rutas siguen siendo de Quick Peek (clic) y de Colibrí con ⌘.
+        assert!(!opens_on_click(&file, false));
+    }
+
+    #[test]
+    fn doble_clic_abre_una_vez() {
+        use super::{Span, repeated_open};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let url = Span::Tag("https://example.com".into());
+        let otra = Span::Tag("https://example.org".into());
+        let last = Some((url.clone(), t0));
+        assert!(repeated_open(
+            last.as_ref(),
+            &url,
+            t0 + Duration::from_millis(200)
+        ));
+        assert!(!repeated_open(
+            last.as_ref(),
+            &url,
+            t0 + Duration::from_millis(900)
+        ));
+        assert!(!repeated_open(
+            last.as_ref(),
+            &otra,
+            t0 + Duration::from_millis(200)
+        ));
+        assert!(!repeated_open(None, &url, t0));
+    }
+
+    #[test]
+    fn pulsacion_aplazada_sobre_un_enlace() {
+        let w = Withheld {
+            button: 0,
+            cell: (24, 1),
+        };
+        assert_eq!(
+            withheld_step(w, PointerEv::Move((24, 1))),
+            (Some(w), WithheldOut::Wait)
+        );
+        assert_eq!(
+            withheld_step(w, PointerEv::Move((25, 1))),
+            (None, WithheldOut::SendPress)
+        );
+        assert_eq!(
+            withheld_step(w, PointerEv::Release),
+            (None, WithheldOut::Open)
+        );
+    }
     use std::path::Path;
 
     /// La rejilla con caché sale igual que rehecha entera y rehace solo las filas que
@@ -1598,6 +1924,7 @@ mod tests {
             cursor: CursorShape::Block,
             blink: false,
             editor: String::new(),
+            link_click: true,
         };
         let mut glyphs = crate::grid::GlyphCache::default();
         let mut pass = |term: &mut Term<VoidListener>, cache: &mut GridCache, full: bool| {
@@ -1610,6 +1937,7 @@ mod tests {
                     origin: Pos2::new(4.0, 4.0),
                     link: None,
                     chip_rows: &[],
+                    paths: &[],
                     shifts: &[],
                 };
                 out = p.run(term, cache, &mut glyphs, &ctx, full);

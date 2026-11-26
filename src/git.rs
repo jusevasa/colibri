@@ -145,6 +145,94 @@ pub fn branches(dir: &Path) -> Vec<String> {
     }
 }
 
+/// Una rama del repositorio, con su último commit: fecha (unix) y primera línea del mensaje.
+/// En las remotas, `name` lleva el remoto delante (`origin/x`).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Ref {
+    pub name: String,
+    pub remote: bool,
+    pub time: u64,
+    pub subject: String,
+}
+
+/// Ramas locales y remotas del repo de `dir`, de la que tuvo el commit más reciente a la más
+/// antigua. Solo lee el repositorio local (no hay `fetch`).
+pub fn refs(dir: &Path) -> Vec<Ref> {
+    git_output(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)%00%(committerdate:unix)%00%(subject)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map(|out| parse_refs(&out))
+    .unwrap_or_default()
+}
+
+/// Las líneas de `for-each-ref` con el formato de `refs`: `refs/heads/x` o
+/// `refs/remotes/origin/x`, NUL, fecha, NUL, mensaje. Las `…/HEAD` de los remotos no son
+/// ramas y se saltan.
+pub fn parse_refs(out: &str) -> Vec<Ref> {
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\0');
+            let full = parts.next()?;
+            let time = parts.next()?.trim().parse().unwrap_or(0);
+            let subject = parts.next().unwrap_or("").to_string();
+            let (name, remote) = match full.strip_prefix("refs/heads/") {
+                Some(name) => (name, false),
+                None => (full.strip_prefix("refs/remotes/")?, true),
+            };
+            if name.is_empty() || (remote && name.ends_with("/HEAD")) {
+                return None;
+            }
+            Some(Ref {
+                name: name.to_string(),
+                remote,
+                time,
+                subject,
+            })
+        })
+        .collect()
+}
+
+/// Alias de git (`git config alias.co checkout`) que ve el repo de `dir`: nombre y valor.
+pub fn aliases(dir: &Path) -> Vec<(String, String)> {
+    git_output(dir, &["config", "--get-regexp", r"^alias\."])
+        .map(|out| parse_aliases(&out))
+        .unwrap_or_default()
+}
+
+/// Las líneas de `git config --get-regexp ^alias\.`: `alias.co checkout`.
+pub fn parse_aliases(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            Some((key.strip_prefix("alias.")?.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// Lo que escribe una orden de git en `dir`, si acaba bien. Sin tocar el índice ni leer del
+/// teclado.
+fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn changes(dir: &Path) -> Option<usize> {
     // --no-optional-locks: no tocar el índice, para no estorbar a un git que esté corriendo.
     let out = std::process::Command::new("git")
@@ -167,6 +255,25 @@ fn changes(dir: &Path) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ramas_de_for_each_ref() {
+        let out = "refs/heads/main\x00300\x00inicio\n\
+                   refs/remotes/origin/HEAD\x00300\x00inicio\n\
+                   refs/remotes/origin/feat-c\x00250\x00trabajo en c\n";
+        let r = parse_refs(out);
+        assert_eq!(r.len(), 2);
+        assert_eq!((r[0].name.as_str(), r[0].remote), ("main", false));
+        assert_eq!(
+            (r[1].name.as_str(), r[1].remote, r[1].time),
+            ("origin/feat-c", true, 250)
+        );
+        assert_eq!(r[1].subject, "trabajo en c");
+        assert_eq!(
+            parse_aliases("alias.co checkout\nalias.st status -sb\n")[1],
+            ("st".to_string(), "status -sb".to_string())
+        );
+    }
 
     #[test]
     fn branch_from_head() {

@@ -75,13 +75,22 @@ if [[ -o interactive ]]; then
     if (( ! ${+_colibri_ready} )); then
       typeset -g _colibri_ready=1
       _colibri_sel_setup
+      # Para probar sin tocar el historial real: `/etc/zshrc` de macOS pone
+      # HISTFILE=~/.zsh_history después de leer el entorno, así que se aplica aquí, en el
+      # primer prompt (tras `/etc/zshrc` y el `.zshrc`), antes de que se ejecute nada.
+      [[ -n ${COLIBRI_HISTFILE-} ]] && HISTFILE=$COLIBRI_HISTFILE
     fi
     # Comandos, alias y órdenes internas que conoce el shell, para que Colibrí los sugiera
-    # con Tab en la primera palabra. Solo se reescribe si cambia el PATH.
+    # con Tab en la primera palabra; a qué equivale cada alias (`gco` → `git checkout`, para
+    # ofrecer ramas) y la ruta de cada orden (para el panel de detalles), en pares separados
+    # por NUL. Solo se reescriben si cambia el PATH (el primer prompt, tras el `.zshrc`, ya
+    # cuenta como cambio).
     if [[ $PATH != ${_colibri_path-} ]]; then
       typeset -g _colibri_path=$PATH
       { print -rl -- ${(k)commands} ${(k)aliases} ${(k)builtins} \
-          >| $HOME/Library/Caches/colibri/zsh/commands } 2>/dev/null
+          >| $HOME/Library/Caches/colibri/zsh/commands
+        print -rN -- ${(kv)aliases} >| $HOME/Library/Caches/colibri/zsh/aliases
+        print -rN -- ${(kv)commands} >| $HOME/Library/Caches/colibri/zsh/paths } 2>/dev/null
     fi
     # Solo si de verdad se ejecutó algo (un Enter vacío o un ^C no cuentan).
     typeset -g _colibri_result=

@@ -56,6 +56,7 @@ pub struct T {
     pub pref_notify: &'static str,
     pub pref_history_popup: &'static str,
     pub pref_complete_popup: &'static str,
+    pub pref_link_click: &'static str,
     pub pref_status_bar: &'static str,
     pub pref_shell_integration: &'static str,
     pub pref_editor: &'static str,
@@ -112,6 +113,17 @@ pub struct T {
     pub kind_command: &'static str,
     pub kind_folder: &'static str,
     pub kind_file: &'static str,
+    pub kind_branch: &'static str,
+    pub kind_current_branch: &'static str,
+    /// Rama de un remoto que aún no tiene rama local.
+    pub kind_remote_branch: &'static str,
+    /// Panel de detalles de las sugerencias: «alias de git checkout».
+    pub detail_alias: fn(&str) -> String,
+    pub detail_builtin: &'static str,
+    /// Elementos de una carpeta.
+    pub detail_entries: fn(usize) -> String,
+    /// Tamaño y hace cuánto se modificó un archivo.
+    pub detail_file: fn(&str, &str) -> String,
     /// «12 opciones», sin nada elegido.
     pub options: fn(usize) -> String,
     pub complete_keys: &'static str,
@@ -257,6 +269,7 @@ pub const ES: T = T {
     pref_notify: "Notificar cuando algo termina",
     pref_history_popup: "Historial de comandos con ↑",
     pref_complete_popup: "Sugerir carpetas y archivos con ⇥",
+    pref_link_click: "Abrir enlaces con un clic",
     pref_status_bar: "Carpeta y rama en cajas, en el prompt",
     pref_shell_integration: "Integración con zsh (pestañas nuevas)",
     pref_editor: "Abrir archivos (⌘+clic) con",
@@ -302,6 +315,19 @@ pub const ES: T = T {
     kind_command: "Comando",
     kind_folder: "Carpeta",
     kind_file: "Archivo",
+    kind_branch: "Rama",
+    kind_current_branch: "Rama actual",
+    kind_remote_branch: "Rama remota",
+    detail_alias: |v| format!("alias de {v}"),
+    detail_builtin: "Orden interna del shell",
+    detail_entries: |n| {
+        if n == 1 {
+            "1 elemento".to_string()
+        } else {
+            format!("{n} elementos")
+        }
+    },
+    detail_file: |size, ago| format!("{size} · modificado {ago}"),
     options: options_es,
     complete_keys: "⇥ ↑↓ elegir  ·  escribe para filtrar  ·  esc cerrar",
 
@@ -363,6 +389,7 @@ pub const EN: T = T {
     pref_notify: "Notify when something finishes",
     pref_history_popup: "Command history with ↑",
     pref_complete_popup: "Suggest folders and files with ⇥",
+    pref_link_click: "Open links with one click",
     pref_status_bar: "Folder and branch as chips in the prompt",
     pref_shell_integration: "zsh integration (new tabs)",
     pref_editor: "Open files (⌘+click) with",
@@ -408,6 +435,19 @@ pub const EN: T = T {
     kind_command: "Command",
     kind_folder: "Folder",
     kind_file: "File",
+    kind_branch: "Branch",
+    kind_current_branch: "Current branch",
+    kind_remote_branch: "Remote branch",
+    detail_alias: |v| format!("alias for {v}"),
+    detail_builtin: "Shell builtin",
+    detail_entries: |n| {
+        if n == 1 {
+            "1 item".to_string()
+        } else {
+            format!("{n} items")
+        }
+    },
+    detail_file: |size, ago| format!("{size} · modified {ago}"),
     options: options_en,
     complete_keys: "⇥ ↑↓ choose  ·  type to filter  ·  esc close",
 

@@ -36,6 +36,8 @@ pub enum Tok {
     Command,
     Flag,
     Str,
+    /// Una ruta que existe, en el comando de un prompt local (`Session::path_tokens`).
+    Path,
 }
 
 /// Colorea un comando por encima: la orden (y la que siga a `|`, `&&`, `;`), las opciones
@@ -77,6 +79,164 @@ pub fn tokenize(text: &[char]) -> Vec<(usize, usize, Tok)> {
         }
     }
     out
+}
+
+/// Lo que decide las rutas coloreadas de una pestaña (ver `Session::paths_memo`).
+type PathsKey = (u64, usize, (usize, usize), Point, bool);
+
+/// Un trozo de comando a colorear en pantalla: fila, columna inicial, final exclusiva y qué es.
+pub type TokSpan = (i32, usize, usize, Tok);
+
+/// El comando de un prompt sacado de la rejilla: la carpeta de su marca, el texto, dónde
+/// está cada carácter (fila, columna) y hasta dónde mirar (el cursor, en el que se escribe).
+type PromptCommand = (PathBuf, Vec<char>, Vec<(i32, usize)>, Option<usize>);
+
+/// Un tramo [from, to) de un texto sacado de la rejilla, en celdas de pantalla: uno por fila
+/// (fila, columna inicial, final exclusiva). `at` dice dónde está cada carácter del texto.
+fn split_rows(at: &[(i32, usize)], from: usize, to: usize) -> Vec<(i32, usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = from;
+    for i in from..=to.min(at.len()) {
+        if i == to.min(at.len()) || at[i].0 != at[start].0 {
+            if i > start {
+                out.push((at[start].0, at[start].1, at[i - 1].1 + 1));
+            }
+            start = i;
+        }
+    }
+    out
+}
+
+/// Palabras de un comando que pueden ser rutas: tramo [inicio, fin) en caracteres, la
+/// palabra ya sin escapes ni comillas y si basta con que sea el principio de algo que existe
+/// (la palabra en la que está el cursor). Quien llama mira el disco con `path_exists`.
+///
+/// No cuentan la orden (la primera palabra de cada orden, salvo que parezca una ruta: `./x`,
+/// `~/x`, `carpeta/`), las opciones, las asignaciones (`A=1`), los redirectores ni las
+/// palabras con variables, comodines o sustituciones. Con `upto` (el cursor del prompt que
+/// se escribe) no se mira lo que hay detrás: puede ser la sugerencia en gris de
+/// zsh-autosuggestions, que está en las celdas como si se hubiera tecleado.
+pub fn path_words(text: &[char], upto: Option<usize>) -> Vec<(usize, usize, String, bool)> {
+    let limit = upto.unwrap_or(text.len()).min(text.len());
+    let mut out = Vec::new();
+    let mut first = true;
+    let mut i = 0;
+    while i < text.len() {
+        if text[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        // Hasta el siguiente espacio fuera de comillas y sin escapar.
+        let mut quote = None;
+        while i < text.len() {
+            let c = text[i];
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some('"') if c == '\\' => i += 1,
+                Some(_) => {}
+                None if c == '\\' => i += 1,
+                None if c == '\'' || c == '"' => quote = Some(c),
+                None if c.is_whitespace() => break,
+                None => {}
+            }
+            i += 1;
+        }
+        let end = i.min(text.len());
+        if start >= limit {
+            break;
+        }
+        let cut = end.min(limit);
+        let typing = upto.is_some() && end >= limit;
+        let raw: String = text[start..end].iter().collect();
+        if matches!(raw.as_str(), "|" | "||" | "&&" | ";" | "&") {
+            first = true;
+            continue;
+        }
+        if matches!(raw.as_str(), ">" | ">>" | "<" | "2>" | "2>>" | "&>") || raw.starts_with('-') {
+            first = false;
+            continue;
+        }
+        let Some(word) = shell_word(&text[start..cut]) else {
+            // Asignación delante de la orden: lo siguiente sigue siendo la orden.
+            first = first && raw.contains('=');
+            continue;
+        };
+        let was_first = std::mem::replace(&mut first, false);
+        if word.is_empty() || (was_first && !(word.contains('/') || word.starts_with(['.', '~']))) {
+            continue;
+        }
+        out.push((start, cut, word, typing));
+        if typing {
+            break;
+        }
+    }
+    out
+}
+
+/// Una palabra del shell sin escapes ni comillas; `None` si lleva lo que el shell expandiría
+/// (variables, comodines, sustituciones) o un `=` (asignación, `--opción=valor`).
+fn shell_word(chars: &[char]) -> Option<String> {
+    let mut out = String::new();
+    let mut quote = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('\'') => out.push(c),
+            Some(_) if c == '\\' => {
+                i += 1;
+                out.extend(chars.get(i));
+            }
+            Some(_) if c == '$' || c == '`' => return None,
+            Some(_) => out.push(c),
+            None if c == '\\' => {
+                i += 1;
+                out.extend(chars.get(i));
+            }
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if "$*?`({[=<>|;&".contains(c) => return None,
+            None => out.push(c),
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// La ruta a la que lleva `word` (ya sin escapes): relativa a `dir` si no es absoluta ni
+/// empieza por `~`.
+fn resolve_word(dir: &Path, word: &str) -> PathBuf {
+    let home = || dirs::home_dir().unwrap_or_default();
+    if word == "~" {
+        home()
+    } else if let Some(rest) = word.strip_prefix("~/") {
+        home().join(rest)
+    } else if word.starts_with('/') {
+        PathBuf::from(word)
+    } else {
+        dir.join(word)
+    }
+}
+
+/// `word` (ya sin escapes) es una ruta que existe, relativa a `dir` si no es absoluta ni
+/// empieza por `~`. Con `prefix` basta con que sea el principio del nombre de una entrada.
+pub fn path_exists(dir: &Path, word: &str, prefix: bool) -> bool {
+    let path = resolve_word(dir, word);
+    if !prefix || word == "~" || word.ends_with('/') {
+        return path.exists();
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let name = name.to_string_lossy();
+            std::fs::read_dir(parent).is_ok_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with(&*name))
+            })
+        }
+        _ => path.exists(),
+    }
 }
 
 /// Un prompt remoto reconocido en una línea: la máquina y la carpeta que nombra (si las
@@ -736,6 +896,19 @@ pub struct Session {
     /// Filas en pantalla que se pintan corridas a la izquierda (sin el símbolo del prompt)
     /// y cuántas celdas; el ratón tiene que deshacer ese corrimiento.
     pub row_shifts: Vec<(i32, i32)>,
+    /// Lo que ya se sabe de qué palabras son rutas que existen (`path_tokens`): por carpeta,
+    /// palabra y si bastaba con el principio, el resultado y cuándo se miró.
+    paths_seen: HashMap<(PathBuf, String, bool), (bool, Instant)>,
+    /// El último resultado de `path_tokens`, con lo que lo decide (salida, desplazamiento,
+    /// tamaño, cursor y si el shell espera) y cuándo se calculó: mientras nada de eso cambie
+    /// y lo mirado en el disco siga valiendo, se reutiliza sin recorrer la pantalla.
+    paths_memo: Option<(PathsKey, Instant, Vec<TokSpan>)>,
+    /// Pulsación sobre un enlace web aún sin mandar al programa (ver `view::Withheld`).
+    pub link_press: Option<crate::view::Withheld>,
+    /// El enlace web bajo el puntero (sin ⌘) y desde cuándo está ahí, para su recuadro.
+    pub link_hover: Option<(crate::view::Span, Instant)>,
+    /// El último enlace abierto y cuándo: el segundo clic de un doble clic no lo reabre.
+    pub last_link_open: Option<(crate::view::Span, Instant)>,
     /// La rejilla del cuadro anterior, para rehacer solo las filas que cambian.
     pub grid: crate::view::GridCache,
     /// Texto a medio componer (tecla muerta: «˜» antes de la «ñ»; o un método de entrada),
@@ -899,6 +1072,11 @@ impl Session {
             cursor_px: None,
             chips_px: Vec::new(),
             row_shifts: Vec::new(),
+            paths_seen: HashMap::new(),
+            paths_memo: None,
+            link_press: None,
+            link_hover: None,
+            last_link_open: None,
             grid: Default::default(),
             preedit: String::new(),
             preedit_frame: 0,
@@ -1328,6 +1506,133 @@ impl Session {
         Some((cells, cursor))
     }
 
+    /// Rutas que existen en el comando de cada prompt marcado que se ve (el que se escribe y
+    /// los del historial): (fila de la pantalla, columna inicial, final exclusiva, `Tok::Path`).
+    /// Las relativas se miran contra la carpeta de la marca de su prompt. En el que se
+    /// escribe solo hasta el cursor (ver `path_words`). Nada en una sesión ssh (no es este
+    /// disco) ni sin la integración (sin marca no se sabe dónde empieza el comando).
+    pub fn path_tokens(&mut self) -> Vec<TokSpan> {
+        /// Cuánto vale lo que se miró en el disco.
+        const FRESH: Duration = Duration::from_secs(2);
+        if self.remote {
+            return Vec::new();
+        }
+        let shell_waits = self.fg_pid == self.shell_pid;
+        let key = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            (
+                self.activity,
+                grid.display_offset(),
+                (grid.columns(), grid.screen_lines()),
+                grid.cursor.point,
+                shell_waits,
+            )
+        };
+        if let Some((seen, at, tokens)) = &self.paths_memo
+            && *seen == key
+            && at.elapsed() < FRESH
+        {
+            return tokens.clone();
+        }
+        // Primero se recogen los comandos (con el terminal bloqueado) y luego se mira el disco.
+        let mut commands: Vec<PromptCommand> = Vec::new();
+        {
+            let term = self.term.lock();
+            let grid = term.grid();
+            let cols = grid.columns();
+            let offset = grid.display_offset() as i32;
+            let screen = grid.screen_lines() as i32;
+            let cursor = grid.cursor.point;
+            let wraps = |line: i32| {
+                grid[Line(line)][Column(cols - 1)]
+                    .flags
+                    .contains(Flags::WRAPLINE)
+            };
+            for row in 0..screen {
+                let line = row - offset;
+                let cells = &grid[Line(line)];
+                let Some(tag) = prompt_tag(&cells[Column(0)]) else {
+                    continue;
+                };
+                // Línea de cajas, o la de arriba de un prompt de dos líneas: el comando va
+                // en la siguiente.
+                let next_same = row + 1 < screen
+                    && same_prompt(
+                        &Some(tag.clone()),
+                        &prompt_tag(&grid[Line(line + 1)][Column(0)]),
+                    );
+                if chip_kind(&cells[Column(0)]).is_some() || next_same {
+                    continue;
+                }
+                let start = (0..cols)
+                    .take_while(|&col| prompt_tag(&cells[Column(col)]).is_some())
+                    .count();
+                let mut text = Vec::new();
+                let mut at = Vec::new();
+                let mut upto = None;
+                let mut r = row;
+                loop {
+                    let l = r - offset;
+                    for col in if r == row { start } else { 0 }..cols {
+                        let cell = &grid[Line(l)][Column(col)];
+                        if cell
+                            .flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                        {
+                            continue;
+                        }
+                        if shell_waits
+                            && upto.is_none()
+                            && Point::new(Line(l), Column(col)) >= cursor
+                        {
+                            upto = Some(text.len());
+                        }
+                        text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                        at.push((r, col));
+                    }
+                    if !wraps(l) || r + 1 >= screen {
+                        break;
+                    }
+                    r += 1;
+                }
+                // Solo el prompt en el que está el cursor se corta en él.
+                let here = shell_waits && (line..=r - offset).contains(&cursor.line.0);
+                commands.push((tag_dir(&tag), text, at, upto.filter(|_| here)));
+            }
+        }
+        if self.paths_seen.len() > 4096 {
+            self.paths_seen.clear();
+        }
+        let mounts = crate::disk::mounts();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (dir, text, at, upto) in commands {
+            for (from, to, word, prefix) in path_words(&text, upto) {
+                let key = (dir.clone(), word, prefix);
+                let exists = match self.paths_seen.get(&key) {
+                    Some(&(found, when)) if now.duration_since(when) < FRESH => found,
+                    _ => {
+                        let local =
+                            crate::disk::local_route(&resolve_word(&key.0, &key.1), &mounts);
+                        let found = local && path_exists(&key.0, &key.1, prefix);
+                        self.paths_seen.insert(key, (found, now));
+                        found
+                    }
+                };
+                if exists {
+                    out.extend(
+                        split_rows(&at, from, to)
+                            .into_iter()
+                            .map(|(row, a, b)| (row, a, b, Tok::Path)),
+                    );
+                }
+            }
+        }
+        self.paths_memo = Some((key, now, out.clone()));
+        out
+    }
+
     /// Líneas de cajas visibles ahora mismo.
     pub fn chip_rows(&self) -> Vec<ChipRow> {
         let term = self.term.lock();
@@ -1414,14 +1719,11 @@ impl Session {
                     r += 1;
                 }
                 for (from, to, tok) in tokenize(&text) {
-                    // Un tramo por fila.
-                    let mut start = from;
-                    for i in from..=to {
-                        if i == to || at[i].0 != at[start].0 {
-                            tokens.push((at[start].0, at[start].1, at[i - 1].1 + 1, tok));
-                            start = i;
-                        }
-                    }
+                    tokens.extend(
+                        split_rows(&at, from, to)
+                            .into_iter()
+                            .map(|(row, a, b)| (row, a, b, tok)),
+                    );
                 }
             }
             out.push(ChipRow {
@@ -1924,6 +2226,78 @@ mod tests {
 
     fn chars(s: &str) -> Vec<char> {
         s.chars().collect()
+    }
+
+    fn words(s: &str, upto: Option<usize>) -> Vec<(usize, usize, String, bool)> {
+        path_words(&chars(s), upto)
+    }
+
+    #[test]
+    fn palabras_de_ruta() {
+        assert_eq!(words("cd src", None), [(3, 6, "src".into(), false)]);
+        assert_eq!(
+            words("ls -la src/main.rs", None),
+            [(7, 18, "src/main.rs".into(), false)]
+        );
+        assert_eq!(
+            words("cat mi\\ archivo.txt", None),
+            [(4, 19, "mi archivo.txt".into(), false)]
+        );
+        assert_eq!(
+            words("cat 'mi archivo'", None),
+            [(4, 16, "mi archivo".into(), false)]
+        );
+        assert_eq!(
+            words("devops-scripts/ x", None)[0],
+            (0, 15, "devops-scripts/".into(), false)
+        );
+        // «git» es la orden; «status» se mira (y no existirá).
+        assert_eq!(words("git status", None), [(4, 10, "status".into(), false)]);
+        assert!(words("echo $HOME/x *.rs --file=a", None).is_empty());
+        assert_eq!(
+            words("make && ./run.sh", None),
+            [(8, 16, "./run.sh".into(), false)]
+        );
+        assert_eq!(
+            words("sort > out.txt", None),
+            [(7, 14, "out.txt".into(), false)]
+        );
+        assert_eq!(words("A=1 ls src", None), [(7, 10, "src".into(), false)]);
+    }
+
+    #[test]
+    fn tramos_partidos_por_filas() {
+        let at = [(5, 78), (5, 79), (6, 0), (6, 1)];
+        assert_eq!(split_rows(&at, 0, 4), [(5, 78, 80), (6, 0, 2)]);
+        assert_eq!(split_rows(&at, 1, 2), [(5, 79, 80)]);
+    }
+
+    #[test]
+    fn palabras_de_ruta_hasta_el_cursor() {
+        // «cd s» tecleado; «rc && cargo build» es la sugerencia gris de zsh-autosuggestions.
+        assert_eq!(
+            words("cd src && cargo build", Some(4)),
+            [(3, 4, "s".into(), true)]
+        );
+        assert_eq!(words("cd src ", Some(7)), [(3, 6, "src".into(), false)]);
+        assert!(words("cd ", Some(3)).is_empty());
+    }
+
+    #[test]
+    fn existe_relativa_a_la_carpeta_dada() {
+        let dir = std::env::temp_dir().join(format!("colibri-rutas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "").unwrap();
+        assert!(path_exists(&dir, "src", false));
+        assert!(path_exists(&dir, "src/main.rs", false));
+        assert!(path_exists(&dir, "sr", true));
+        assert!(!path_exists(&dir, "sr", false));
+        assert!(path_exists(&dir, "src/", true));
+        assert!(path_exists(&dir, "src/ma", true));
+        assert!(!path_exists(&dir.join("borrada"), "src", false));
+        assert!(path_exists(Path::new("/"), "~", false));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

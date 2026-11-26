@@ -78,6 +78,9 @@ fn shell_arg(text: &str) -> String {
     }
 }
 
+// Hay uno por ventana: que `Complete` (con lo leído de git) sea mayor que las demás
+// variantes no cuesta nada que se note.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq)]
 pub enum Overlay {
     None,
@@ -102,22 +105,41 @@ pub enum Overlay {
         query: String,
         sel: usize,
     },
-    /// Carpetas y archivos que encajan con la palabra que se teclea en el prompt.
-    /// Sin elegir nada (`sel` None) la lista solo se muestra; al elegir, la opción queda
-    /// escrita en el prompt. `line` es la línea del prompt para la que vale la lista (si
-    /// cambia es que se siguió escribiendo y se rehace) y `x`, dónde se ancla.
+    /// Carpetas, archivos, comandos o ramas que encajan con la palabra que se teclea en el
+    /// prompt. Sin elegir nada (`sel` None) la lista solo se muestra; al elegir, la opción
+    /// queda escrita en el prompt. `line` es la línea del prompt para la que vale la lista
+    /// (si cambia es que se siguió escribiendo y se rehace), `x`, dónde se ancla, y `git`,
+    /// lo ya leído de git (al rehacerla no se vuelve a llamar).
     Complete {
         target: crate::complete::Target,
         items: Vec<crate::complete::Item>,
         sel: Option<usize>,
         line: String,
         x: f32,
+        git: crate::complete::GitData,
+        /// El detalle ya calculado de la fila que describe el panel, por carpeta, nombre y tipo (mira el
+        /// disco: no se repite en cada cuadro).
+        detail: Option<(crate::complete::DetailKey, Option<crate::complete::Detail>)>,
     },
+}
+
+/// Rótulo del tipo de una sugerencia de Tab, en el idioma de la interfaz.
+fn kind_label(kind: crate::complete::Kind) -> &'static str {
+    use crate::complete::Kind;
+    let o = &i18n::t().overlay;
+    match kind {
+        Kind::Dir => o.kind_folder,
+        Kind::File => o.kind_file,
+        Kind::Command => o.kind_command,
+        Kind::Branch => o.kind_branch,
+        Kind::CurrentBranch => o.kind_current_branch,
+        Kind::RemoteBranch => o.kind_remote_branch,
+    }
 }
 
 /// Filas de Preferencias, por id (el que usa el guion: `pref <id>`); la etiqueta sale de
 /// `pref_label` en el idioma de la interfaz.
-const PREF_ROWS: [&str; 24] = [
+const PREF_ROWS: [&str; 25] = [
     "theme",
     "font",
     "font_size",
@@ -132,6 +154,7 @@ const PREF_ROWS: [&str; 24] = [
     "notify",
     "history_popup",
     "complete_popup",
+    "link_click",
     "status_bar",
     "shell_integration",
     "editor",
@@ -160,6 +183,7 @@ fn pref_label(o: &'static i18n::overlay::T, id: &str) -> &'static str {
         "notify" => o.pref_notify,
         "history_popup" => o.pref_history_popup,
         "complete_popup" => o.pref_complete_popup,
+        "link_click" => o.pref_link_click,
         "status_bar" => o.pref_status_bar,
         "shell_integration" => o.pref_shell_integration,
         "editor" => o.pref_editor,
@@ -338,7 +362,9 @@ impl App {
                 sel,
                 line,
                 x,
-            } => self.complete_ui(ctx, target, items, sel, line, x),
+                git,
+                detail,
+            } => self.complete_ui(ctx, target, items, sel, line, x, git, detail),
         }
     }
 
@@ -825,6 +851,7 @@ impl App {
     /// sigue llegando al shell: escribir o borrar rehace la lista con lo nuevo. Tab y las
     /// flechas eligen, y lo elegido queda escrito en el prompt al momento; Enter lo acepta
     /// (sin nada elegido, Enter es del shell) y Esc devuelve la palabra original.
+    #[allow(clippy::too_many_arguments)]
     fn complete_ui(
         &mut self,
         ctx: &egui::Context,
@@ -833,6 +860,8 @@ impl App {
         mut sel: Option<usize>,
         mut line: String,
         x: f32,
+        mut git: crate::complete::GitData,
+        mut detail: Option<(crate::complete::DetailKey, Option<crate::complete::Detail>)>,
     ) {
         use crate::complete;
         let Some(s) = self.w.sessions.get(self.w.active) else {
@@ -840,10 +869,13 @@ impl App {
             return;
         };
         if s.prompt_line() != Some(line.as_str()) {
+            let aliases = complete::shell_aliases();
             let fresh = s
                 .prompt_line()
-                .and_then(|l| complete::target(l).map(|t| (l.to_string(), t)))
-                .map(|(l, t)| (complete::candidates(&s.cwd, &t), l, t))
+                .and_then(|l| {
+                    complete::offer(l, &s.cwd, &|n| aliases.get(n).cloned(), &mut git)
+                        .map(|(t, found)| (found, l.to_string(), t))
+                })
                 .filter(|(found, ..)| !found.is_empty());
             let Some((found, l, t)) = fresh else {
                 self.w.overlay = Overlay::None;
@@ -893,6 +925,7 @@ impl App {
         let last = (first + VISIBLE).min(n);
         let needle = target.prefix.to_lowercase();
 
+        let mut hovered = None;
         let out = egui::Area::new(Id::unique("complete"))
             .order(Order::Foreground)
             .fixed_pos(Pos2::new(x_at, y))
@@ -910,6 +943,9 @@ impl App {
                                 Vec2::new(ui.available_width(), ROW),
                                 Sense::click(),
                             );
+                            if resp.hovered() {
+                                hovered = Some(i);
+                            }
                             if resp.clicked() {
                                 next = Some(i);
                                 accept = true;
@@ -931,7 +967,9 @@ impl App {
                             }
                             let icon = Pos2::new(r.left() + 20.0, r.center().y);
                             let icon_color = if chosen { pal.fg } else { pal.muted };
-                            if item.command {
+                            if item.is_branch() {
+                                crate::branch_icon(p, icon, icon_color);
+                            } else if item.kind == crate::complete::Kind::Command {
                                 // «>_» de terminal.
                                 let st = Stroke::new(1.2, icon_color);
                                 let c = icon + Vec2::new(-3.0, 0.0);
@@ -942,10 +980,10 @@ impl App {
                                     st,
                                 );
                             } else {
-                                crate::file_icon(p, icon, item.is_dir, icon_color);
+                                crate::file_icon(p, icon, item.is_dir(), icon_color);
                             }
                             // El trozo que coincide con lo tecleado va resaltado.
-                            let name = if item.is_dir {
+                            let name = if item.is_dir() {
                                 format!("{}/", item.name)
                             } else {
                                 item.name.clone()
@@ -980,14 +1018,15 @@ impl App {
                                 }
                                 None => add(&name, dim),
                             }
-                            let kind = if item.command {
-                                o.kind_command
-                            } else if item.is_dir {
-                                o.kind_folder
-                            } else {
-                                o.kind_file
-                            };
-                            let kind_w = 64.0;
+                            let kind = kind_label(item.kind);
+                            let kind_w = ui
+                                .ctx()
+                                .fonts_mut(|f| {
+                                    f.layout_no_wrap(kind.to_string(), small.clone(), pal.muted)
+                                })
+                                .size()
+                                .x
+                                .max(64.0);
                             job.wrap = egui::text::TextWrapping::truncate_at_width(
                                 r.width() - 40.0 - kind_w - 12.0,
                             );
@@ -1038,6 +1077,28 @@ impl App {
         // Su fundido de entrada (el de egui) sale fluido.
         fade_in(ctx, Id::unique("complete"));
 
+        // Panel de detalles a la derecha: la fila bajo el puntero, si no la elegida, si no la
+        // primera que se ve. Si no cabe en la ventana, no se pinta.
+        const DETAIL_W: f32 = 240.0;
+        let panel_x = x_at + width + 8.0;
+        if let Some(item) = items.get(hovered.or(next).unwrap_or(first))
+            && panel_x + DETAIL_W <= screen.right() - 8.0
+        {
+            let key = complete::detail_key(&target, item);
+            if detail.as_ref().is_none_or(|(seen, _)| *seen != key) {
+                let found = complete::detail(
+                    &s.cwd,
+                    &target,
+                    item,
+                    &complete::shell_aliases(),
+                    &complete::command_paths(),
+                );
+                detail = Some((key, found));
+            }
+            let info = detail.as_ref().and_then(|(_, d)| d.clone());
+            self.complete_detail(ctx, item, info, Pos2::new(panel_x, y), DETAIL_W);
+        }
+
         // Lo elegido se escribe en el prompt en lugar de lo que hubiera (la palabra
         // original o la opción anterior).
         if next != sel
@@ -1066,8 +1127,104 @@ impl App {
                 sel,
                 line,
                 x,
+                git,
+                detail,
             };
         }
+    }
+
+    /// El panel junto a la lista de sugerencias: nombre, tipo y lo que se sepa de la fila
+    /// (`complete::detail`).
+    fn complete_detail(
+        &self,
+        ctx: &egui::Context,
+        item: &crate::complete::Item,
+        info: Option<crate::complete::Detail>,
+        at: Pos2,
+        width: f32,
+    ) {
+        use crate::complete::Detail;
+        let pal = &self.pal;
+        let o = &i18n::t().overlay;
+        let small = FontId::proportional(11.5);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let ago = |at: u64| (o.ago)(now.saturating_sub(at));
+        let name = if item.is_dir() {
+            format!("{}/", item.name)
+        } else {
+            item.name.clone()
+        };
+        // Texto principal y, debajo, más apagado.
+        let (main, extra): (Option<String>, Option<String>) = match info {
+            Some(Detail::Commit { at, subject }) => (Some(subject), Some(ago(at))),
+            Some(Detail::Entries(n)) => (Some((o.detail_entries)(n)), None),
+            Some(Detail::File { bytes, modified }) => (
+                Some((o.detail_file)(
+                    &crate::complete::human_size(bytes),
+                    &ago(modified),
+                )),
+                None,
+            ),
+            Some(Detail::Alias(value)) => (Some((o.detail_alias)(&value)), None),
+            Some(Detail::Builtin) => (Some(o.detail_builtin.to_string()), None),
+            Some(Detail::Path(path)) => (None, Some(path)),
+            None => (None, None),
+        };
+        let id = Id::unique("complete-detail");
+        egui::Area::new(id)
+            .order(Order::Foreground)
+            .fixed_pos(at)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.panel)
+                    .stroke(Stroke::new(1.0, pal.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(width - 24.0);
+                        ui.spacing_mut().item_spacing = Vec2::new(0.0, 4.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(name)
+                                    .font(FontId::monospace(13.0))
+                                    .color(pal.fg)
+                                    .strong(),
+                            )
+                            .truncate(),
+                        );
+                        ui.label(
+                            egui::RichText::new(kind_label(item.kind))
+                                .font(small.clone())
+                                .color(pal.muted),
+                        );
+                        if let Some(main) = main {
+                            let mut job = egui::text::LayoutJob::single_section(
+                                main,
+                                egui::TextFormat::simple(
+                                    small.clone(),
+                                    pal.fg.gamma_multiply(0.85),
+                                ),
+                            );
+                            job.wrap.max_width = width - 24.0;
+                            job.wrap.max_rows = 3;
+                            ui.label(job);
+                        }
+                        if let Some(extra) = extra {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(extra)
+                                        .font(small.clone())
+                                        .color(pal.muted),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
+            });
+        fade_in(ctx, id);
     }
 
     fn palette_items(&self) -> Vec<(String, String, Cmd)> {
@@ -1285,6 +1442,7 @@ impl App {
             "notify" => (String::new(), Some(c.notify)),
             "history_popup" => (String::new(), Some(c.history_popup)),
             "complete_popup" => (String::new(), Some(c.complete_popup)),
+            "link_click" => (String::new(), Some(c.link_click)),
             "status_bar" => (String::new(), Some(c.status_bar)),
             "shell_integration" => (String::new(), Some(c.shell_integration)),
             "editor" if c.editor.is_empty() => (o.editor_default.to_string(), None),
@@ -1364,6 +1522,7 @@ impl App {
             "notify" => c.notify = !c.notify,
             "history_popup" => c.history_popup = !c.history_popup,
             "complete_popup" => c.complete_popup = !c.complete_popup,
+            "link_click" => c.link_click = !c.link_click,
             "status_bar" => c.status_bar = !c.status_bar,
             "shell_integration" => c.shell_integration = !c.shell_integration,
             "editor" => {
