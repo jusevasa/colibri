@@ -77,11 +77,16 @@ if [[ -o interactive ]]; then
       _colibri_sel_setup
     fi
     # Comandos, alias y órdenes internas que conoce el shell, para que Colibrí los sugiera
-    # con Tab en la primera palabra. Solo se reescribe si cambia el PATH.
+    # con Tab en la primera palabra; a qué equivale cada alias (`gco` → `git checkout`, para
+    # ofrecer ramas) y la ruta de cada orden (para el panel de detalles), en pares separados
+    # por NUL. Solo se reescriben si cambia el PATH (el primer prompt, tras el `.zshrc`, ya
+    # cuenta como cambio).
     if [[ $PATH != ${_colibri_path-} ]]; then
       typeset -g _colibri_path=$PATH
       { print -rl -- ${(k)commands} ${(k)aliases} ${(k)builtins} \
-          >| $HOME/Library/Caches/colibri/zsh/commands } 2>/dev/null
+          >| $HOME/Library/Caches/colibri/zsh/commands
+        print -rN -- ${(kv)aliases} >| $HOME/Library/Caches/colibri/zsh/aliases
+        print -rN -- ${(kv)commands} >| $HOME/Library/Caches/colibri/zsh/paths } 2>/dev/null
     fi
     # Solo si de verdad se ejecutó algo (un Enter vacío o un ^C no cuentan).
     typeset -g _colibri_result=

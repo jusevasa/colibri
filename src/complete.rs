@@ -1,7 +1,10 @@
 //! Sugerencias de archivos y carpetas para lo que se está tecleando en el prompt (Tab).
 //! Solo mira el disco: no ejecuta nada ni le pregunta al shell.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Item {
@@ -158,39 +161,237 @@ pub fn replacement(t: &Target, item: &Item) -> String {
 /// Comandos que conoce el shell: los escribe la integración de zsh
 /// (`assets/shell/zshenv.zsh`) en cada prompt en que cambia el PATH. Sin ella, los
 /// ejecutables del PATH de Colibrí. Se relee solo si el archivo cambió.
-fn commands() -> std::sync::Arc<Vec<String>> {
-    use std::sync::{Arc, Mutex};
-    type Cache = Option<(Option<std::time::SystemTime>, Arc<Vec<String>>)>;
-    static CACHE: Mutex<Cache> = Mutex::new(None);
-    let file = dirs::cache_dir().map(|d| d.join("colibri/zsh/commands"));
+fn commands() -> Arc<Vec<String>> {
+    static CACHE: Cache<Vec<String>> = Mutex::new(None);
+    cached(&CACHE, "commands", |text| {
+        let mut list: Vec<String> = match text {
+            Some(text) => String::from_utf8_lossy(&text)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            None => std::env::var_os("PATH")
+                .map(|p| {
+                    std::env::split_paths(&p)
+                        .filter_map(|d| std::fs::read_dir(d).ok())
+                        .flatten()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        list.retain(|c| !c.is_empty() && !c.starts_with(['.', '_']) && !c.contains(['/', ' ']));
+        list.sort();
+        list.dedup();
+        list
+    })
+}
+
+/// Alias del shell y a qué equivalen (`gco` → `git checkout`), tal como los escribe la
+/// integración de zsh junto a `commands`. Vacío sin ella.
+pub fn shell_aliases() -> Arc<HashMap<String, String>> {
+    static CACHE: Cache<HashMap<String, String>> = Mutex::new(None);
+    cached(&CACHE, "aliases", |bytes| {
+        bytes.map(|b| parse_pairs(&b)).unwrap_or_default()
+    })
+}
+
+/// Ruta de cada orden tal como la ve el shell (su `$commands`), de la integración de zsh.
+/// Vacío sin ella.
+pub fn command_paths() -> Arc<HashMap<String, String>> {
+    static CACHE: Cache<HashMap<String, String>> = Mutex::new(None);
+    cached(&CACHE, "paths", |bytes| {
+        bytes.map(|b| parse_pairs(&b)).unwrap_or_default()
+    })
+}
+
+type Cache<T> = Mutex<Option<(Option<SystemTime>, Arc<T>)>>;
+
+/// Un archivo de `~/Library/Caches/colibri/zsh`, interpretado con `parse` (que recibe `None`
+/// si no existe) y vuelto a leer solo cuando cambia su fecha de modificación.
+fn cached<T>(cache: &Cache<T>, name: &str, parse: impl FnOnce(Option<Vec<u8>>) -> T) -> Arc<T> {
+    let file = dirs::cache_dir().map(|d| d.join("colibri/zsh").join(name));
     let mtime = file
         .as_ref()
         .and_then(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, list)) = cache.as_ref()
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, value)) = cache.as_ref()
         && *at == mtime
     {
-        return list.clone();
+        return value.clone();
     }
-    let mut list: Vec<String> = match file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) {
-        Some(text) => text.lines().map(str::to_string).collect(),
-        None => std::env::var_os("PATH")
-            .map(|p| {
-                std::env::split_paths(&p)
-                    .filter_map(|d| std::fs::read_dir(d).ok())
-                    .flatten()
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default(),
+    let value = Arc::new(parse(file.as_ref().and_then(|f| std::fs::read(f).ok())));
+    *cache = Some((mtime, value.clone()));
+    value
+}
+
+/// Pares nombre/valor separados (y terminados) por NUL, como los deja `print -rN`.
+fn parse_pairs(bytes: &[u8]) -> HashMap<String, String> {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    let mut parts = bytes.split(|b| *b == 0);
+    let mut out = HashMap::new();
+    while let (Some(name), Some(value)) = (parts.next(), parts.next()) {
+        if !name.is_empty() {
+            out.insert(
+                String::from_utf8_lossy(name).into_owned(),
+                String::from_utf8_lossy(value).into_owned(),
+            );
+        }
+    }
+    out
+}
+
+/// Qué pide el argumento que se escribe dentro de una orden de git.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GitArg {
+    /// Una rama; `remotes`: también las remotas sin rama local (checkout y switch).
+    Branch { remotes: bool },
+    /// Algo que no es rama ni ruta (un nombre nuevo, un remoto): el Tab es del shell.
+    Shell,
+    /// Rutas (tras `--`): como fuera de git.
+    Files,
+}
+
+/// La orden en la que está el cursor: lo que sigue al último `|`, `||`, `&&`, `&` o `;`.
+pub fn last_command(line: &str) -> &str {
+    let cut = line.rfind(['|', '&', ';']).map_or(0, |i| i + 1);
+    &line[cut..]
+}
+
+/// Sustituye la primera palabra por su alias, hasta 3 veces (alias de alias). Para si la
+/// expansión empieza por el mismo nombre (`ls='ls -G'`).
+pub fn expand_alias(command: &str, alias: &dyn Fn(&str) -> Option<String>) -> String {
+    let mut line = command.trim_start().to_string();
+    for _ in 0..3 {
+        let first = line.split([' ', '\t']).next().unwrap_or("").to_string();
+        let Some(value) = alias(&first) else {
+            break;
+        };
+        let again = value.split_whitespace().next() == Some(first.as_str());
+        line = format!("{value}{}", &line[first.len()..]);
+        if again {
+            break;
+        }
+    }
+    line
+}
+
+/// Palabras separadas por espacios sin escapar, tal como se escribieron. Si la línea acaba
+/// en espacio, la última es vacía (la que se empieza a escribir).
+fn split_words(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ' ' || c == '\t' {
+            if i > start {
+                out.push(&line[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
+/// Subórdenes de git que reciben ramas (o que deciden qué recibe su argumento).
+const GIT_BRANCH_COMMANDS: [&str; 13] = [
+    "checkout",
+    "switch",
+    "merge",
+    "rebase",
+    "diff",
+    "log",
+    "show",
+    "cherry-pick",
+    "reset",
+    "branch",
+    "push",
+    "pull",
+    "fetch",
+];
+
+/// Qué pide la última palabra de `line` si es un argumento de una orden de git que admite
+/// ramas, siguiendo los alias del shell (`gco`) y los de git (`git co`). `None`: no es una
+/// de esas órdenes, o lo que se escribe es la propia suborden.
+pub fn git_arg(
+    line: &str,
+    shell_alias: &dyn Fn(&str) -> Option<String>,
+    git_alias: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<GitArg> {
+    let expanded = expand_alias(last_command(line), shell_alias);
+    let mut words = split_words(&expanded);
+    words.pop()?;
+    let mut it = words.into_iter();
+    if it.next()? != "git" {
+        return None;
+    }
+    // Opciones generales de git antes de la suborden: `-C <carpeta>`, `-c <clave=valor>`…
+    let mut sub = None;
+    while let Some(w) = it.next() {
+        if w == "-C" || w == "-c" {
+            it.next();
+        } else if !w.starts_with('-') {
+            sub = Some(w);
+            break;
+        }
+    }
+    let sub = sub?;
+    let (sub, mut args): (String, Vec<String>) = if GIT_BRANCH_COMMANDS.contains(&sub) {
+        (sub.to_string(), Vec::new())
+    } else {
+        let value = git_alias(sub)?;
+        if value.starts_with('!') {
+            return None;
+        }
+        let mut parts = value.split_whitespace().map(str::to_string);
+        (parts.next()?, parts.collect())
     };
-    list.retain(|c| !c.is_empty() && !c.starts_with(['.', '_']) && !c.contains(['/', ' ']));
-    list.sort();
-    list.dedup();
-    let list = Arc::new(list);
-    *cache = Some((mtime, list.clone()));
-    list
+    args.extend(it.map(str::to_string));
+    if args.iter().any(|a| a == "--") {
+        return Some(GitArg::Files);
+    }
+    let positional = args.iter().filter(|a| !a.starts_with('-')).count();
+    Some(match sub.as_str() {
+        "checkout" | "switch" => {
+            let new_name = args
+                .last()
+                .is_some_and(|a| matches!(a.as_str(), "-b" | "-B" | "-c" | "-C" | "--orphan"));
+            if new_name {
+                GitArg::Shell
+            } else {
+                GitArg::Branch { remotes: true }
+            }
+        }
+        "merge" | "rebase" | "diff" | "log" | "show" | "cherry-pick" | "reset" => {
+            GitArg::Branch { remotes: false }
+        }
+        "branch" => {
+            let existing = args.iter().any(|a| {
+                matches!(
+                    a.as_str(),
+                    "-d" | "-D" | "-m" | "-M" | "--delete" | "--move"
+                )
+            });
+            if existing || positional > 0 {
+                GitArg::Branch { remotes: false }
+            } else {
+                GitArg::Shell
+            }
+        }
+        "push" | "pull" | "fetch" => {
+            if positional == 0 {
+                GitArg::Shell
+            } else {
+                GitArg::Branch { remotes: false }
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn unescape(s: &str) -> String {
@@ -209,6 +410,60 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contexto_de_git() {
+        let sh = |n: &str| (n == "gco").then(|| "git checkout".to_string());
+        let mut git = |n: &str| match n {
+            "co" => Some("checkout".to_string()),
+            "sync" => Some("!git pull".to_string()),
+            _ => None,
+        };
+        let b = |remotes| Some(GitArg::Branch { remotes });
+        assert_eq!(git_arg("gco f", &sh, &mut git), b(true));
+        assert_eq!(git_arg("git checkout ", &sh, &mut git), b(true));
+        assert_eq!(
+            git_arg("git switch -c ", &sh, &mut git),
+            Some(GitArg::Shell)
+        );
+        // Tras el nombre de la rama nueva va su punto de partida: otra rama.
+        assert_eq!(git_arg("git checkout -b nueva ", &sh, &mut git), b(true));
+        assert_eq!(git_arg("git merge ma", &sh, &mut git), b(false));
+        assert_eq!(git_arg("git branch -D fe", &sh, &mut git), b(false));
+        assert_eq!(git_arg("git branch ", &sh, &mut git), Some(GitArg::Shell));
+        assert_eq!(git_arg("git branch nueva ", &sh, &mut git), b(false));
+        assert_eq!(git_arg("git push ", &sh, &mut git), Some(GitArg::Shell));
+        assert_eq!(git_arg("git push origin fe", &sh, &mut git), b(false));
+        assert_eq!(
+            git_arg("git checkout -- src/ma", &sh, &mut git),
+            Some(GitArg::Files)
+        );
+        assert_eq!(git_arg("git co fe", &sh, &mut git), b(true));
+        assert_eq!(git_arg("git -C ../otro checkout f", &sh, &mut git), b(true));
+        assert_eq!(git_arg("make && gco f", &sh, &mut git), b(true));
+        // Un alias de git que es una orden del shell no se sigue.
+        assert_eq!(git_arg("git sync fe", &sh, &mut git), None);
+        // Se está escribiendo la suborden.
+        assert_eq!(git_arg("git ch", &sh, &mut git), None);
+        assert_eq!(git_arg("git status ", &sh, &mut git), None);
+        assert_eq!(git_arg("ls f", &sh, &mut git), None);
+    }
+
+    #[test]
+    fn alias_que_empieza_por_si_mismo() {
+        let a = |n: &str| (n == "ls").then(|| "ls -G".to_string());
+        assert_eq!(expand_alias("ls x", &a), "ls -G x");
+        assert_eq!(last_command("make && gco f"), " gco f");
+        assert_eq!(last_command("gco f"), "gco f");
+    }
+
+    #[test]
+    fn pares_separados_por_nul() {
+        let m = parse_pairs(b"gco\0git checkout\0ll\0ls -l\0");
+        assert_eq!(m.get("gco").map(String::as_str), Some("git checkout"));
+        assert_eq!(m.len(), 2);
+        assert!(parse_pairs(b"suelto\0").is_empty());
+    }
 
     #[test]
     fn target_from_line() {
