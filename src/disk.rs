@@ -94,7 +94,8 @@ pub fn local_route(path: &Path, mounts: &[(PathBuf, bool)]) -> bool {
             }
         }
     }
-    true
+    // Lo recorrido ya se comprobó tramo a tramo; esto cubre lo que no tiene tramos («/»).
+    on_local_disk(&current, mounts)
 }
 
 #[cfg(test)]
@@ -128,6 +129,9 @@ mod tests {
         // Si getmntinfo fallara no se puede saber qué es local: no se mira el disco.
         assert!(!on_local_disk(Path::new("/Users/yo/src"), &[]));
         assert!(!local_route(Path::new("/Users/yo/src"), &[]));
+        // También la raíz sola.
+        assert!(!local_route(Path::new("/"), &[]));
+        assert!(local_route(Path::new("/"), &[(PathBuf::from("/"), true)]));
     }
 
     #[test]
