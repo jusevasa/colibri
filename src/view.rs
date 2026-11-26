@@ -1071,7 +1071,7 @@ fn handle_input(
         ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
         if mods.command {
             if resp.clicked() {
-                open_link(&link.target, &m.editor);
+                open_once(s, link, &m.editor);
             }
             return link_some(link);
         }
@@ -1079,8 +1079,7 @@ fn handle_input(
 
     let reporting = mode.intersects(TermMode::MOUSE_MODE) && !mods.shift;
     if reporting {
-        let target = link.as_ref().map(|l| &l.target);
-        report_mouse(ui, s, rect, origin, m, mode, mods, target);
+        report_mouse(ui, s, rect, origin, m, mode, mods, link.as_ref());
         return link;
     }
     s.link_press = None;
@@ -1088,7 +1087,7 @@ fn handle_input(
     if let Some(link) = &link
         && resp.clicked()
     {
-        open_link(&link.target, &m.editor);
+        open_once(s, link, &m.editor);
         return link_some(link);
     }
     s.mouse_cell = None;
@@ -1222,6 +1221,28 @@ fn middle_truncate(text: &str, max: usize) -> String {
     out.push('…');
     out.extend(text.chars().skip(count - tail));
     out
+}
+
+/// Tiempo en el que un segundo clic sobre el mismo enlace es el doble clic del primero.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Abrir `span` ahora repetiría lo que abrió el clic anterior: es el segundo clic de un doble
+/// clic sobre el mismo enlace (sin esto, el navegador abría dos pestañas).
+fn repeated_open(
+    last: Option<&(Span, std::time::Instant)>,
+    span: &Span,
+    now: std::time::Instant,
+) -> bool {
+    last.is_some_and(|(seen, at)| seen == span && now.duration_since(*at) < DOUBLE_CLICK)
+}
+
+/// Abre el enlace, salvo que sea el segundo clic de un doble clic sobre él.
+fn open_once(s: &mut Session, link: &Link, editor: &str) {
+    let now = std::time::Instant::now();
+    if !repeated_open(s.last_link_open.as_ref(), &link.span, now) {
+        open_link(&link.target, editor);
+    }
+    s.last_link_open = Some((link.span.clone(), now));
 }
 
 fn link_some(link: &Link) -> Option<Link> {
@@ -1715,7 +1736,7 @@ fn report_mouse(
     m: &Metrics,
     mode: TermMode,
     mods: Modifiers,
-    link: Option<&Target>,
+    link: Option<&Link>,
 ) {
     use egui::PointerButton::{Middle, Primary, Secondary};
     let buttons = [Primary, Middle, Secondary];
@@ -1783,8 +1804,8 @@ fn report_mouse(
         if let Some(w) = s.link_press.filter(|w| is_released && w.button == b as u8) {
             let (keep, step) = withheld_step(w, PointerEv::Release);
             s.link_press = keep;
-            if let (WithheldOut::Open, Some(target)) = (step, link) {
-                open_link(target, &m.editor);
+            if let (WithheldOut::Open, Some(link)) = (step, link) {
+                open_once(s, link, &m.editor);
             }
             continue;
         }
@@ -1823,6 +1844,32 @@ mod tests {
         assert!(!opens_on_click(&url, true));
         // Las rutas siguen siendo de Quick Peek (clic) y de Colibrí con ⌘.
         assert!(!opens_on_click(&file, false));
+    }
+
+    #[test]
+    fn doble_clic_abre_una_vez() {
+        use super::{Span, repeated_open};
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let url = Span::Tag("https://example.com".into());
+        let otra = Span::Tag("https://example.org".into());
+        let last = Some((url.clone(), t0));
+        assert!(repeated_open(
+            last.as_ref(),
+            &url,
+            t0 + Duration::from_millis(200)
+        ));
+        assert!(!repeated_open(
+            last.as_ref(),
+            &url,
+            t0 + Duration::from_millis(900)
+        ));
+        assert!(!repeated_open(
+            last.as_ref(),
+            &otra,
+            t0 + Duration::from_millis(200)
+        ));
+        assert!(!repeated_open(None, &url, t0));
     }
 
     #[test]

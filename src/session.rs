@@ -204,11 +204,11 @@ fn shell_word(chars: &[char]) -> Option<String> {
     Some(out)
 }
 
-/// `word` (ya sin escapes) es una ruta que existe, relativa a `dir` si no es absoluta ni
-/// empieza por `~`. Con `prefix` basta con que sea el principio del nombre de una entrada.
-pub fn path_exists(dir: &Path, word: &str, prefix: bool) -> bool {
+/// La ruta a la que lleva `word` (ya sin escapes): relativa a `dir` si no es absoluta ni
+/// empieza por `~`.
+fn resolve_word(dir: &Path, word: &str) -> PathBuf {
     let home = || dirs::home_dir().unwrap_or_default();
-    let path = if word == "~" {
+    if word == "~" {
         home()
     } else if let Some(rest) = word.strip_prefix("~/") {
         home().join(rest)
@@ -216,7 +216,54 @@ pub fn path_exists(dir: &Path, word: &str, prefix: bool) -> bool {
         PathBuf::from(word)
     } else {
         dir.join(word)
-    };
+    }
+}
+
+/// Puntos de montaje y si son locales, leídos de la tabla del sistema sin esperar a ningún
+/// servidor (`getmntinfo` con `MNT_NOWAIT`).
+fn mounts_now() -> Vec<(PathBuf, bool)> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut list: *mut libc::statfs = std::ptr::null_mut();
+    // SAFETY: getmntinfo deja en `list` un búfer suyo con `n` entradas válidas (no se libera).
+    let n = unsafe { libc::getmntinfo(&mut list, libc::MNT_NOWAIT) };
+    if n <= 0 || list.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `n` entradas a partir de `list`, recién devueltas por getmntinfo.
+    let entries = unsafe { std::slice::from_raw_parts(list, n as usize) };
+    entries
+        .iter()
+        .map(|m| {
+            // SAFETY: f_mntonname es una cadena C terminada en NUL dentro del struct.
+            let name = unsafe { std::ffi::CStr::from_ptr(m.f_mntonname.as_ptr()) };
+            let local = m.f_flags & libc::MNT_LOCAL as u32 != 0;
+            (
+                PathBuf::from(std::ffi::OsStr::from_bytes(name.to_bytes())),
+                local,
+            )
+        })
+        .collect()
+}
+
+/// `path` está en un disco de este Mac: el montaje más largo que lo contiene es local, y no
+/// cuelga de `/net` ni de `/Network` (autofs montaría el recurso de red solo por mirarlo).
+/// Mirar una ruta en una unidad de red puede tardar segundos si el servidor no responde, y
+/// el color de las rutas se calcula en el hilo de la interfaz.
+fn on_local_disk(path: &Path, mounts: &[(PathBuf, bool)]) -> bool {
+    if path.starts_with("/net") || path.starts_with("/Network") {
+        return false;
+    }
+    mounts
+        .iter()
+        .filter(|(at, _)| path.starts_with(at))
+        .max_by_key(|(at, _)| at.as_os_str().len())
+        .is_none_or(|(_, local)| *local)
+}
+
+/// `word` (ya sin escapes) es una ruta que existe, relativa a `dir` si no es absoluta ni
+/// empieza por `~`. Con `prefix` basta con que sea el principio del nombre de una entrada.
+pub fn path_exists(dir: &Path, word: &str, prefix: bool) -> bool {
+    let path = resolve_word(dir, word);
     if !prefix || word == "~" || word.ends_with('/') {
         return path.exists();
     }
@@ -901,6 +948,8 @@ pub struct Session {
     pub link_press: Option<crate::view::Withheld>,
     /// El enlace web bajo el puntero (sin ⌘) y desde cuándo está ahí, para su recuadro.
     pub link_hover: Option<(crate::view::Span, Instant)>,
+    /// El último enlace abierto y cuándo: el segundo clic de un doble clic no lo reabre.
+    pub last_link_open: Option<(crate::view::Span, Instant)>,
     /// La rejilla del cuadro anterior, para rehacer solo las filas que cambian.
     pub grid: crate::view::GridCache,
     /// Texto a medio componer (tecla muerta: «˜» antes de la «ñ»; o un método de entrada),
@@ -1068,6 +1117,7 @@ impl Session {
             paths_memo: None,
             link_press: None,
             link_hover: None,
+            last_link_open: None,
             grid: Default::default(),
             preedit: String::new(),
             preedit_frame: 0,
@@ -1595,6 +1645,7 @@ impl Session {
         if self.paths_seen.len() > 4096 {
             self.paths_seen.clear();
         }
+        let mounts = mounts_now();
         let now = Instant::now();
         let mut out = Vec::new();
         for (dir, text, at, upto) in commands {
@@ -1603,7 +1654,8 @@ impl Session {
                 let exists = match self.paths_seen.get(&key) {
                     Some(&(found, when)) if now.duration_since(when) < FRESH => found,
                     _ => {
-                        let found = path_exists(&key.0, &key.1, prefix);
+                        let local = on_local_disk(&resolve_word(&key.0, &key.1), &mounts);
+                        let found = local && path_exists(&key.0, &key.1, prefix);
                         self.paths_seen.insert(key, (found, now));
                         found
                     }
@@ -2269,6 +2321,28 @@ mod tests {
         );
         assert_eq!(words("cd src ", Some(7)), [(3, 6, "src".into(), false)]);
         assert!(words("cd ", Some(3)).is_empty());
+    }
+
+    #[test]
+    fn rutas_en_unidades_de_red_no_se_miran() {
+        let mounts = [
+            (PathBuf::from("/"), true),
+            (PathBuf::from("/System/Volumes/Data"), true),
+            (PathBuf::from("/Volumes/NAS"), false),
+        ];
+        assert!(on_local_disk(Path::new("/Users/yo/src"), &mounts));
+        assert!(!on_local_disk(Path::new("/Volumes/NAS/proyecto"), &mounts));
+        // Se compara por componentes: «/Volumes/NASX» no está dentro de «/Volumes/NAS».
+        assert!(on_local_disk(Path::new("/Volumes/NASX/a"), &mounts));
+        // autofs montaría el recurso de red solo por mirarlo.
+        assert!(!on_local_disk(Path::new("/net/servidor/x"), &mounts));
+        assert!(!on_local_disk(Path::new("/Network/Servers/x"), &mounts));
+        // La raíz de este Mac siempre es local.
+        assert!(
+            mounts_now()
+                .iter()
+                .any(|(at, local)| at == Path::new("/") && *local)
+        );
     }
 
     #[test]
