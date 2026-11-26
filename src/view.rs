@@ -686,6 +686,7 @@ fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
             Some(crate::session::Tok::Command) => pal.ansi[2],
             Some(crate::session::Tok::Flag) => pal.ansi[4],
             Some(crate::session::Tok::Str) => pal.ansi[3],
+            Some(crate::session::Tok::Path) => pal.ansi[6],
             None => resolve(cell.fg, look.colors, pal),
         };
         let mut bg = resolve(cell.bg, look.colors, pal);
