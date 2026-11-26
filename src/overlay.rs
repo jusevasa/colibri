@@ -931,7 +931,7 @@ impl App {
                             }
                             let icon = Pos2::new(r.left() + 20.0, r.center().y);
                             let icon_color = if chosen { pal.fg } else { pal.muted };
-                            if item.command {
+                            if item.kind == crate::complete::Kind::Command {
                                 // «>_» de terminal.
                                 let st = Stroke::new(1.2, icon_color);
                                 let c = icon + Vec2::new(-3.0, 0.0);
@@ -942,10 +942,10 @@ impl App {
                                     st,
                                 );
                             } else {
-                                crate::file_icon(p, icon, item.is_dir, icon_color);
+                                crate::file_icon(p, icon, item.is_dir(), icon_color);
                             }
                             // El trozo que coincide con lo tecleado va resaltado.
-                            let name = if item.is_dir {
+                            let name = if item.is_dir() {
                                 format!("{}/", item.name)
                             } else {
                                 item.name.clone()
@@ -980,12 +980,10 @@ impl App {
                                 }
                                 None => add(&name, dim),
                             }
-                            let kind = if item.command {
-                                o.kind_command
-                            } else if item.is_dir {
-                                o.kind_folder
-                            } else {
-                                o.kind_file
+                            let kind = match item.kind {
+                                crate::complete::Kind::Command => o.kind_command,
+                                crate::complete::Kind::Dir => o.kind_folder,
+                                _ => o.kind_file,
                             };
                             let kind_w = 64.0;
                             job.wrap = egui::text::TextWrapping::truncate_at_width(

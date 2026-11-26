@@ -6,12 +6,46 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+/// Qué es una sugerencia.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Dir,
+    File,
+    /// Un comando (de la lista del shell), no algo del disco.
+    Command,
+    Branch,
+    CurrentBranch,
+    /// Rama de un remoto sin rama local con su nombre (git crea la local al cambiar a ella).
+    RemoteBranch,
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Item {
     pub name: String,
-    pub is_dir: bool,
-    /// Un comando (de la lista del shell), no algo del disco.
-    pub command: bool,
+    pub kind: Kind,
+    /// Ramas: fecha (unix) y mensaje de su último commit.
+    pub commit: Option<(u64, String)>,
+}
+
+impl Item {
+    fn new(name: String, kind: Kind) -> Item {
+        Item {
+            name,
+            kind,
+            commit: None,
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.kind == Kind::Dir
+    }
+
+    pub fn is_branch(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::Branch | Kind::CurrentBranch | Kind::RemoteBranch
+        )
+    }
 }
 
 /// Lo que hay que completar en una línea del prompt.
@@ -28,6 +62,16 @@ pub struct Target {
     /// Es la primera palabra: se ofrecen comandos y carpetas (zsh entra en ellas con
     /// `autocd`), o carpetas y archivos si ya parece una ruta.
     pub command: bool,
+}
+
+impl Target {
+    /// La palabra entera como nombre, sin separar la carpeta: una rama `feat/x` no es la
+    /// entrada `x` de la carpeta `feat/`.
+    pub fn whole(mut self) -> Target {
+        self.prefix = unescape(&self.token);
+        self.typed_dir.clear();
+        self
+    }
 }
 
 /// Decide qué completar. None = mejor que lo haga el shell: la línea está vacía, o la
@@ -84,15 +128,11 @@ pub fn candidates(cwd: &Path, t: &Target) -> Vec<Item> {
         commands()
             .iter()
             .filter(|c| c.starts_with(&t.prefix))
-            .map(|c| Item {
-                name: c.clone(),
-                is_dir: false,
-                command: true,
-            }),
+            .map(|c| Item::new(c.clone(), Kind::Command)),
     );
     // Primero lo más corto: con «gi», `git` antes que `git-receive-pack`.
-    items.sort_by_cached_key(|i| (i.name.len(), !i.is_dir, i.name.to_lowercase()));
-    items.dedup_by(|a, b| a.name == b.name && a.is_dir == b.is_dir);
+    items.sort_by_cached_key(|i| (i.name.len(), !i.is_dir(), i.name.to_lowercase()));
+    items.dedup_by(|a, b| a.name == b.name && a.is_dir() == b.is_dir());
     items.truncate(300);
     items
 }
@@ -125,16 +165,13 @@ fn entries(cwd: &Path, t: &Target, dirs_only: bool) -> Vec<Item> {
             }
             // Sigue los enlaces: un enlace a una carpeta cuenta como carpeta.
             let is_dir = e.path().is_dir();
-            (is_dir || !(dirs_only || t.dirs_only)).then_some(Item {
-                name,
-                is_dir,
-                command: false,
-            })
+            let kind = if is_dir { Kind::Dir } else { Kind::File };
+            (is_dir || !(dirs_only || t.dirs_only)).then_some(Item::new(name, kind))
         })
         .collect();
     items.sort_by_cached_key(|i| {
         let lower = i.name.to_lowercase();
-        (!lower.starts_with(&needle), !i.is_dir, lower)
+        (!lower.starts_with(&needle), !i.is_dir(), lower)
     });
     items.truncate(300);
     items
@@ -150,12 +187,125 @@ pub fn replacement(t: &Target, item: &Item) -> String {
         }
         out.push(c);
     }
-    if item.is_dir {
-        out.push('/');
-    } else if item.command {
-        out.push(' ');
+    match item.kind {
+        Kind::Dir => out.push('/'),
+        Kind::File => {}
+        // Una orden o una rama ya están completas: lo siguiente es otra palabra.
+        _ => out.push(' '),
     }
     out
+}
+
+/// Las ramas que contienen `prefix` (sin distinguir mayúsculas) como sugerencias: las locales
+/// y, con `remotes`, las de los remotos que no tienen rama local con su nombre, sin el
+/// remoto delante. Primero las que empiezan por `prefix`; dentro, la actual y luego de la
+/// del commit más reciente a la más antigua.
+pub fn branch_items(
+    refs: &[crate::git::Ref],
+    current: Option<&str>,
+    remotes: bool,
+    prefix: &str,
+) -> Vec<Item> {
+    use std::cmp::Reverse;
+    let needle = prefix.to_lowercase();
+    let locals: std::collections::HashSet<&str> = refs
+        .iter()
+        .filter(|r| !r.remote)
+        .map(|r| r.name.as_str())
+        .collect();
+    let mut by_time: Vec<&crate::git::Ref> = refs.iter().collect();
+    by_time.sort_by_key(|r| Reverse(r.time));
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for r in by_time {
+        let (name, kind) = if r.remote {
+            match r.name.split_once('/') {
+                Some((_, name)) if remotes && !locals.contains(name) => (name, Kind::RemoteBranch),
+                _ => continue,
+            }
+        } else if current == Some(r.name.as_str()) {
+            (r.name.as_str(), Kind::CurrentBranch)
+        } else {
+            (r.name.as_str(), Kind::Branch)
+        };
+        if !name.to_lowercase().contains(&needle) || !seen.insert(name) {
+            continue;
+        }
+        items.push(Item {
+            name: name.to_string(),
+            kind,
+            commit: Some((r.time, r.subject.clone())),
+        });
+    }
+    // Estable: dentro de cada grupo se conserva el orden por fecha.
+    items.sort_by_key(|i| {
+        (
+            !i.name.to_lowercase().starts_with(&needle),
+            i.kind != Kind::CurrentBranch,
+        )
+    });
+    items.truncate(300);
+    items
+}
+
+/// Lo que se lee de git para una lista de sugerencias: se carga la primera vez que hace
+/// falta y se reutiliza mientras la lista sigue abierta (al seguir escribiendo no se vuelve
+/// a llamar a git).
+#[derive(Clone, Default, Debug)]
+pub struct GitData {
+    pub refs: Option<Vec<crate::git::Ref>>,
+    pub current: Option<String>,
+    pub aliases: Option<Vec<(String, String)>>,
+}
+
+impl GitData {
+    fn load_refs(&mut self, cwd: &Path) {
+        if self.refs.is_none() {
+            self.refs = Some(crate::git::refs(cwd));
+            self.current = crate::git::branch(cwd);
+        }
+    }
+
+    fn alias(&mut self, cwd: &Path, name: &str) -> Option<String> {
+        self.aliases
+            .get_or_insert_with(|| crate::git::aliases(cwd))
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, value)| value.clone())
+    }
+}
+
+/// Qué ofrecer con Tab para `line`: la palabra que se sustituye y las opciones. En una orden
+/// de git que pide una rama, las ramas (si alguna coincide); donde pide algo que no es rama
+/// ni ruta, nada. `None` o la lista vacía: el Tab es del shell.
+pub fn offer(
+    line: &str,
+    cwd: &Path,
+    shell_alias: &dyn Fn(&str) -> Option<String>,
+    git: &mut GitData,
+) -> Option<(Target, Vec<Item>)> {
+    let t = target(line)?;
+    if !t.command {
+        match git_arg(line, shell_alias, &mut |name| git.alias(cwd, name)) {
+            Some(GitArg::Shell) => return None,
+            Some(GitArg::Branch { remotes }) => {
+                git.load_refs(cwd);
+                let whole = t.clone().whole();
+                let items = branch_items(
+                    git.refs.as_deref().unwrap_or_default(),
+                    git.current.as_deref(),
+                    remotes,
+                    &whole.prefix,
+                );
+                if !items.is_empty() {
+                    return Some((whole, items));
+                }
+            }
+            Some(GitArg::Files) | None => {}
+        }
+    }
+    let items = candidates(cwd, &t);
+    Some((t, items))
 }
 
 /// Comandos que conoce el shell: los escribe la integración de zsh
@@ -457,6 +607,118 @@ mod tests {
         assert_eq!(last_command("gco f"), "gco f");
     }
 
+    fn rama(name: &str, remote: bool, time: u64) -> crate::git::Ref {
+        crate::git::Ref {
+            name: name.into(),
+            remote,
+            time,
+            subject: format!("msg {name}"),
+        }
+    }
+
+    /// Locales main, feat-a, feat-b; remotas feat-a (ya local) y feat-c en dos remotos.
+    fn refs() -> Vec<crate::git::Ref> {
+        vec![
+            rama("main", false, 300),
+            rama("feat-a", false, 200),
+            rama("feat-b", false, 100),
+            rama("origin/feat-a", true, 200),
+            rama("origin/feat-c", true, 250),
+            rama("upstream/feat-c", true, 240),
+        ]
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("colibri-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ramas_filtradas_y_ordenadas() {
+        let names = |v: Vec<Item>| v.into_iter().map(|i| (i.name, i.kind)).collect::<Vec<_>>();
+        assert_eq!(
+            names(branch_items(&refs(), Some("feat-a"), true, "F")),
+            [
+                ("feat-a".to_string(), Kind::CurrentBranch),
+                ("feat-c".to_string(), Kind::RemoteBranch),
+                ("feat-b".to_string(), Kind::Branch),
+            ]
+        );
+        // «a» no empieza ninguna: todas las que la contienen, la actual primero y luego por
+        // fecha.
+        let n: Vec<String> = branch_items(&refs(), Some("feat-a"), false, "a")
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(n, ["feat-a", "main", "feat-b"]);
+        // Dos remotos con la misma rama: una sola, la más reciente.
+        let c = branch_items(&refs(), None, true, "feat-c");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].commit, Some((250, "msg origin/feat-c".to_string())));
+    }
+
+    #[test]
+    fn oferta_de_ramas_y_vuelta_a_archivos() {
+        let dir = temp_dir("oferta");
+        std::fs::write(dir.join("zz.txt"), "").unwrap();
+        let mut g = GitData {
+            refs: Some(refs()),
+            current: Some("main".into()),
+            aliases: Some(vec![]),
+        };
+        let none = |_: &str| None;
+        let (t, items) = offer("git checkout fe", &dir, &none, &mut g).unwrap();
+        assert_eq!((t.token.as_str(), t.typed_dir.as_str()), ("fe", ""));
+        assert!(!items.is_empty() && items.iter().all(Item::is_branch));
+        let (_, items) = offer("git checkout zz", &dir, &none, &mut g).unwrap();
+        assert_eq!(items[0].name, "zz.txt");
+        assert!(offer("git switch -c ", &dir, &none, &mut g).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oferta_sin_repo_da_archivos() {
+        let dir = temp_dir("sin-repo");
+        std::fs::write(dir.join("zz.txt"), "").unwrap();
+        let mut g = GitData {
+            refs: Some(vec![]),
+            current: None,
+            aliases: Some(vec![]),
+        };
+        let (_, items) = offer("git merge zz", &dir, &|_| None, &mut g).unwrap();
+        assert_eq!(items[0].kind, Kind::File);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oferta_rama_con_barra() {
+        let dir = temp_dir("barra");
+        let mut g = GitData {
+            refs: Some(vec![rama("feat/x", false, 10)]),
+            current: None,
+            aliases: Some(vec![]),
+        };
+        let (t, items) = offer("git checkout feat/", &dir, &|_| None, &mut g).unwrap();
+        assert_eq!(
+            (t.typed_dir.as_str(), items[0].name.as_str()),
+            ("", "feat/x")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reemplazo_de_rama_escapado() {
+        let t = target("git checkout fi").unwrap().whole();
+        let item = Item {
+            name: "fix(ui)".into(),
+            kind: Kind::Branch,
+            commit: None,
+        };
+        assert_eq!(replacement(&t, &item), "fix\\(ui\\) ");
+    }
+
     #[test]
     fn pares_separados_por_nul() {
         let m = parse_pairs(b"gco\0git checkout\0ll\0ls -l\0");
@@ -525,7 +787,7 @@ mod tests {
         assert!(
             found
                 .iter()
-                .any(|i| i.name == "integrations-logs" && i.is_dir)
+                .any(|i| i.name == "integrations-logs" && i.is_dir())
         );
         assert!(!found.iter().any(|i| i.name == "delivery integrations"));
         // …y dentro de una carpeta escrita como orden, su contenido.
@@ -533,11 +795,7 @@ mod tests {
         let t = target("integrations-logs/").unwrap();
         let names: Vec<String> = candidates(&dir, &t).into_iter().map(|i| i.name).collect();
         assert_eq!(names, ["src"]);
-        let cmd = Item {
-            name: "git".into(),
-            is_dir: false,
-            command: true,
-        };
+        let cmd = Item::new("git".into(), Kind::Command);
         assert_eq!(replacement(&target("gi").unwrap(), &cmd), "git ");
         let _ = std::fs::remove_dir_all(&dir);
     }
