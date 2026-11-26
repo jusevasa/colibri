@@ -1760,6 +1760,7 @@ impl App {
             pad: self.cfg.padding.clamp(0.0, 64.0),
             blink: self.cfg.cursor_blink,
             editor: self.cfg.editor.clone(),
+            link_click: self.cfg.link_click,
             cursor: match self.cfg.cursor.as_str() {
                 "bar" | "beam" => alacritty_terminal::vte::ansi::CursorShape::Beam,
                 "underline" => alacritty_terminal::vte::ansi::CursorShape::Underline,

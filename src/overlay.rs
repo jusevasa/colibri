@@ -139,7 +139,7 @@ fn kind_label(kind: crate::complete::Kind) -> &'static str {
 
 /// Filas de Preferencias, por id (el que usa el guion: `pref <id>`); la etiqueta sale de
 /// `pref_label` en el idioma de la interfaz.
-const PREF_ROWS: [&str; 24] = [
+const PREF_ROWS: [&str; 25] = [
     "theme",
     "font",
     "font_size",
@@ -154,6 +154,7 @@ const PREF_ROWS: [&str; 24] = [
     "notify",
     "history_popup",
     "complete_popup",
+    "link_click",
     "status_bar",
     "shell_integration",
     "editor",
@@ -182,6 +183,7 @@ fn pref_label(o: &'static i18n::overlay::T, id: &str) -> &'static str {
         "notify" => o.pref_notify,
         "history_popup" => o.pref_history_popup,
         "complete_popup" => o.pref_complete_popup,
+        "link_click" => o.pref_link_click,
         "status_bar" => o.pref_status_bar,
         "shell_integration" => o.pref_shell_integration,
         "editor" => o.pref_editor,
@@ -1439,6 +1441,7 @@ impl App {
             "notify" => (String::new(), Some(c.notify)),
             "history_popup" => (String::new(), Some(c.history_popup)),
             "complete_popup" => (String::new(), Some(c.complete_popup)),
+            "link_click" => (String::new(), Some(c.link_click)),
             "status_bar" => (String::new(), Some(c.status_bar)),
             "shell_integration" => (String::new(), Some(c.shell_integration)),
             "editor" if c.editor.is_empty() => (o.editor_default.to_string(), None),
@@ -1518,6 +1521,7 @@ impl App {
             "notify" => c.notify = !c.notify,
             "history_popup" => c.history_popup = !c.history_popup,
             "complete_popup" => c.complete_popup = !c.complete_popup,
+            "link_click" => c.link_click = !c.link_click,
             "status_bar" => c.status_bar = !c.status_bar,
             "shell_integration" => c.shell_integration = !c.shell_integration,
             "editor" => {

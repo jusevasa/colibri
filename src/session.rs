@@ -897,6 +897,10 @@ pub struct Session {
     /// tamaño, cursor y si el shell espera) y cuándo se calculó: mientras nada de eso cambie
     /// y lo mirado en el disco siga valiendo, se reutiliza sin recorrer la pantalla.
     paths_memo: Option<(PathsKey, Instant, Vec<TokSpan>)>,
+    /// Pulsación sobre un enlace web aún sin mandar al programa (ver `view::Withheld`).
+    pub link_press: Option<crate::view::Withheld>,
+    /// El enlace web bajo el puntero (sin ⌘) y desde cuándo está ahí, para su recuadro.
+    pub link_hover: Option<(crate::view::Span, Instant)>,
     /// La rejilla del cuadro anterior, para rehacer solo las filas que cambian.
     pub grid: crate::view::GridCache,
     /// Texto a medio componer (tecla muerta: «˜» antes de la «ñ»; o un método de entrada),
@@ -1062,6 +1066,8 @@ impl Session {
             row_shifts: Vec::new(),
             paths_seen: HashMap::new(),
             paths_memo: None,
+            link_press: None,
+            link_hover: None,
             grid: Default::default(),
             preedit: String::new(),
             preedit_frame: 0,

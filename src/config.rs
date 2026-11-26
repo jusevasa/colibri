@@ -34,6 +34,9 @@ pub struct Config {
     pub history_popup: bool,
     /// Tab en el prompt abre la lista de carpetas y archivos que coinciden.
     pub complete_popup: bool,
+    /// Un clic normal abre los enlaces web (con un recuadro al pasar el puntero); si no,
+    /// solo ⌘+clic.
+    pub link_click: bool,
     /// Barra inferior con la carpeta, la rama de git y los archivos con cambios.
     pub status_bar: bool,
     /// Marca el prompt de zsh desde el propio shell (ver `assets/shell/zshenv.zsh`).
@@ -143,6 +146,7 @@ impl Default for Config {
             restore_tabs: true,
             history_popup: true,
             complete_popup: true,
+            link_click: true,
             status_bar: true,
             shell_integration: true,
             editor: String::new(),
