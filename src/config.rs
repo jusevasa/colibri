@@ -362,9 +362,31 @@ pub fn presets() -> Vec<(&'static str, Theme)> {
         done: "#98c379".into(),
         ansi: one_dark_ansi.iter().map(|s| s.to_string()).collect(),
     };
+    // Ayu Dark con los colores del catálogo de temas de Warp (`standard/ayu_dark.yaml`):
+    // fondo, texto, acento y los 16 ANSI. La selección es la de ayu; barra, paneles y bordes,
+    // algo más oscuros que el fondo («details: darker» en Warp).
+    let ayu_ansi = [
+        "#01060e", "#ea6c73", "#91b362", "#f9af4f", "#53bdfa", "#fae994", "#90e1c6", "#c7c7c7",
+        "#686868", "#f07178", "#c2d94c", "#ffb454", "#59c2ff", "#ffee99", "#95e6cb", "#ffffff",
+    ];
+    let ayu_dark = Theme {
+        background: "#0a0e14".into(),
+        foreground: "#b3b1ad".into(),
+        cursor: "#b3b1ad".into(),
+        selection: "#273747".into(),
+        accent: "#53bdfa".into(),
+        tab_bar: "#070a0f".into(),
+        tab_active: "#0a0e14".into(),
+        panel: "#080b10".into(),
+        muted: "#7d8794".into(),
+        border: "#1a1f29".into(),
+        done: "#91b362".into(),
+        ansi: ayu_ansi.iter().map(|s| s.to_string()).collect(),
+    };
     vec![
         ("Colibrí", base),
         ("One Dark", one_dark),
+        ("Ayu Dark", ayu_dark),
         ("Medianoche", midnight),
         ("Claro", light),
     ]
@@ -678,6 +700,31 @@ impl Shortcut {
 #[cfg(test)]
 mod tests {
     use super::{Config, SecureInput};
+
+    #[test]
+    fn ayu_dark_como_en_warp() {
+        // Los colores de `standard/ayu_dark.yaml` del catálogo de temas de Warp.
+        let (_, ayu) = super::presets()
+            .into_iter()
+            .find(|(name, _)| *name == "Ayu Dark")
+            .expect("falta el tema Ayu Dark");
+        assert_eq!(
+            (
+                ayu.background.as_str(),
+                ayu.foreground.as_str(),
+                ayu.accent.as_str()
+            ),
+            ("#0a0e14", "#b3b1ad", "#53bdfa")
+        );
+        assert_eq!(
+            ayu.ansi,
+            [
+                "#01060e", "#ea6c73", "#91b362", "#f9af4f", "#53bdfa", "#fae994", "#90e1c6",
+                "#c7c7c7", "#686868", "#f07178", "#c2d94c", "#ffb454", "#59c2ff", "#ffee99",
+                "#95e6cb", "#ffffff",
+            ]
+        );
+    }
 
     #[test]
     fn entrada_segura_de_archivos_antiguos() {
