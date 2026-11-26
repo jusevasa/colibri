@@ -138,6 +138,8 @@ fn show_grid(
     // Las líneas de cajas no se pintan como texto: en su sitio van las cajas, que dibuja
     // quien llama a partir de `s.chips_px`.
     let chip_rows = if chips { s.chip_rows() } else { Vec::new() };
+    // Las rutas que existen en el comando de cada prompt, de otro color (como en Warp).
+    let paths = s.path_tokens();
     // Un prompt remoto lleva sus cajas en la misma fila que el comando. Las cajas ocupan
     // más que el texto que sustituyen, así que el comando se pinta corrido a la derecha
     // lo que haga falta (en celdas enteras, para que siga en la rejilla).
@@ -239,6 +241,7 @@ fn show_grid(
                 origin,
                 link: link.as_ref(),
                 chip_rows: &chip_rows,
+                paths: &paths,
                 shifts: &shifts,
             };
             pass.run(&mut term, &mut s.grid, &mut glyphs, &ctx, no_grid_cache())
@@ -253,6 +256,7 @@ fn show_grid(
             selection: content.selection,
             link: link.as_ref(),
             chip_rows: &chip_rows,
+            paths: &paths,
             shifts: &shifts,
         };
         let cursor_row = content.cursor.point.line.0 + offset;
@@ -459,6 +463,9 @@ pub struct GridCache {
     batch: Option<std::sync::Arc<crate::grid::GridBatch>>,
     /// Filas rehechas en el último cuadro.
     rebuilt: usize,
+    /// Las rutas coloreadas en el último cuadro: una fila cuyas rutas cambian se rehace
+    /// aunque alacritty no la dé por dañada (un archivo que se creó, otro prompt).
+    paths: Vec<(i32, usize, usize, crate::session::Tok)>,
 }
 
 /// Lo que sale de la rejilla en un cuadro. Con instancias: el lote (fondos y letras) y, con
@@ -492,6 +499,8 @@ struct GridPass<'a> {
     origin: Pos2,
     link: Option<&'a Link>,
     chip_rows: &'a [crate::session::ChipRow],
+    /// Rutas del comando a colorear (`Session::path_tokens`).
+    paths: &'a [(i32, usize, usize, crate::session::Tok)],
     shifts: &'a [(i32, i32)],
 }
 
@@ -539,10 +548,28 @@ impl GridPass<'_> {
             || damaged.is_none()
             || cache.key.as_ref() != Some(&key)
             || cache.rows.len() != lines;
-        let rows: Vec<usize> = match &damaged {
+        let mut rows: Vec<usize> = match &damaged {
             Some(rows) if !full => rows.iter().copied().filter(|&r| r < lines).collect(),
             _ => (0..lines).collect(),
         };
+        if !full {
+            let of_row = |list: &[(i32, usize, usize, crate::session::Tok)], row: i32| {
+                list.iter()
+                    .filter(|t| t.0 == row)
+                    .copied()
+                    .collect::<Vec<_>>()
+            };
+            for row in cache.paths.iter().chain(self.paths).map(|t| t.0) {
+                let fresh = row >= 0
+                    && (row as usize) < lines
+                    && !rows.contains(&(row as usize))
+                    && of_row(&cache.paths, row) != of_row(self.paths, row);
+                if fresh {
+                    rows.push(row as usize);
+                }
+            }
+        }
+        cache.paths = self.paths.to_vec();
         if full {
             cache.rows.clear();
             cache.rows.resize_with(lines, RowOut::default);
@@ -554,6 +581,7 @@ impl GridPass<'_> {
             selection,
             link: self.link,
             chip_rows: self.chip_rows,
+            paths: self.paths,
             shifts: self.shifts,
         };
         let mut changed = full;
@@ -620,15 +648,18 @@ fn shift_of(shifts: &[(i32, i32)], row: i32) -> i32 {
         .map_or(0, |(_, n)| *n)
 }
 
-/// Color del comando que se escribe en una máquina remota (allí no hay resaltado).
+/// Color de un trozo de comando: el que se escribe en una máquina remota (allí no hay
+/// resaltado) o una ruta que existe en el comando de un prompt local.
 fn token_at(
     chip_rows: &[crate::session::ChipRow],
+    paths: &[(i32, usize, usize, crate::session::Tok)],
     row: i32,
     col: usize,
 ) -> Option<crate::session::Tok> {
     chip_rows
         .iter()
         .flat_map(|c| c.tokens.iter())
+        .chain(paths)
         .find(|(r, from, to, _)| *r == row && (*from..*to).contains(&col))
         .map(|(.., tok)| *tok)
 }
@@ -640,6 +671,7 @@ struct Look<'a> {
     selection: Option<alacritty_terminal::selection::SelectionRange>,
     link: Option<&'a Link>,
     chip_rows: &'a [crate::session::ChipRow],
+    paths: &'a [(i32, usize, usize, crate::session::Tok)],
     shifts: &'a [(i32, i32)],
 }
 
@@ -670,7 +702,7 @@ fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
         if look.chip_rows.iter().any(|c| c.row == row && col < c.end) {
             continue;
         }
-        let token = token_at(look.chip_rows, row, col);
+        let token = token_at(look.chip_rows, look.paths, row, col);
         let shifted = col as i32 - shift;
         if shifted < 0 {
             continue;
@@ -715,9 +747,12 @@ fn walk_row<T>(term: &Term<T>, row: i32, offset: i32, look: &Look) -> RowRuns {
                 }),
             }
         }
+        // Una ruta coloreada va sin el subrayado con que la marca zsh-syntax-highlighting.
+        let underline =
+            flags.intersects(Flags::ALL_UNDERLINES) && token != Some(crate::session::Tok::Path);
         if linked {
             out.deco.push((col, width, fg, false));
-        } else if flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
+        } else if underline || flags.contains(Flags::STRIKEOUT) {
             out.deco
                 .push((col, width, fg, flags.contains(Flags::STRIKEOUT)));
         }
@@ -1611,6 +1646,7 @@ mod tests {
                     origin: Pos2::new(4.0, 4.0),
                     link: None,
                     chip_rows: &[],
+                    paths: &[],
                     shifts: &[],
                 };
                 out = p.run(term, cache, &mut glyphs, &ctx, full);

@@ -81,6 +81,32 @@ pub fn tokenize(text: &[char]) -> Vec<(usize, usize, Tok)> {
     out
 }
 
+/// Lo que decide las rutas coloreadas de una pestaña (ver `Session::paths_memo`).
+type PathsKey = (u64, usize, (usize, usize), Point, bool);
+
+/// Un trozo de comando a colorear en pantalla: fila, columna inicial, final exclusiva y qué es.
+pub type TokSpan = (i32, usize, usize, Tok);
+
+/// El comando de un prompt sacado de la rejilla: la carpeta de su marca, el texto, dónde
+/// está cada carácter (fila, columna) y hasta dónde mirar (el cursor, en el que se escribe).
+type PromptCommand = (PathBuf, Vec<char>, Vec<(i32, usize)>, Option<usize>);
+
+/// Un tramo [from, to) de un texto sacado de la rejilla, en celdas de pantalla: uno por fila
+/// (fila, columna inicial, final exclusiva). `at` dice dónde está cada carácter del texto.
+fn split_rows(at: &[(i32, usize)], from: usize, to: usize) -> Vec<(i32, usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = from;
+    for i in from..=to.min(at.len()) {
+        if i == to.min(at.len()) || at[i].0 != at[start].0 {
+            if i > start {
+                out.push((at[start].0, at[start].1, at[i - 1].1 + 1));
+            }
+            start = i;
+        }
+    }
+    out
+}
+
 /// Palabras de un comando que pueden ser rutas: tramo [inicio, fin) en caracteres, la
 /// palabra ya sin escapes ni comillas y si basta con que sea el principio de algo que existe
 /// (la palabra en la que está el cursor). Quien llama mira el disco con `path_exists`.
@@ -864,6 +890,13 @@ pub struct Session {
     /// Filas en pantalla que se pintan corridas a la izquierda (sin el símbolo del prompt)
     /// y cuántas celdas; el ratón tiene que deshacer ese corrimiento.
     pub row_shifts: Vec<(i32, i32)>,
+    /// Lo que ya se sabe de qué palabras son rutas que existen (`path_tokens`): por carpeta,
+    /// palabra y si bastaba con el principio, el resultado y cuándo se miró.
+    paths_seen: HashMap<(PathBuf, String, bool), (bool, Instant)>,
+    /// El último resultado de `path_tokens`, con lo que lo decide (salida, desplazamiento,
+    /// tamaño, cursor y si el shell espera) y cuándo se calculó: mientras nada de eso cambie
+    /// y lo mirado en el disco siga valiendo, se reutiliza sin recorrer la pantalla.
+    paths_memo: Option<(PathsKey, Instant, Vec<TokSpan>)>,
     /// La rejilla del cuadro anterior, para rehacer solo las filas que cambian.
     pub grid: crate::view::GridCache,
     /// Texto a medio componer (tecla muerta: «˜» antes de la «ñ»; o un método de entrada),
@@ -1027,6 +1060,8 @@ impl Session {
             cursor_px: None,
             chips_px: Vec::new(),
             row_shifts: Vec::new(),
+            paths_seen: HashMap::new(),
+            paths_memo: None,
             grid: Default::default(),
             preedit: String::new(),
             preedit_frame: 0,
@@ -1456,6 +1491,130 @@ impl Session {
         Some((cells, cursor))
     }
 
+    /// Rutas que existen en el comando de cada prompt marcado que se ve (el que se escribe y
+    /// los del historial): (fila de la pantalla, columna inicial, final exclusiva, `Tok::Path`).
+    /// Las relativas se miran contra la carpeta de la marca de su prompt. En el que se
+    /// escribe solo hasta el cursor (ver `path_words`). Nada en una sesión ssh (no es este
+    /// disco) ni sin la integración (sin marca no se sabe dónde empieza el comando).
+    pub fn path_tokens(&mut self) -> Vec<TokSpan> {
+        /// Cuánto vale lo que se miró en el disco.
+        const FRESH: Duration = Duration::from_secs(2);
+        if self.remote {
+            return Vec::new();
+        }
+        let shell_waits = self.fg_pid == self.shell_pid;
+        let key = {
+            let term = self.term.lock();
+            let grid = term.grid();
+            (
+                self.activity,
+                grid.display_offset(),
+                (grid.columns(), grid.screen_lines()),
+                grid.cursor.point,
+                shell_waits,
+            )
+        };
+        if let Some((seen, at, tokens)) = &self.paths_memo
+            && *seen == key
+            && at.elapsed() < FRESH
+        {
+            return tokens.clone();
+        }
+        // Primero se recogen los comandos (con el terminal bloqueado) y luego se mira el disco.
+        let mut commands: Vec<PromptCommand> = Vec::new();
+        {
+            let term = self.term.lock();
+            let grid = term.grid();
+            let cols = grid.columns();
+            let offset = grid.display_offset() as i32;
+            let screen = grid.screen_lines() as i32;
+            let cursor = grid.cursor.point;
+            let wraps = |line: i32| {
+                grid[Line(line)][Column(cols - 1)]
+                    .flags
+                    .contains(Flags::WRAPLINE)
+            };
+            for row in 0..screen {
+                let line = row - offset;
+                let cells = &grid[Line(line)];
+                let Some(tag) = prompt_tag(&cells[Column(0)]) else {
+                    continue;
+                };
+                // Línea de cajas, o la de arriba de un prompt de dos líneas: el comando va
+                // en la siguiente.
+                let next_same = row + 1 < screen
+                    && same_prompt(
+                        &Some(tag.clone()),
+                        &prompt_tag(&grid[Line(line + 1)][Column(0)]),
+                    );
+                if chip_kind(&cells[Column(0)]).is_some() || next_same {
+                    continue;
+                }
+                let start = (0..cols)
+                    .take_while(|&col| prompt_tag(&cells[Column(col)]).is_some())
+                    .count();
+                let mut text = Vec::new();
+                let mut at = Vec::new();
+                let mut upto = None;
+                let mut r = row;
+                loop {
+                    let l = r - offset;
+                    for col in if r == row { start } else { 0 }..cols {
+                        let cell = &grid[Line(l)][Column(col)];
+                        if cell
+                            .flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                        {
+                            continue;
+                        }
+                        if shell_waits
+                            && upto.is_none()
+                            && Point::new(Line(l), Column(col)) >= cursor
+                        {
+                            upto = Some(text.len());
+                        }
+                        text.push(if cell.c == '\0' { ' ' } else { cell.c });
+                        at.push((r, col));
+                    }
+                    if !wraps(l) || r + 1 >= screen {
+                        break;
+                    }
+                    r += 1;
+                }
+                // Solo el prompt en el que está el cursor se corta en él.
+                let here = shell_waits && (line..=r - offset).contains(&cursor.line.0);
+                commands.push((tag_dir(&tag), text, at, upto.filter(|_| here)));
+            }
+        }
+        if self.paths_seen.len() > 4096 {
+            self.paths_seen.clear();
+        }
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (dir, text, at, upto) in commands {
+            for (from, to, word, prefix) in path_words(&text, upto) {
+                let key = (dir.clone(), word, prefix);
+                let exists = match self.paths_seen.get(&key) {
+                    Some(&(found, when)) if now.duration_since(when) < FRESH => found,
+                    _ => {
+                        let found = path_exists(&key.0, &key.1, prefix);
+                        self.paths_seen.insert(key, (found, now));
+                        found
+                    }
+                };
+                if exists {
+                    out.extend(
+                        split_rows(&at, from, to)
+                            .into_iter()
+                            .map(|(row, a, b)| (row, a, b, Tok::Path)),
+                    );
+                }
+            }
+        }
+        self.paths_memo = Some((key, now, out.clone()));
+        out
+    }
+
     /// Líneas de cajas visibles ahora mismo.
     pub fn chip_rows(&self) -> Vec<ChipRow> {
         let term = self.term.lock();
@@ -1542,14 +1701,11 @@ impl Session {
                     r += 1;
                 }
                 for (from, to, tok) in tokenize(&text) {
-                    // Un tramo por fila.
-                    let mut start = from;
-                    for i in from..=to {
-                        if i == to || at[i].0 != at[start].0 {
-                            tokens.push((at[start].0, at[start].1, at[i - 1].1 + 1, tok));
-                            start = i;
-                        }
-                    }
+                    tokens.extend(
+                        split_rows(&at, from, to)
+                            .into_iter()
+                            .map(|(row, a, b)| (row, a, b, tok)),
+                    );
                 }
             }
             out.push(ChipRow {
@@ -2089,6 +2245,13 @@ mod tests {
             [(7, 14, "out.txt".into(), false)]
         );
         assert_eq!(words("A=1 ls src", None), [(7, 10, "src".into(), false)]);
+    }
+
+    #[test]
+    fn tramos_partidos_por_filas() {
+        let at = [(5, 78), (5, 79), (6, 0), (6, 1)];
+        assert_eq!(split_rows(&at, 0, 4), [(5, 78, 80), (6, 0, 2)]);
+        assert_eq!(split_rows(&at, 1, 2), [(5, 79, 80)]);
     }
 
     #[test]
