@@ -368,15 +368,16 @@ fn show_grid(
     };
     // Tras la sugerencia gris de zsh-autosuggestions, una cajita «→» dice con qué tecla se
     // acepta (como en Warp): a 10 px de su última letra, del alto del cursor.
-    if focused && shape != CursorShape::Hidden {
-        if let Some(end) = s.autosuggestion_end() {
-            let offset = s.term.lock().grid().display_offset() as i32;
-            let row = end.line.0 + offset;
-            let col = (end.column.0 as i32 - shift_of(&shifts, row)).max(0) as usize;
-            if row >= 0 && (row as usize) < lines {
-                let last = cell_pos(row, col);
-                accept_hint(&painter, last + Vec2::new(m.cell_w, 0.0), m, pal);
-            }
+    if focused
+        && shape != CursorShape::Hidden
+        && let Some(end) = s.autosuggestion_end()
+    {
+        let offset = s.term.lock().grid().display_offset() as i32;
+        let row = end.line.0 + offset;
+        let col = (end.column.0 as i32 - shift_of(&shifts, row)).max(0) as usize;
+        if row >= 0 && (row as usize) < lines {
+            let last = cell_pos(row, col);
+            accept_hint(&painter, last + Vec2::new(m.cell_w, 0.0), m, pal);
         }
     }
     // Dónde colocar la ventana de composición si el cursor no está en pantalla.
