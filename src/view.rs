@@ -348,9 +348,16 @@ fn show_grid(
             .request_repaint_after(std::time::Duration::from_millis(500 - ms % 500));
         (ms / 500) % 2 == 0
     };
-    if shape != CursorShape::Hidden && crow >= 0 && (crow as usize) < lines {
+    // Dónde colocar la ventana de composición si el cursor no está en pantalla.
+    let mut ime_cell = Rect::from_min_size(rect.min, Vec2::new(m.cell_w, m.cell_h));
+    // Aunque el programa oculte el cursor (Claude Code lo oculta y pinta el suyo), su
+    // posición sigue siendo donde se escribe: ahí va lo que se compone.
+    if crow >= 0 && (crow as usize) < lines {
+        let hidden = shape == CursorShape::Hidden;
         let base = cell_pos(crow, ccol);
-        s.cursor_px = Some(Rect::from_min_size(base, Vec2::new(m.cell_w, m.cell_h)));
+        if !hidden {
+            s.cursor_px = Some(Rect::from_min_size(base, Vec2::new(m.cell_w, m.cell_h)));
+        }
         // Lo que se está componiendo va en el sitio del cursor, subrayado, y el cursor detrás.
         let composing = s.preedit.chars().count() as f32 * m.cell_w;
         if composing > 0.0 {
@@ -368,7 +375,10 @@ fn show_grid(
         }
         let min = base + Vec2::new(composing, 0.0);
         let cell = Rect::from_min_size(min, Vec2::new(m.cell_w, m.cell_h));
-        if !focused {
+        ime_cell = cell;
+        if hidden {
+            // El programa pinta su propio cursor.
+        } else if !focused {
             painter.rect_stroke(cell, 0.0, Stroke::new(1.0, pal.cursor), StrokeKind::Inside);
         } else if blink_on {
             match shape {
@@ -408,16 +418,19 @@ fn show_grid(
                 }
             }
         }
-        // Dónde colocar la ventana de composición (acentos, emoji).
-        ui.output_mut(|o| {
-            o.ime = Some(egui::output::IMEOutput {
-                purpose: egui::IMEPurpose::Terminal,
-                rect,
-                cursor_rect: cell,
-                should_interrupt_composition: false,
-            })
-        });
     }
+    // La entrada de texto del sistema va siempre activa, también con el cursor oculto o
+    // fuera de la pantalla: sin ella macOS no compone las teclas muertas (⌥N + N daba
+    // «˜n» en Claude Code en vez de «ñ»). `ime_cell` dice dónde poner la ventana de
+    // composición (acentos, emoji).
+    ui.output_mut(|o| {
+        o.ime = Some(egui::output::IMEOutput {
+            purpose: egui::IMEPurpose::Terminal,
+            rect,
+            cursor_rect: ime_cell,
+            should_interrupt_composition: false,
+        })
+    });
 }
 
 /// `COLIBRI_NO_GRID_CACHE`: rehacer la rejilla entera en cada cuadro, para comparar.
