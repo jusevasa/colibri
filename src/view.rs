@@ -162,7 +162,7 @@ fn show_grid(
         .map(|c| {
             // Con la fila de encima vacía, las cajas suben hacia ella y dejan aire sobre
             // el comando (12 px entre el borde de la caja y su fila, como en Warp).
-            let lift = if c.room_above { CHIP_LIFT } else { 0.0 };
+            let lift = chip_lift(c.room_above, m.cell_h);
             let top = origin.y + c.row as f32 * m.cell_h - lift;
             // (Las cajas de un prompt remoto se miden solas; el comando empieza en `lead`.)
             let right = if c.inline || c.next >= cols {
@@ -209,10 +209,9 @@ fn show_grid(
         };
         let prev = i.checked_sub(1).map(|j| chip_rows[j].row);
         // La etiqueta va junto a las cajas del prompt anterior: sube con ellas.
-        let prev_lift = match i.checked_sub(1).map(|j| chip_rows[j].room_above) {
-            Some(true) => CHIP_LIFT,
-            _ => 0.0,
-        };
+        let prev_lift = i
+            .checked_sub(1)
+            .map_or(0.0, |j| chip_lift(chip_rows[j].room_above, m.cell_h));
         let failed = status != 0;
         let y = |row: i32| origin.y + row as f32 * m.cell_h;
         if failed {
@@ -489,6 +488,17 @@ fn accept_hint(painter: &egui::Painter, after: Pos2, m: &Metrics, pal: &Palette)
 /// `prompt_chips` ya recorta (3 px arriba, 5 abajo) su borde inferior queda 12 px por
 /// encima de la fila del comando.
 const CHIP_LIFT: f32 = 7.0;
+
+/// Lo que suben las cajas de una fila: `CHIP_LIFT` si hay hueco encima y cabe. Con filas
+/// bajas, solo hasta 5 px del borde de arriba de la fila vacía (los 3 que `prompt_chips`
+/// ya sube y 2 de margen para la raya), para no tocar la fila de más arriba.
+fn chip_lift(room_above: bool, cell_h: f32) -> f32 {
+    if room_above {
+        CHIP_LIFT.min((cell_h - 5.0).max(0.0))
+    } else {
+        0.0
+    }
+}
 
 /// `COLIBRI_NO_GRID_CACHE`: rehacer la rejilla entera en cada cuadro, para comparar.
 fn no_grid_cache() -> bool {
@@ -1893,6 +1903,16 @@ fn report_mouse(
 
 #[cfg(test)]
 mod tests {
+    /// Las cajas suben 7 px si cabe; con filas bajas (letra pequeña) solo lo que deja la
+    /// fila vacía de encima, sin tocar la de más arriba ni la raya.
+    #[test]
+    fn las_cajas_suben_lo_que_cabe() {
+        assert_eq!(super::chip_lift(false, 20.0), 0.0);
+        assert_eq!(super::chip_lift(true, 20.0), 7.0);
+        assert_eq!(super::chip_lift(true, 10.0), 5.0);
+        assert_eq!(super::chip_lift(true, 4.0), 0.0);
+    }
+
     use super::{PointerEv, Target, Withheld, WithheldOut, opens_on_click, withheld_step};
     use super::{file_command, mouse_seq, path_span, split_position, url_span};
 

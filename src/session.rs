@@ -650,11 +650,11 @@ fn suggestion_end(
 }
 
 /// Para una línea de cajas en la fila `row` de la pantalla: si pueden subir (la fila de
-/// encima está vacía) y si encima va la raya entre bloques (además queda algo por encima de
-/// esa fila vacía: tras `clear` el primer prompt no separa nada).
-fn chip_room(row: i32, above_blank: bool) -> (bool, bool) {
+/// encima está vacía) y si encima va la raya entre bloques (además hay contenido en alguna
+/// fila por encima de esa vacía: tras `clear` el primer prompt no separa nada).
+fn chip_room(row: i32, above_blank: bool, content_higher: bool) -> (bool, bool) {
     let room = row > 0 && above_blank;
-    (room, room && row > 1)
+    (room, room && content_higher)
 }
 
 fn chip_kind(cell: &Cell) -> Option<char> {
@@ -1803,7 +1803,11 @@ impl Session {
             let above_blank = !inline
                 && row > 0
                 && row_is_blank((0..cols).map(|col| &grid[Line(row - 1 - offset)][Column(col)]));
-            let (room_above, rule_above) = chip_room(row, above_blank);
+            // La raya solo separa de algo: alguna fila con contenido más arriba.
+            let blank_at =
+                |r: i32| row_is_blank((0..cols).map(|col| &grid[Line(r - offset)][Column(col)]));
+            let content_higher = above_blank && (0..row - 1).rev().any(|r| !blank_at(r));
+            let (room_above, rule_above) = chip_room(row, above_blank, content_higher);
             out.push(ChipRow {
                 row,
                 end,
@@ -2495,10 +2499,12 @@ mod tests {
     /// si por encima de esa fila vacía queda algo de la pantalla (tras `clear`, no).
     #[test]
     fn hueco_y_raya_sobre_las_cajas() {
-        assert_eq!(chip_room(0, true), (false, false));
-        assert_eq!(chip_room(1, true), (true, false));
-        assert_eq!(chip_room(5, true), (true, true));
-        assert_eq!(chip_room(5, false), (false, false));
+        assert_eq!(chip_room(0, true, false), (false, false));
+        assert_eq!(chip_room(1, true, false), (true, false));
+        assert_eq!(chip_room(5, true, true), (true, true));
+        assert_eq!(chip_room(5, false, true), (false, false));
+        // Tras `clear` con dos filas vacías arriba: suben, pero no hay bloque que separar.
+        assert_eq!(chip_room(2, true, false), (true, false));
     }
 
     /// La sugerencia gris de zsh-autosuggestions se reconoce por su color (el gris 8 de la
