@@ -445,6 +445,9 @@ pub struct ChipRow {
     pub result: Option<(i32, u64)>,
     /// Tramos del comando remoto a colorear: (fila, columna inicial, final, qué es).
     pub tokens: Vec<(i32, usize, usize, Tok)>,
+    /// La fila de encima está en pantalla y vacía (`row_is_blank`): las cajas pueden subir
+    /// hacia ella para dejar aire sobre el comando, y encima va la raya entre bloques.
+    pub room_above: bool,
 }
 
 /// Esquema del hiperenlace con el que la integración de zsh (`assets/shell/zshenv.zsh`)
@@ -599,6 +602,19 @@ fn zsh_integration_dir() -> Option<PathBuf> {
 
 fn is_blank(c: char) -> bool {
     c == ' ' || c == '\0'
+}
+
+/// Una fila vacía de verdad: sin texto, sin fondo de color y sin marcas de prompt o de
+/// cajas. Encima de una línea de cajas, ahí pueden subir las cajas para dejar aire sobre
+/// el comando.
+fn row_is_blank(cells: &[Cell]) -> bool {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    cells.iter().all(|cell| {
+        is_blank(cell.c)
+            && cell.bg == Color::Named(NamedColor::Background)
+            && prompt_tag(cell).is_none()
+            && chip_kind(cell).is_none()
+    })
 }
 
 fn chip_kind(cell: &Cell) -> Option<char> {
@@ -1735,6 +1751,12 @@ impl Session {
                 inline,
                 result: prompt_tag(&cells[Column(0)]).as_ref().and_then(tag_result),
                 tokens,
+                room_above: !inline && row > 0 && {
+                    let above = &grid[Line(row - 1 - offset)];
+                    let cells: Vec<Cell> =
+                        (0..cols).map(|col| above[Column(col)].clone()).collect();
+                    row_is_blank(&cells)
+                },
             });
         }
         out
@@ -2387,5 +2409,20 @@ mod tests {
         assert_eq!(tag_dir(&link), PathBuf::from("/tmp/a b"));
         let plain = Hyperlink::new(None::<String>, "colibri-prompt:/tmp".into());
         assert_eq!(tag_result(&plain), None);
+    }
+
+    /// Las cajas solo suben si encima hay una fila de verdad vacía: ni texto ni fondo de
+    /// color (la salida de un programa que pinta fondos no es hueco).
+    #[test]
+    fn fila_en_blanco() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let blank = vec![Cell::default(); 8];
+        assert!(row_is_blank(&blank));
+        let mut text = blank.clone();
+        text[3].c = 'x';
+        assert!(!row_is_blank(&text));
+        let mut painted = blank.clone();
+        painted[5].bg = Color::Named(NamedColor::Red);
+        assert!(!row_is_blank(&painted));
     }
 }

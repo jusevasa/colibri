@@ -160,7 +160,10 @@ fn show_grid(
     s.chips_px = chip_rows
         .iter()
         .map(|c| {
-            let top = origin.y + c.row as f32 * m.cell_h;
+            // Con la fila de encima vacía, las cajas suben hacia ella y dejan aire sobre
+            // el comando (12 px entre el borde de la caja y su fila, como en Warp).
+            let lift = if c.room_above { CHIP_LIFT } else { 0.0 };
+            let top = origin.y + c.row as f32 * m.cell_h - lift;
             // (Las cajas de un prompt remoto se miden solas; el comando empieza en `lead`.)
             let right = if c.inline || c.next >= cols {
                 cols
@@ -190,6 +193,13 @@ fn show_grid(
     let shifts = s.row_shifts.clone();
     let prompt_bar = !shifts.is_empty() && s.at_prompt();
     let painter = ui.painter().with_clip_rect(rect);
+    // Una raya fina separa cada bloque del anterior, arriba de la línea en blanco sobre
+    // sus cajas (con la primera fila de la pantalla no hay bloque anterior que separar).
+    let rule = pal.bg.lerp_to_gamma(pal.fg, 0.10);
+    for c in chip_rows.iter().filter(|c| c.room_above) {
+        let y = origin.y + (c.row - 1) as f32 * m.cell_h + 0.5;
+        painter.hline(rect.x_range(), y, Stroke::new(1.0, rule));
+    }
     // Cada prompt marcado sabe cómo acabó el comando anterior: si falló, una barra roja
     // en el margen recorre ese comando y su salida, y junto a sus cajas van el código de
     // salida y lo que tardó (la duración sola, si acabó bien pero tardó).
@@ -198,6 +208,11 @@ fn show_grid(
             continue;
         };
         let prev = i.checked_sub(1).map(|j| chip_rows[j].row);
+        // La etiqueta va junto a las cajas del prompt anterior: sube con ellas.
+        let prev_lift = match i.checked_sub(1).map(|j| chip_rows[j].room_above) {
+            Some(true) => CHIP_LIFT,
+            _ => 0.0,
+        };
         let failed = status != 0;
         let y = |row: i32| origin.y + row as f32 * m.cell_h;
         if failed {
@@ -216,7 +231,10 @@ fn show_grid(
         };
         if let Some(prev) = prev {
             painter.text(
-                Pos2::new(rect.right() - m.pad - 4.0, y(prev) + m.cell_h / 2.0 - 4.0),
+                Pos2::new(
+                    rect.right() - m.pad - 4.0,
+                    y(prev) + m.cell_h / 2.0 - 4.0 - prev_lift,
+                ),
                 Align2::RIGHT_CENTER,
                 label,
                 egui::FontId::proportional(m.font.size * 0.85),
@@ -432,6 +450,11 @@ fn show_grid(
         })
     });
 }
+
+/// Cuánto suben las cajas del prompt cuando encima hay una fila vacía. Con lo que
+/// `prompt_chips` ya recorta (3 px arriba, 5 abajo) su borde inferior queda 12 px por
+/// encima de la fila del comando.
+const CHIP_LIFT: f32 = 7.0;
 
 /// `COLIBRI_NO_GRID_CACHE`: rehacer la rejilla entera en cada cuadro, para comparar.
 fn no_grid_cache() -> bool {
