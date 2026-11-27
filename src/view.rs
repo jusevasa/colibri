@@ -366,6 +366,19 @@ fn show_grid(
             .request_repaint_after(std::time::Duration::from_millis(500 - ms % 500));
         (ms / 500) % 2 == 0
     };
+    // Tras la sugerencia gris de zsh-autosuggestions, una cajita «→» dice con qué tecla se
+    // acepta (como en Warp): a 10 px de su última letra, del alto del cursor.
+    if focused && shape != CursorShape::Hidden {
+        if let Some(end) = s.autosuggestion_end() {
+            let offset = s.term.lock().grid().display_offset() as i32;
+            let row = end.line.0 + offset;
+            let col = (end.column.0 as i32 - shift_of(&shifts, row)).max(0) as usize;
+            if row >= 0 && (row as usize) < lines {
+                let last = cell_pos(row, col);
+                accept_hint(&painter, last + Vec2::new(m.cell_w, 0.0), m, pal);
+            }
+        }
+    }
     // Dónde colocar la ventana de composición si el cursor no está en pantalla.
     let mut ime_cell = Rect::from_min_size(rect.min, Vec2::new(m.cell_w, m.cell_h));
     // Aunque el programa oculte el cursor (Claude Code lo oculta y pinta el suyo), su
@@ -449,6 +462,26 @@ fn show_grid(
             should_interrupt_composition: false,
         })
     });
+}
+
+/// La pista «→» de la sugerencia gris, empezando 10 px a la derecha de `after` (la esquina
+/// de arriba de la celda que sigue a su última letra): alto del cursor (mín. 12 px), borde
+/// de 1 px, radio del 25 % del alto y el texto del tema al 40 %, sin relleno.
+fn accept_hint(painter: &egui::Painter, after: Pos2, m: &Metrics, pal: &Palette) {
+    let h = m.cell_h.max(12.0);
+    let color = pal.bg.lerp_to_gamma(pal.fg, 0.40);
+    let font = egui::FontId::proportional((m.font.size - 2.0).max(8.0));
+    let galley = painter.layout_no_wrap("→".into(), font, color);
+    let w = (galley.size().x + 8.0).max(h);
+    let rect = Rect::from_min_size(after + Vec2::new(10.0, 0.0), Vec2::new(w, h));
+    let radius = (h * 0.25).round() as u8;
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(radius),
+        Stroke::new(1.0, color),
+        StrokeKind::Inside,
+    );
+    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
 }
 
 /// Cuánto suben las cajas del prompt cuando encima hay una fila vacía. Con lo que

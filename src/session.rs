@@ -617,6 +617,33 @@ fn row_is_blank(cells: &[Cell]) -> bool {
     })
 }
 
+/// El color con el que zsh-autosuggestions pinta su sugerencia por defecto (`fg=8`, el gris
+/// de la paleta, que llega como índice 8 o como «negro brillante»), o texto atenuado.
+fn is_suggestion_color(fg: alacritty_terminal::vte::ansi::Color, flags: Flags) -> bool {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    flags.contains(Flags::DIM)
+        || matches!(
+            fg,
+            Color::Indexed(8) | Color::Named(NamedColor::BrightBlack)
+        )
+}
+
+/// Índice de la última letra de la sugerencia gris que empieza en `cursor` (las celdas del
+/// comando que se escribe, seguidas aunque salten de fila); `None` si en el cursor no hay
+/// sugerencia.
+fn suggestion_end(
+    cells: &[(char, alacritty_terminal::vte::ansi::Color, Flags)],
+    cursor: usize,
+) -> Option<usize> {
+    cells[cursor.min(cells.len())..]
+        .iter()
+        .take_while(|(_, fg, flags)| is_suggestion_color(*fg, *flags))
+        .enumerate()
+        .filter(|(_, (c, _, _))| !is_blank(*c))
+        .map(|(i, _)| cursor + i)
+        .last()
+}
+
 fn chip_kind(cell: &Cell) -> Option<char> {
     cell.zerowidth()?
         .iter()
@@ -1522,6 +1549,23 @@ impl Session {
         Some((cells, cursor))
     }
 
+    /// La última celda de la sugerencia gris de zsh-autosuggestions que sigue al cursor en el
+    /// comando que se escribe, si la hay (ver `suggestion_end`; se reconoce por su color).
+    pub fn autosuggestion_end(&self) -> Option<Point> {
+        let (cells, cursor) = self.input_cells()?;
+        let at = cells.iter().position(|p| *p == cursor)?;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let looks: Vec<_> = cells
+            .iter()
+            .map(|p| {
+                let cell = &grid[p.line][p.column];
+                (cell.c, cell.fg, cell.flags)
+            })
+            .collect();
+        suggestion_end(&looks, at).map(|i| cells[i])
+    }
+
     /// Rutas que existen en el comando de cada prompt marcado que se ve (el que se escribe y
     /// los del historial): (fila de la pantalla, columna inicial, final exclusiva, `Tok::Path`).
     /// Las relativas se miran contra la carpeta de la marca de su prompt. En el que se
@@ -2424,5 +2468,47 @@ mod tests {
         let mut painted = blank.clone();
         painted[5].bg = Color::Named(NamedColor::Red);
         assert!(!row_is_blank(&painted));
+    }
+
+    /// La sugerencia gris de zsh-autosuggestions se reconoce por su color (el gris 8 de la
+    /// paleta, o atenuada) a partir del cursor; la pista «→» va tras su última letra.
+    #[test]
+    fn sugerencia_gris() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let none = Flags::empty();
+        assert!(is_suggestion_color(
+            Color::Named(NamedColor::BrightBlack),
+            none
+        ));
+        assert!(is_suggestion_color(Color::Indexed(8), none));
+        assert!(is_suggestion_color(
+            Color::Named(NamedColor::Foreground),
+            Flags::DIM
+        ));
+        assert!(!is_suggestion_color(
+            Color::Named(NamedColor::Foreground),
+            none
+        ));
+
+        let normal = Color::Named(NamedColor::Foreground);
+        let gray = Color::Indexed(8);
+        let cells = |typed: &str, hint: &str| -> Vec<(char, Color, Flags)> {
+            typed
+                .chars()
+                .map(|c| (c, normal, none))
+                .chain(hint.chars().map(|c| (c, gray, none)))
+                .collect()
+        };
+        // «cd s» tecleado y «rc/» sugerido: la pista va tras la «/».
+        assert_eq!(suggestion_end(&cells("cd s", "rc/"), 4), Some(6));
+        // Lo de detrás del cursor es texto de verdad (se movió el cursor): no hay pista.
+        assert_eq!(suggestion_end(&cells("cd src/", ""), 4), None);
+        // Cursor al final, sin nada detrás.
+        assert_eq!(suggestion_end(&cells("cd s", ""), 4), None);
+        // Los espacios grises del final no cuentan.
+        assert_eq!(suggestion_end(&cells("cd s", "rc/  "), 4), Some(6));
+        // Una sugerencia que sigue en la fila de abajo llega seguida en las celdas.
+        let long = "x".repeat(30);
+        assert_eq!(suggestion_end(&cells("git ", &long), 4), Some(33));
     }
 }
