@@ -3398,20 +3398,17 @@ fn prompt_chips(
             resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                 .hovered()
         });
-        // Al pasar el ratón la caja solo se aclara un poco: sin borde de color ni rótulo.
-        let (fill, border) = if hovered {
-            (
-                pal.panel.lerp_to_gamma(pal.fg, 0.09),
-                pal.border.lerp_to_gamma(pal.fg, 0.12),
-            )
-        } else {
-            (pal.panel, pal.border)
-        };
+        // Fondo y borde son el texto del tema sobre su fondo, al 5 % y al 15 % (como en
+        // Warp); al pasar el ratón el fondo se aclara al 10 %, sin borde de color ni rótulo.
+        let fill = pal
+            .bg
+            .lerp_to_gamma(pal.fg, if hovered { 0.10 } else { 0.05 });
+        let border = pal.bg.lerp_to_gamma(pal.fg, 0.15);
         let p = ui.painter();
-        p.rect_filled(rect, CornerRadius::same(5), fill);
+        p.rect_filled(rect, CornerRadius::same(4), fill);
         p.rect_stroke(
             rect,
-            CornerRadius::same(5),
+            CornerRadius::same(4),
             Stroke::new(1.0, border),
             StrokeKind::Inside,
         );

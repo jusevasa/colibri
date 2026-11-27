@@ -160,7 +160,10 @@ fn show_grid(
     s.chips_px = chip_rows
         .iter()
         .map(|c| {
-            let top = origin.y + c.row as f32 * m.cell_h;
+            // Con la fila de encima vacía, las cajas suben hacia ella y dejan aire sobre
+            // el comando (12 px entre el borde de la caja y su fila, como en Warp).
+            let lift = chip_lift(c.room_above, m.cell_h);
+            let top = origin.y + c.row as f32 * m.cell_h - lift;
             // (Las cajas de un prompt remoto se miden solas; el comando empieza en `lead`.)
             let right = if c.inline || c.next >= cols {
                 cols
@@ -190,6 +193,13 @@ fn show_grid(
     let shifts = s.row_shifts.clone();
     let prompt_bar = !shifts.is_empty() && s.at_prompt();
     let painter = ui.painter().with_clip_rect(rect);
+    // Una raya fina separa cada bloque del anterior, arriba de la línea en blanco sobre
+    // sus cajas (con la primera fila de la pantalla no hay bloque anterior que separar).
+    let rule = pal.bg.lerp_to_gamma(pal.fg, 0.10);
+    for c in chip_rows.iter().filter(|c| c.rule_above) {
+        let y = origin.y + (c.row - 1) as f32 * m.cell_h + 0.5;
+        painter.hline(rect.x_range(), y, Stroke::new(1.0, rule));
+    }
     // Cada prompt marcado sabe cómo acabó el comando anterior: si falló, una barra roja
     // en el margen recorre ese comando y su salida, y junto a sus cajas van el código de
     // salida y lo que tardó (la duración sola, si acabó bien pero tardó).
@@ -198,11 +208,15 @@ fn show_grid(
             continue;
         };
         let prev = i.checked_sub(1).map(|j| chip_rows[j].row);
+        // La etiqueta va junto a las cajas del prompt anterior: sube con ellas.
+        let prev_lift = i
+            .checked_sub(1)
+            .map_or(0.0, |j| chip_lift(chip_rows[j].room_above, m.cell_h));
         let failed = status != 0;
         let y = |row: i32| origin.y + row as f32 * m.cell_h;
         if failed {
             let bar = Rect::from_min_max(
-                Pos2::new(rect.left(), y(prev.unwrap_or(0)) - 3.0),
+                Pos2::new(rect.left(), y(prev.unwrap_or(0)) - 3.0 - prev_lift),
                 Pos2::new(rect.left() + 3.0, y(c.row) - m.cell_h * 0.6),
             );
             painter.rect_filled(bar, 1.0, pal.ansi[1]);
@@ -216,7 +230,10 @@ fn show_grid(
         };
         if let Some(prev) = prev {
             painter.text(
-                Pos2::new(rect.right() - m.pad - 4.0, y(prev) + m.cell_h / 2.0 - 4.0),
+                Pos2::new(
+                    rect.right() - m.pad - 4.0,
+                    y(prev) + m.cell_h / 2.0 - 4.0 - prev_lift,
+                ),
                 Align2::RIGHT_CENTER,
                 label,
                 egui::FontId::proportional(m.font.size * 0.85),
@@ -348,6 +365,20 @@ fn show_grid(
             .request_repaint_after(std::time::Duration::from_millis(500 - ms % 500));
         (ms / 500) % 2 == 0
     };
+    // Tras la sugerencia gris de zsh-autosuggestions, una cajita «→» dice con qué tecla se
+    // acepta (como en Warp): a 10 px de su última letra, del alto del cursor.
+    if focused
+        && shape != CursorShape::Hidden
+        && let Some(end) = s.autosuggestion_end()
+    {
+        let offset = s.term.lock().grid().display_offset() as i32;
+        let row = end.line.0 + offset;
+        let col = (end.column.0 as i32 - shift_of(&shifts, row)).max(0) as usize;
+        if row >= 0 && (row as usize) < lines {
+            let last = cell_pos(row, col);
+            accept_hint(&painter, last + Vec2::new(m.cell_w, 0.0), m, pal);
+        }
+    }
     // Dónde colocar la ventana de composición si el cursor no está en pantalla.
     let mut ime_cell = Rect::from_min_size(rect.min, Vec2::new(m.cell_w, m.cell_h));
     // Aunque el programa oculte el cursor (Claude Code lo oculta y pinta el suyo), su
@@ -431,6 +462,42 @@ fn show_grid(
             should_interrupt_composition: false,
         })
     });
+}
+
+/// La pista «→» de la sugerencia gris, empezando 10 px a la derecha de `after` (la esquina
+/// de arriba de la celda que sigue a su última letra): alto del cursor (mín. 12 px), borde
+/// de 1 px, radio del 25 % del alto y el texto del tema al 40 %, sin relleno.
+fn accept_hint(painter: &egui::Painter, after: Pos2, m: &Metrics, pal: &Palette) {
+    let h = m.cell_h.max(12.0);
+    let color = pal.bg.lerp_to_gamma(pal.fg, 0.40);
+    let font = egui::FontId::proportional((m.font.size - 2.0).max(8.0));
+    let galley = painter.layout_no_wrap("→".into(), font, color);
+    let w = (galley.size().x + 8.0).max(h);
+    let rect = Rect::from_min_size(after + Vec2::new(10.0, 0.0), Vec2::new(w, h));
+    let radius = (h * 0.25).round() as u8;
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(radius),
+        Stroke::new(1.0, color),
+        StrokeKind::Inside,
+    );
+    painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+}
+
+/// Cuánto suben las cajas del prompt cuando encima hay una fila vacía. Con lo que
+/// `prompt_chips` ya recorta (3 px arriba, 5 abajo) su borde inferior queda 12 px por
+/// encima de la fila del comando.
+const CHIP_LIFT: f32 = 7.0;
+
+/// Lo que suben las cajas de una fila: `CHIP_LIFT` si hay hueco encima y cabe. Con filas
+/// bajas, solo hasta 5 px del borde de arriba de la fila vacía (los 3 que `prompt_chips`
+/// ya sube y 2 de margen para la raya), para no tocar la fila de más arriba.
+fn chip_lift(room_above: bool, cell_h: f32) -> f32 {
+    if room_above {
+        CHIP_LIFT.min((cell_h - 5.0).max(0.0))
+    } else {
+        0.0
+    }
 }
 
 /// `COLIBRI_NO_GRID_CACHE`: rehacer la rejilla entera en cada cuadro, para comparar.
@@ -1836,6 +1903,16 @@ fn report_mouse(
 
 #[cfg(test)]
 mod tests {
+    /// Las cajas suben 7 px si cabe; con filas bajas (letra pequeña) solo lo que deja la
+    /// fila vacía de encima, sin tocar la de más arriba ni la raya.
+    #[test]
+    fn las_cajas_suben_lo_que_cabe() {
+        assert_eq!(super::chip_lift(false, 20.0), 0.0);
+        assert_eq!(super::chip_lift(true, 20.0), 7.0);
+        assert_eq!(super::chip_lift(true, 10.0), 5.0);
+        assert_eq!(super::chip_lift(true, 4.0), 0.0);
+    }
+
     use super::{PointerEv, Target, Withheld, WithheldOut, opens_on_click, withheld_step};
     use super::{file_command, mouse_seq, path_span, split_position, url_span};
 

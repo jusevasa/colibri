@@ -445,6 +445,11 @@ pub struct ChipRow {
     pub result: Option<(i32, u64)>,
     /// Tramos del comando remoto a colorear: (fila, columna inicial, final, qué es).
     pub tokens: Vec<(i32, usize, usize, Tok)>,
+    /// La fila de encima está en pantalla y vacía (`row_is_blank`): las cajas pueden subir
+    /// hacia ella para dejar aire sobre el comando, y encima va la raya entre bloques.
+    pub room_above: bool,
+    /// Encima de la fila vacía queda algo de la pantalla: ahí va la raya entre bloques.
+    pub rule_above: bool,
 }
 
 /// Esquema del hiperenlace con el que la integración de zsh (`assets/shell/zshenv.zsh`)
@@ -599,6 +604,57 @@ fn zsh_integration_dir() -> Option<PathBuf> {
 
 fn is_blank(c: char) -> bool {
     c == ' ' || c == '\0'
+}
+
+/// Una fila vacía de verdad: sin texto, sin fondo de color, sin vídeo inverso ni rayas
+/// (unos espacios así se ven como una barra) y sin marcas de prompt o de cajas. Encima de una línea de cajas, ahí pueden subir las cajas para dejar aire sobre
+/// el comando.
+fn row_is_blank<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> bool {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    cells.into_iter().all(|cell| {
+        is_blank(cell.c)
+            && cell.bg == Color::Named(NamedColor::Background)
+            && !cell
+                .flags
+                .intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+            && prompt_tag(cell).is_none()
+            && chip_kind(cell).is_none()
+    })
+}
+
+/// El color con el que zsh-autosuggestions pinta su sugerencia por defecto (`fg=8`, el gris
+/// de la paleta, que llega como índice 8 o como «negro brillante»), o texto atenuado.
+fn is_suggestion_color(fg: alacritty_terminal::vte::ansi::Color, flags: Flags) -> bool {
+    use alacritty_terminal::vte::ansi::{Color, NamedColor};
+    flags.contains(Flags::DIM)
+        || matches!(
+            fg,
+            Color::Indexed(8) | Color::Named(NamedColor::BrightBlack)
+        )
+}
+
+/// Índice de la última letra de la sugerencia gris que empieza en `cursor` (las celdas del
+/// comando que se escribe, seguidas aunque salten de fila); `None` si en el cursor no hay
+/// sugerencia.
+fn suggestion_end(
+    cells: &[(char, alacritty_terminal::vte::ansi::Color, Flags)],
+    cursor: usize,
+) -> Option<usize> {
+    cells[cursor.min(cells.len())..]
+        .iter()
+        .take_while(|(_, fg, flags)| is_suggestion_color(*fg, *flags))
+        .enumerate()
+        .filter(|(_, (c, _, _))| !is_blank(*c))
+        .map(|(i, _)| cursor + i)
+        .last()
+}
+
+/// Para una línea de cajas en la fila `row` de la pantalla: si pueden subir (la fila de
+/// encima está vacía) y si encima va la raya entre bloques (además hay contenido en alguna
+/// fila por encima de esa vacía: tras `clear` el primer prompt no separa nada).
+fn chip_room(row: i32, above_blank: bool, content_higher: bool) -> (bool, bool) {
+    let room = row > 0 && above_blank;
+    (room, room && content_higher)
 }
 
 fn chip_kind(cell: &Cell) -> Option<char> {
@@ -1506,6 +1562,23 @@ impl Session {
         Some((cells, cursor))
     }
 
+    /// La última celda de la sugerencia gris de zsh-autosuggestions que sigue al cursor en el
+    /// comando que se escribe, si la hay (ver `suggestion_end`; se reconoce por su color).
+    pub fn autosuggestion_end(&self) -> Option<Point> {
+        let (cells, cursor) = self.input_cells()?;
+        let at = cells.iter().position(|p| *p == cursor)?;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let looks: Vec<_> = cells
+            .iter()
+            .map(|p| {
+                let cell = &grid[p.line][p.column];
+                (cell.c, cell.fg, cell.flags)
+            })
+            .collect();
+        suggestion_end(&looks, at).map(|i| cells[i])
+    }
+
     /// Rutas que existen en el comando de cada prompt marcado que se ve (el que se escribe y
     /// los del historial): (fila de la pantalla, columna inicial, final exclusiva, `Tok::Path`).
     /// Las relativas se miran contra la carpeta de la marca de su prompt. En el que se
@@ -1726,6 +1799,15 @@ impl Session {
                     );
                 }
             }
+            // Las cajas suben hacia la fila de encima si está vacía (`row_is_blank`).
+            let above_blank = !inline
+                && row > 0
+                && row_is_blank((0..cols).map(|col| &grid[Line(row - 1 - offset)][Column(col)]));
+            // La raya solo separa de algo: alguna fila con contenido más arriba.
+            let blank_at =
+                |r: i32| row_is_blank((0..cols).map(|col| &grid[Line(r - offset)][Column(col)]));
+            let content_higher = above_blank && (0..row - 1).rev().any(|r| !blank_at(r));
+            let (room_above, rule_above) = chip_room(row, above_blank, content_higher);
             out.push(ChipRow {
                 row,
                 end,
@@ -1735,6 +1817,8 @@ impl Session {
                 inline,
                 result: prompt_tag(&cells[Column(0)]).as_ref().and_then(tag_result),
                 tokens,
+                room_above,
+                rule_above,
             });
         }
         out
@@ -2387,5 +2471,81 @@ mod tests {
         assert_eq!(tag_dir(&link), PathBuf::from("/tmp/a b"));
         let plain = Hyperlink::new(None::<String>, "colibri-prompt:/tmp".into());
         assert_eq!(tag_result(&plain), None);
+    }
+
+    /// Las cajas solo suben si encima hay una fila de verdad vacía: ni texto ni fondo de
+    /// color (la salida de un programa que pinta fondos no es hueco).
+    #[test]
+    fn fila_en_blanco() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let blank = vec![Cell::default(); 8];
+        assert!(row_is_blank(&blank));
+        let mut text = blank.clone();
+        text[3].c = 'x';
+        assert!(!row_is_blank(&text));
+        let mut painted = blank.clone();
+        painted[5].bg = Color::Named(NamedColor::Red);
+        assert!(!row_is_blank(&painted));
+        // Espacios en vídeo inverso o subrayados se ven como una barra, no como hueco.
+        let mut inverse = blank.clone();
+        inverse[2].flags = Flags::INVERSE;
+        assert!(!row_is_blank(&inverse));
+        let mut underlined = blank.clone();
+        underlined[2].flags = Flags::UNDERLINE;
+        assert!(!row_is_blank(&underlined));
+    }
+
+    /// Las cajas suben si la fila de encima está vacía; la raya entre bloques, además, solo
+    /// si por encima de esa fila vacía queda algo de la pantalla (tras `clear`, no).
+    #[test]
+    fn hueco_y_raya_sobre_las_cajas() {
+        assert_eq!(chip_room(0, true, false), (false, false));
+        assert_eq!(chip_room(1, true, false), (true, false));
+        assert_eq!(chip_room(5, true, true), (true, true));
+        assert_eq!(chip_room(5, false, true), (false, false));
+        // Tras `clear` con dos filas vacías arriba: suben, pero no hay bloque que separar.
+        assert_eq!(chip_room(2, true, false), (true, false));
+    }
+
+    /// La sugerencia gris de zsh-autosuggestions se reconoce por su color (el gris 8 de la
+    /// paleta, o atenuada) a partir del cursor; la pista «→» va tras su última letra.
+    #[test]
+    fn sugerencia_gris() {
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        let none = Flags::empty();
+        assert!(is_suggestion_color(
+            Color::Named(NamedColor::BrightBlack),
+            none
+        ));
+        assert!(is_suggestion_color(Color::Indexed(8), none));
+        assert!(is_suggestion_color(
+            Color::Named(NamedColor::Foreground),
+            Flags::DIM
+        ));
+        assert!(!is_suggestion_color(
+            Color::Named(NamedColor::Foreground),
+            none
+        ));
+
+        let normal = Color::Named(NamedColor::Foreground);
+        let gray = Color::Indexed(8);
+        let cells = |typed: &str, hint: &str| -> Vec<(char, Color, Flags)> {
+            typed
+                .chars()
+                .map(|c| (c, normal, none))
+                .chain(hint.chars().map(|c| (c, gray, none)))
+                .collect()
+        };
+        // «cd s» tecleado y «rc/» sugerido: la pista va tras la «/».
+        assert_eq!(suggestion_end(&cells("cd s", "rc/"), 4), Some(6));
+        // Lo de detrás del cursor es texto de verdad (se movió el cursor): no hay pista.
+        assert_eq!(suggestion_end(&cells("cd src/", ""), 4), None);
+        // Cursor al final, sin nada detrás.
+        assert_eq!(suggestion_end(&cells("cd s", ""), 4), None);
+        // Los espacios grises del final no cuentan.
+        assert_eq!(suggestion_end(&cells("cd s", "rc/  "), 4), Some(6));
+        // Una sugerencia que sigue en la fila de abajo llega seguida en las celdas.
+        let long = "x".repeat(30);
+        assert_eq!(suggestion_end(&cells("git ", &long), 4), Some(33));
     }
 }
