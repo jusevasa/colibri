@@ -448,6 +448,8 @@ pub struct ChipRow {
     /// La fila de encima está en pantalla y vacía (`row_is_blank`): las cajas pueden subir
     /// hacia ella para dejar aire sobre el comando, y encima va la raya entre bloques.
     pub room_above: bool,
+    /// Encima de la fila vacía queda algo de la pantalla: ahí va la raya entre bloques.
+    pub rule_above: bool,
 }
 
 /// Esquema del hiperenlace con el que la integración de zsh (`assets/shell/zshenv.zsh`)
@@ -604,14 +606,17 @@ fn is_blank(c: char) -> bool {
     c == ' ' || c == '\0'
 }
 
-/// Una fila vacía de verdad: sin texto, sin fondo de color y sin marcas de prompt o de
-/// cajas. Encima de una línea de cajas, ahí pueden subir las cajas para dejar aire sobre
+/// Una fila vacía de verdad: sin texto, sin fondo de color, sin vídeo inverso ni rayas
+/// (unos espacios así se ven como una barra) y sin marcas de prompt o de cajas. Encima de una línea de cajas, ahí pueden subir las cajas para dejar aire sobre
 /// el comando.
-fn row_is_blank(cells: &[Cell]) -> bool {
+fn row_is_blank<'a>(cells: impl IntoIterator<Item = &'a Cell>) -> bool {
     use alacritty_terminal::vte::ansi::{Color, NamedColor};
-    cells.iter().all(|cell| {
+    cells.into_iter().all(|cell| {
         is_blank(cell.c)
             && cell.bg == Color::Named(NamedColor::Background)
+            && !cell
+                .flags
+                .intersects(Flags::INVERSE | Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
             && prompt_tag(cell).is_none()
             && chip_kind(cell).is_none()
     })
@@ -642,6 +647,14 @@ fn suggestion_end(
         .filter(|(_, (c, _, _))| !is_blank(*c))
         .map(|(i, _)| cursor + i)
         .last()
+}
+
+/// Para una línea de cajas en la fila `row` de la pantalla: si pueden subir (la fila de
+/// encima está vacía) y si encima va la raya entre bloques (además queda algo por encima de
+/// esa fila vacía: tras `clear` el primer prompt no separa nada).
+fn chip_room(row: i32, above_blank: bool) -> (bool, bool) {
+    let room = row > 0 && above_blank;
+    (room, room && row > 1)
 }
 
 fn chip_kind(cell: &Cell) -> Option<char> {
@@ -1786,6 +1799,11 @@ impl Session {
                     );
                 }
             }
+            // Las cajas suben hacia la fila de encima si está vacía (`row_is_blank`).
+            let above_blank = !inline
+                && row > 0
+                && row_is_blank((0..cols).map(|col| &grid[Line(row - 1 - offset)][Column(col)]));
+            let (room_above, rule_above) = chip_room(row, above_blank);
             out.push(ChipRow {
                 row,
                 end,
@@ -1795,12 +1813,8 @@ impl Session {
                 inline,
                 result: prompt_tag(&cells[Column(0)]).as_ref().and_then(tag_result),
                 tokens,
-                room_above: !inline && row > 0 && {
-                    let above = &grid[Line(row - 1 - offset)];
-                    let cells: Vec<Cell> =
-                        (0..cols).map(|col| above[Column(col)].clone()).collect();
-                    row_is_blank(&cells)
-                },
+                room_above,
+                rule_above,
             });
         }
         out
@@ -2468,6 +2482,23 @@ mod tests {
         let mut painted = blank.clone();
         painted[5].bg = Color::Named(NamedColor::Red);
         assert!(!row_is_blank(&painted));
+        // Espacios en vídeo inverso o subrayados se ven como una barra, no como hueco.
+        let mut inverse = blank.clone();
+        inverse[2].flags = Flags::INVERSE;
+        assert!(!row_is_blank(&inverse));
+        let mut underlined = blank.clone();
+        underlined[2].flags = Flags::UNDERLINE;
+        assert!(!row_is_blank(&underlined));
+    }
+
+    /// Las cajas suben si la fila de encima está vacía; la raya entre bloques, además, solo
+    /// si por encima de esa fila vacía queda algo de la pantalla (tras `clear`, no).
+    #[test]
+    fn hueco_y_raya_sobre_las_cajas() {
+        assert_eq!(chip_room(0, true), (false, false));
+        assert_eq!(chip_room(1, true), (true, false));
+        assert_eq!(chip_room(5, true), (true, true));
+        assert_eq!(chip_room(5, false), (false, false));
     }
 
     /// La sugerencia gris de zsh-autosuggestions se reconoce por su color (el gris 8 de la

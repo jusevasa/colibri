@@ -196,7 +196,7 @@ fn show_grid(
     // Una raya fina separa cada bloque del anterior, arriba de la línea en blanco sobre
     // sus cajas (con la primera fila de la pantalla no hay bloque anterior que separar).
     let rule = pal.bg.lerp_to_gamma(pal.fg, 0.10);
-    for c in chip_rows.iter().filter(|c| c.room_above) {
+    for c in chip_rows.iter().filter(|c| c.rule_above) {
         let y = origin.y + (c.row - 1) as f32 * m.cell_h + 0.5;
         painter.hline(rect.x_range(), y, Stroke::new(1.0, rule));
     }
@@ -217,7 +217,7 @@ fn show_grid(
         let y = |row: i32| origin.y + row as f32 * m.cell_h;
         if failed {
             let bar = Rect::from_min_max(
-                Pos2::new(rect.left(), y(prev.unwrap_or(0)) - 3.0),
+                Pos2::new(rect.left(), y(prev.unwrap_or(0)) - 3.0 - prev_lift),
                 Pos2::new(rect.left() + 3.0, y(c.row) - m.cell_h * 0.6),
             );
             painter.rect_filled(bar, 1.0, pal.ansi[1]);
